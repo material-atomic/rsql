@@ -64,45 +64,78 @@ func TestASyncThatLiesLosesTheWrite(t *testing.T) {
 }
 
 func TestATornWriteLandsWholeSectorsAndNothingElse(t *testing.T) {
-	// Always torn, and big enough to cross sectors.
-	disk := NewSim(3, Faults{TornWrite: 1})
+	// A write is torn by the power cut, not by the call: it is recorded whole,
+	// and what survives the crash is whole sectors of its front and no more.
 	page := bytes.Repeat([]byte("x"), SectorBytes*4)
+	partial := false
 
-	n, err := disk.WriteAt(page, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n == len(page) {
-		t.Fatalf("this write was meant to tear, got all %d bytes", n)
-	}
-	if n%SectorBytes != 0 {
-		t.Errorf("a tear lands whole sectors; %d bytes is not a multiple of %d", n, SectorBytes)
+	for seed := int64(0); seed < 40; seed++ {
+		disk := NewSim(seed, Faults{TornWrite: 1})
+
+		n, err := disk.WriteAt(page, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != len(page) {
+			t.Fatalf("seed %d: a write is recorded whole, got %d of %d", seed, n, len(page))
+		}
+		if got := read(t, disk, 0, len(page)); !bytes.Equal(got, page) {
+			t.Fatalf("seed %d: the writer must see its own write whole", seed)
+		}
+
+		durable := disk.Crash().Durable()
+		if len(durable)%SectorBytes != 0 {
+			t.Errorf("seed %d: a tear lands whole sectors; %d bytes is not a multiple of %d", seed, len(durable), SectorBytes)
+		}
+		if !bytes.Equal(durable, page[:len(durable)]) {
+			t.Errorf("seed %d: what landed must be the front of what was written", seed)
+		}
+		if len(durable) > 0 && len(durable) < len(page) {
+			partial = true
+		}
 	}
 
-	if err := disk.Sync(); err != nil {
-		t.Fatal(err)
+	if !partial {
+		t.Error("over 40 seeds no write ever tore, so the fault does nothing")
 	}
-	durable := disk.Durable()
-	if len(durable) != n {
-		t.Fatalf("durable is %d bytes, the write landed %d", len(durable), n)
-	}
-	if !bytes.Equal(durable, page[:n]) {
-		t.Error("the part that landed must be the front of what was written")
+}
+
+func TestASyncedWriteIsNeverTorn(t *testing.T) {
+	// The promise a disk does keep: once an honest fsync has returned, the
+	// whole write is there. The commit protocol rests on this.
+	page := bytes.Repeat([]byte("y"), SectorBytes*4)
+
+	for seed := int64(0); seed < 40; seed++ {
+		disk := NewSim(seed, Faults{TornWrite: 1, ReorderWrites: true})
+		write(t, disk, 0, page)
+		if err := disk.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := disk.Crash().Durable(); !bytes.Equal(got, page) {
+			t.Fatalf("seed %d: a synced write must survive whole, got %d of %d bytes", seed, len(got), len(page))
+		}
 	}
 }
 
 func TestAWriteInsideOneSectorIsAtomic(t *testing.T) {
-	// The one promise a disk does make, and the one the engine may rely on.
+	// The other promise: within one sector a write is all or nothing, however
+	// badly the power goes.
 	for seed := int64(0); seed < 50; seed++ {
-		disk := NewSim(seed, Faults{TornWrite: 1})
+		disk := NewSim(seed, Faults{TornWrite: 1, ReorderWrites: true})
 		data := bytes.Repeat([]byte("a"), 64)
 
-		n, err := disk.WriteAt(data, 100) // 100..163, inside one sector
-		if err != nil {
-			t.Fatal(err)
+		write(t, disk, 100, data) // 100..163, inside one sector
+
+		durable := disk.Crash().Durable()
+		if len(durable) == 0 {
+			continue // the write did not survive at all, which is allowed
 		}
-		if n != len(data) {
-			t.Fatalf("seed %d: a write inside one sector must not tear, landed %d of %d", seed, n, len(data))
+		if len(durable) != 164 {
+			t.Fatalf("seed %d: the write landed in part: %d bytes", seed, len(durable))
+		}
+		if !bytes.Equal(durable[100:164], data) {
+			t.Fatalf("seed %d: the sector landed changed", seed)
 		}
 	}
 }

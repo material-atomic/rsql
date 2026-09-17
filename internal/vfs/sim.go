@@ -18,9 +18,14 @@ var ErrPowerCut = errors.New("rsql/vfs: power cut")
 // Faults is what a simulated disk is allowed to do to you. Every one of them
 // is something a real disk, filesystem or kernel has been observed to do.
 type Faults struct {
-	// TornWrite is the chance, per write crossing a sector boundary, that only
-	// some of its sectors land. A write is atomic within one sector and
-	// nowhere else.
+	// TornWrite is the chance that a write still in flight when the power goes
+	// lands as whole sectors of its front and no more. A write is atomic within
+	// one sector and nowhere else — but only a write that was never synced can
+	// tear: an honest Sync delivers every byte.
+	//
+	// It also lets a prefix of the pending writes survive a crash at all, which
+	// is what makes a power cut mid-transaction something to test rather than a
+	// clean loss of everything.
 	TornWrite float64
 
 	// LyingSync is the chance, per Sync, that it reports success while leaving
@@ -40,15 +45,19 @@ type Faults struct {
 
 // SimDisk is a file that lives in memory and can be told to misbehave.
 //
-// It keeps two images: what is durable — what a restart would find — and what
-// has been written since the last successful Sync. A power cut throws the
-// second away.
+// It keeps two things: the durable image — what a restart would find — and the
+// writes made since the last successful Sync. A power cut decides what happens
+// to those: they may be lost, reordered, or land in part.
+//
+// A write is recorded whole. Tearing happens at the crash, not at the call: a
+// disk that acknowledged a write and then honoured an fsync does deliver every
+// byte of it. Only writes still in flight when the power goes can land half
+// done, so that is the only place this simulator tears one.
 type SimDisk struct {
 	durable []byte
-	pending map[int64]byte
-	// order is the sequence pending writes were made in, so a crash can honour
-	// or scramble it.
-	order []int64
+	// pending is the writes since the last honest Sync, in the order they were
+	// made. Each is kept whole: what a crash does to it is decided then.
+	pending []pendingWrite
 
 	random *rand.Rand
 	faults Faults
@@ -61,13 +70,18 @@ type SimDisk struct {
 	Trace []string
 }
 
+// pendingWrite is one WriteAt that has not become durable yet.
+type pendingWrite struct {
+	off  int64
+	data []byte
+}
+
 // NewSim opens an empty simulated disk. The same seed and the same sequence of
 // calls always produce the same faults, so a failure replays exactly.
 func NewSim(seed int64, faults Faults) *SimDisk {
 	return &SimDisk{
-		pending: map[int64]byte{},
-		random:  rand.New(rand.NewSource(seed)),
-		faults:  faults,
+		random: rand.New(rand.NewSource(seed)),
+		faults: faults,
 	}
 }
 
@@ -86,7 +100,7 @@ func (d *SimDisk) alive() error {
 }
 
 // ReadAt reads what the file looks like right now: durable bytes, with
-// anything written since laid over them.
+// anything written since laid over them in the order it was written.
 func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 	if err := d.alive(); err != nil {
 		return 0, err
@@ -106,14 +120,22 @@ func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 		if at >= size {
 			break
 		}
-		if value, ok := d.pending[at]; ok {
-			p[i] = value
-		} else if at < int64(len(d.durable)) {
+		if at < int64(len(d.durable)) {
 			p[i] = d.durable[at]
 		} else {
 			p[i] = 0
 		}
 		n++
+	}
+
+	for _, write := range d.pending {
+		for i := range write.data {
+			at := write.off + int64(i)
+			if at < off || at >= off+int64(n) {
+				continue
+			}
+			p[at-off] = write.data[i]
+		}
 	}
 
 	if n < len(p) {
@@ -122,8 +144,8 @@ func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// WriteAt writes bytes that are not durable until Sync says so — and may be
-// torn on the way, if the faults allow it.
+// WriteAt records a write. It is not durable until Sync says so, and what a
+// crash makes of it is decided at the crash.
 func (d *SimDisk) WriteAt(p []byte, off int64) (int, error) {
 	if err := d.alive(); err != nil {
 		return 0, err
@@ -133,33 +155,14 @@ func (d *SimDisk) WriteAt(p []byte, off int64) (int, error) {
 	}
 
 	d.writes++
-
-	landed := len(p)
-	if d.faults.TornWrite > 0 && crossesSector(off, len(p)) && d.random.Float64() < d.faults.TornWrite {
-		// A torn write lands whole sectors, not whole calls.
-		sectors := sectorsOf(off, len(p))
-		keep := d.random.Intn(sectors) // 0..sectors-1 of them
-		landed = sectorPrefix(off, len(p), keep)
-		d.logf("write %d bytes at %d torn after %d bytes", len(p), off, landed)
-	}
-
-	for i := 0; i < landed; i++ {
-		at := off + int64(i)
-		if _, seen := d.pending[at]; !seen {
-			d.order = append(d.order, at)
-		}
-		d.pending[at] = p[i]
-	}
+	d.pending = append(d.pending, pendingWrite{off: off, data: append([]byte(nil), p...)})
 
 	if d.faults.PowerCutAfter > 0 && d.writes >= d.faults.PowerCutAfter {
 		d.logf("power cut after %d writes", d.writes)
 		d.cut = true
-		return landed, ErrPowerCut
+		return len(p), ErrPowerCut
 	}
 
-	if landed < len(p) {
-		return landed, nil
-	}
 	return len(p), nil
 }
 
@@ -171,46 +174,68 @@ func (d *SimDisk) Sync() error {
 	}
 
 	if d.faults.LyingSync > 0 && d.random.Float64() < d.faults.LyingSync {
-		d.logf("sync lied about %d pending bytes", len(d.pending))
+		d.logf("sync lied about %d pending writes", len(d.pending))
 		return nil
 	}
 
-	d.commit(len(d.order))
+	for _, write := range d.pending {
+		d.apply(write, len(write.data))
+	}
+	d.pending = nil
 	d.logf("sync made everything durable")
 	return nil
 }
 
-// commit moves the first n pending writes into the durable image.
-func (d *SimDisk) commit(n int) {
-	offsets := d.order
-	if n < len(offsets) {
-		offsets = offsets[:n]
+// apply puts the first n bytes of a write into the durable image.
+func (d *SimDisk) apply(write pendingWrite, n int) {
+	for int64(len(d.durable)) < write.off+int64(n) {
+		d.durable = append(d.durable, 0)
+	}
+	copy(d.durable[write.off:], write.data[:n])
+}
+
+// land decides what the pending writes leave behind when the power goes.
+//
+// With no faults asked for, nothing does: a write that was never synced was
+// never there, which is the rule the engine is built against. With faults, a
+// prefix of them lands — in an order of the simulator's choosing if writes may
+// be reordered — and one of those may land as whole sectors and no more.
+func (d *SimDisk) land() {
+	if len(d.pending) == 0 {
+		return
+	}
+	if !d.faults.ReorderWrites && d.faults.TornWrite <= 0 {
+		d.logf("crash lost all %d pending writes", len(d.pending))
+		d.pending = nil
+		return
 	}
 
-	for _, at := range offsets {
-		value, ok := d.pending[at]
-		if !ok {
-			continue
+	writes := append([]pendingWrite(nil), d.pending...)
+	if d.faults.ReorderWrites {
+		d.random.Shuffle(len(writes), func(i, j int) { writes[i], writes[j] = writes[j], writes[i] })
+	}
+	kept := d.random.Intn(len(writes) + 1)
+
+	for _, write := range writes[:kept] {
+		n := len(write.data)
+		if d.faults.TornWrite > 0 && crossesSector(write.off, n) && d.random.Float64() < d.faults.TornWrite {
+			// A torn write lands whole sectors, not whole calls.
+			sectors := sectorsOf(write.off, n)
+			n = sectorPrefix(write.off, n, d.random.Intn(sectors))
+			d.logf("write of %d bytes at %d torn after %d bytes", len(write.data), write.off, n)
 		}
-		for int64(len(d.durable)) <= at {
-			d.durable = append(d.durable, 0)
-		}
-		d.durable[at] = value
-		delete(d.pending, at)
+		d.apply(write, n)
 	}
 
-	if n >= len(d.order) {
-		d.order = d.order[:0]
-	} else {
-		d.order = append([]int64(nil), d.order[n:]...)
-	}
+	d.logf("crash kept %d of %d pending writes, reordered=%v", kept, len(writes), d.faults.ReorderWrites)
+	d.pending = nil
 }
 
 func (d *SimDisk) size() int64 {
 	size := int64(len(d.durable))
-	for at := range d.pending {
-		if at+1 > size {
-			size = at + 1
+	for _, write := range d.pending {
+		if end := write.off + int64(len(write.data)); end > size {
+			size = end
 		}
 	}
 	return size
@@ -242,18 +267,17 @@ func (d *SimDisk) Truncate(size int64) error {
 		}
 	}
 
-	for at := range d.pending {
-		if at >= size {
-			delete(d.pending, at)
+	kept := d.pending[:0]
+	for _, write := range d.pending {
+		if write.off >= size {
+			continue
 		}
-	}
-	kept := d.order[:0]
-	for _, at := range d.order {
-		if at < size {
-			kept = append(kept, at)
+		if end := write.off + int64(len(write.data)); end > size {
+			write.data = write.data[:size-write.off]
 		}
+		kept = append(kept, write)
 	}
-	d.order = kept
+	d.pending = kept
 
 	d.logf("truncate to %d", size)
 	return nil
@@ -265,21 +289,10 @@ func (d *SimDisk) Close() error {
 	return nil
 }
 
-// Crash throws away everything that was not durable and hands back the file a
-// restart would find. The disk this was called on is spent.
-//
-// With ReorderWrites, a prefix of the pending writes survives in an order of
-// the simulator's choosing — which is what a disk with a write cache may leave
-// behind when the power goes between two syncs.
+// Crash cuts the power and hands back the file a restart would find. The disk
+// this was called on is spent.
 func (d *SimDisk) Crash() *SimDisk {
-	if d.faults.ReorderWrites && len(d.order) > 0 {
-		scrambled := append([]int64(nil), d.order...)
-		d.random.Shuffle(len(scrambled), func(i, j int) { scrambled[i], scrambled[j] = scrambled[j], scrambled[i] })
-		survivors := d.random.Intn(len(scrambled) + 1)
-		d.order = scrambled
-		d.commit(survivors)
-		d.logf("crash kept %d of %d pending writes, reordered", survivors, len(scrambled))
-	}
+	d.land()
 
 	image := append([]byte(nil), d.durable...)
 	d.cut = true
@@ -290,6 +303,15 @@ func (d *SimDisk) Crash() *SimDisk {
 	return restarted
 }
 
+// Restore puts a durable image into the disk, for a test that starts from the
+// file another disk left behind.
+func (d *SimDisk) Restore(image []byte) {
+	d.durable = append([]byte(nil), image...)
+	d.pending = nil
+	d.cut = false
+	d.writes = 0
+}
+
 // Durable is the image a restart would find right now, for a test to inspect.
 func (d *SimDisk) Durable() []byte {
 	return append([]byte(nil), d.durable...)
@@ -297,7 +319,11 @@ func (d *SimDisk) Durable() []byte {
 
 // Pending is how many bytes have been written but not made durable.
 func (d *SimDisk) Pending() int {
-	return len(d.pending)
+	total := 0
+	for _, write := range d.pending {
+		total += len(write.data)
+	}
+	return total
 }
 
 // PowerIsOut reports whether the power has been cut.
@@ -332,9 +358,13 @@ func sectorPrefix(off int64, length int, keep int) int {
 	return int(landed)
 }
 
-// SortedOffsets is the pending offsets in order, for a test that wants to look.
+// SortedOffsets is where the pending writes start, in order, for a test that
+// wants to look.
 func (d *SimDisk) SortedOffsets() []int64 {
-	out := append([]int64(nil), d.order...)
+	out := make([]int64, 0, len(d.pending))
+	for _, write := range d.pending {
+		out = append(out, write.off)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
