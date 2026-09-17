@@ -37,15 +37,17 @@ var PasswordPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{16,128}$`)
 
 // Parts are the three fields of a connection string that a signature covers.
 type Parts struct {
-	UserID    string
+	// AccountID is the registered account — the tenant boundary. A database
+	// name only has to be unique within one.
+	AccountID string
 	Password  string
-	ProjectID string
+	DBName    string
 }
 
 var (
 	ErrEmptySecret  = errors.New("rsql: secret must not be empty")
 	ErrPassword     = errors.New("rsql: password must be 16-128 characters of A-Z a-z 0-9 . _ ~ -")
-	ErrFieldDelim   = errors.New(`rsql: user_id and project_id must not be empty or contain ":"`)
+	ErrFieldDelim   = errors.New(`rsql: account_id and dbname must not be empty or contain ":"`)
 	ErrBadSignature = errors.New("rsql: signature does not verify")
 )
 
@@ -61,19 +63,19 @@ func field(value string) error {
 	return nil
 }
 
-// Message is the exact bytes signed: user_id ":" password ":" project_id,
+// Message is the exact bytes signed: account_id ":" password ":" dbname,
 // UTF-8, unnormalised.
 func Message(parts Parts) (string, error) {
-	if err := field(parts.UserID); err != nil {
-		return "", fmt.Errorf("user_id: %w", err)
+	if err := field(parts.AccountID); err != nil {
+		return "", fmt.Errorf("account_id: %w", err)
 	}
-	if err := field(parts.ProjectID); err != nil {
-		return "", fmt.Errorf("project_id: %w", err)
+	if err := field(parts.DBName); err != nil {
+		return "", fmt.Errorf("dbname: %w", err)
 	}
 	if !ValidPassword(parts.Password) {
 		return "", ErrPassword
 	}
-	return parts.UserID + ":" + parts.Password + ":" + parts.ProjectID, nil
+	return parts.AccountID + ":" + parts.Password + ":" + parts.DBName, nil
 }
 
 // key is what the signature is made with: derived under a label, or the secret

@@ -1,8 +1,8 @@
 {
-  "note": "Read by both the store tests and this package tests. A change to the contract must turn both suites red at once.",
-  "message": "user_id + \":\" + password + \":\" + project_id, UTF-8, unnormalised",
+  "note": "Read by both the store tests (Go) and the client tests (TypeScript). A change to the contract must turn both suites red at once.",
+  "message": "account_id + \":\" + password + \":\" + dbname, UTF-8, unnormalised",
   "modes": {
-    "derived": "key = HMAC-SHA256(secret, label); sig = hex(HMAC-SHA256(key, message)) — the package default",
+    "derived": "key = HMAC-SHA256(secret, label); sig = hex(HMAC-SHA256(key, message)) — the default",
     "direct": "sig = hex(HMAC-SHA256(secret, message)) — pass label: null"
   },
   "secret": "rsql-fixture-secret-do-not-use-in-production",
@@ -10,49 +10,49 @@
   "cases": [
     {
       "name": "plain",
-      "userId": "11111111-1111-4111-8111-111111111111",
+      "accountId": "11111111-1111-4111-8111-111111111111",
       "password": "matkhau-don-gian",
-      "projectId": "22222222-2222-4222-8222-222222222222",
+      "dbname": "22222222-2222-4222-8222-222222222222",
       "derived": "403a3de18acbccafa321b0fa54a4e898f99dd9b90c7a21073c12284e7a0bef0c",
       "direct": "30f6b28e266f18c5816ee8692f24f4cb9a0d189676f7db4d792ca763ef89a976"
     },
     {
       "name": "every allowed character class",
-      "userId": "0",
+      "accountId": "0",
       "password": "aA0._~-aA0._~-aA0._~-",
-      "projectId": "p",
+      "dbname": "p",
       "derived": "f29e4d1217a7261d24f1d1e984778cfed48b5e988839a3fa0f3f472010db2b8f",
       "direct": "db115d84207d06b9e75fd8b83e0cfca71a26beae3dce7ea751206e1e10695ec6"
     },
     {
       "name": "longest password",
-      "userId": "u",
+      "accountId": "u",
       "password": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "projectId": "proj",
+      "dbname": "proj",
       "derived": "fe2d993e266ee3334362edd16eea995609f448b2b09cf0e027dda32a1ddaf5eb",
       "direct": "aad7fda955778ff9f1ce91186c2d8c4c48da3d31f2778f1b5c6dcab73c2c05fa"
     },
     {
       "name": "shortest password",
-      "userId": "user",
+      "accountId": "user",
       "password": "yyyyyyyyyyyyyyyy",
-      "projectId": "project",
+      "dbname": "project",
       "derived": "cd12ee10ebed2c09d46bfe3bf98e399300692389a56395aa7442f22f59c48715",
       "direct": "b40f87391c2af50631be64a9d507e653e635c171f63014cbfec47026e926ebff"
     },
     {
       "name": "one split of ab|c…",
-      "userId": "ab",
+      "accountId": "ab",
       "password": "cccccccccccccccc",
-      "projectId": "x",
+      "dbname": "x",
       "derived": "2aac3f424e229bb2a04286156ca5790b65ced0475f5a14b43f52f035723e24a8",
       "direct": "6fd37b7be0f00cc382f4ea1008c56aa8d4b61a2768e45770c1496ebbb2618d2f"
     },
     {
       "name": "the other split, a|bc… — same characters, must differ",
-      "userId": "a",
+      "accountId": "a",
       "password": "bcccccccccccccccc",
-      "projectId": "x",
+      "dbname": "x",
       "derived": "0daf93eb29bd94367a22efe1959ce2356ace1d25b45d5075ac5ed668122bd36d",
       "direct": "8e383ee0000ff8c4034bb4bb806c834f45d42e9dbac89d1920e6f8a2174401b1"
     }

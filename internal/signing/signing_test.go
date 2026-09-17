@@ -13,9 +13,9 @@ type fixture struct {
 	Label  string `json:"label"`
 	Cases  []struct {
 		Name      string `json:"name"`
-		UserID    string `json:"userId"`
+		AccountID string `json:"accountId"`
 		Password  string `json:"password"`
-		ProjectID string `json:"projectId"`
+		DBName    string `json:"dbname"`
 		Derived   string `json:"derived"`
 		Direct    string `json:"direct"`
 	} `json:"cases"`
@@ -44,7 +44,7 @@ func TestFixtureAgreesWithTheAppSide(t *testing.T) {
 	hexOnly := regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 	for _, c := range f.Cases {
-		parts := Parts{UserID: c.UserID, Password: c.Password, ProjectID: c.ProjectID}
+		parts := Parts{AccountID: c.AccountID, Password: c.Password, DBName: c.DBName}
 
 		derived, err := Sign(parts, f.Secret, f.Label)
 		if err != nil {
@@ -86,10 +86,10 @@ func TestTheDelimiterKeepsTwoSplitsApart(t *testing.T) {
 
 	for _, c := range f.Cases {
 		if strings.Contains(c.Name, "split of") {
-			one, joinOne = c.Derived, c.UserID+c.Password+c.ProjectID
+			one, joinOne = c.Derived, c.AccountID+c.Password+c.DBName
 		}
 		if strings.Contains(c.Name, "other split") {
-			other, joinOther = c.Derived, c.UserID+c.Password+c.ProjectID
+			other, joinOther = c.Derived, c.AccountID+c.Password+c.DBName
 		}
 	}
 	if one == "" || other == "" {
@@ -116,7 +116,7 @@ func TestPasswordCharset(t *testing.T) {
 		if ValidPassword(p) {
 			t.Errorf("%q should be refused", p)
 		}
-		if _, err := Sign(Parts{UserID: "u", Password: p, ProjectID: "p"}, "s", DefaultLabel); err == nil {
+		if _, err := Sign(Parts{AccountID: "u", Password: p, DBName: "p"}, "s", DefaultLabel); err == nil {
 			t.Errorf("%q should not sign", p)
 		}
 	}
@@ -125,21 +125,21 @@ func TestPasswordCharset(t *testing.T) {
 func TestRefusesWhatWouldMakeTheMessageAmbiguous(t *testing.T) {
 	ok := strings.Repeat("y", 16)
 	for _, parts := range []Parts{
-		{UserID: "a:b", Password: ok, ProjectID: "p"},
-		{UserID: "u", Password: ok, ProjectID: "p:q"},
-		{UserID: "", Password: ok, ProjectID: "p"},
+		{AccountID: "a:b", Password: ok, DBName: "p"},
+		{AccountID: "u", Password: ok, DBName: "p:q"},
+		{AccountID: "", Password: ok, DBName: "p"},
 	} {
 		if _, err := Sign(parts, "s", DefaultLabel); err == nil {
 			t.Errorf("%+v should not sign", parts)
 		}
 	}
-	if _, err := Sign(Parts{UserID: "u", Password: ok, ProjectID: "p"}, "", DefaultLabel); err == nil {
+	if _, err := Sign(Parts{AccountID: "u", Password: ok, DBName: "p"}, "", DefaultLabel); err == nil {
 		t.Error("an empty secret should not sign")
 	}
 }
 
 func TestVerifyIsFalseNotFatal(t *testing.T) {
-	parts := Parts{UserID: "u", Password: strings.Repeat("y", 16), ProjectID: "p"}
+	parts := Parts{AccountID: "u", Password: strings.Repeat("y", 16), DBName: "p"}
 	sig, _ := Sign(parts, "secret", DefaultLabel)
 
 	for _, bad := range []string{"", "zz", sig[:62], sig + "00"} {
