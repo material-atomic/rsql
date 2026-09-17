@@ -1,0 +1,308 @@
+package store
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+
+	"github.com/material-atomic/rsql/internal/btree"
+	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/material-atomic/rsql/internal/pager"
+	"github.com/material-atomic/rsql/internal/ulid"
+)
+
+// What a key starts with says what it is. One tree holds all of them, so a
+// document and the index entries that describe it are written in one
+// transaction and can never disagree.
+const (
+	spaceMeta    byte = 0x00 // 0x00 | name           -> a number the store keeps
+	spaceCatalog byte = 0x01 // 0x01 | name           -> a collection descriptor
+	spaceDoc     byte = 0x02 // 0x02 | id | key       -> the document
+	spaceIndex   byte = 0x03 // 0x03 | id | index | fields | key -> the covered fields
+)
+
+// nextCollection is where the counter of collection ids lives.
+var nextCollection = []byte{spaceMeta, 'c', 'o', 'l', 'l'}
+
+// Store is a database: its catalogue, its documents and its indexes.
+//
+// One writer at a time, which is what the tree underneath allows. Readers take
+// a snapshot and are unaffected by anything written afterwards.
+type Store struct {
+	tree        *btree.Tree
+	collections map[string]*Collection
+	ids         *ulid.Source
+}
+
+// Open reads the catalogue of an existing database, or starts an empty one.
+func Open(pages *pager.Pager) (*Store, error) {
+	store := &Store{
+		tree:        btree.New(pages),
+		collections: map[string]*Collection{},
+		ids:         ulid.New(),
+	}
+	if err := store.load(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// Identifiers lets a caller — a test, mostly — decide where generated primary
+// keys come from.
+func (s *Store) Identifiers(source *ulid.Source) { s.ids = source }
+
+// Commit makes everything written since the last one durable.
+func (s *Store) Commit() error { return s.tree.Commit() }
+
+func (s *Store) load() error {
+	prefix := []byte{spaceCatalog}
+
+	return s.tree.Ascend(prefix, func(key, value []byte) bool {
+		if !bytes.HasPrefix(key, prefix) {
+			return false
+		}
+		spec := &Spec{}
+		if err := json.Unmarshal(value, spec); err != nil {
+			return false
+		}
+		s.collections[spec.Name] = &Collection{store: s, spec: *spec}
+		return true
+	})
+}
+
+// Declare creates a collection, or brings an existing one up to date with the
+// declaration.
+//
+// What can change and what cannot follows from what is already written down:
+// the primary key cannot, because every document key is made of it. Indexes
+// can be added, and are built over the documents already there; they can be
+// dropped, and their entries go with them. An index that keeps its name but
+// changes its shape is refused — that is two different indexes, and silently
+// replacing one with the other would leave every reader of the old one wrong.
+func (s *Store) Declare(spec Spec) (*Collection, error) {
+	if err := spec.validate(); err != nil {
+		return nil, err
+	}
+
+	existing, found := s.collections[spec.Name]
+	if !found {
+		id, err := s.takeCollectionID()
+		if err != nil {
+			return nil, err
+		}
+		spec.ID = id
+		for i := range spec.Indexes {
+			spec.Indexes[i].ID = uint16(i)
+		}
+		spec.NextIndexID = uint16(len(spec.Indexes))
+
+		collection := &Collection{store: s, spec: spec}
+		if err := s.writeSpec(spec); err != nil {
+			return nil, err
+		}
+		s.collections[spec.Name] = collection
+		return collection, nil
+	}
+
+	if existing.spec.Key != spec.Key {
+		return nil, fmt.Errorf("%w: the primary key of %q was declared %+v", ErrIncompatible, spec.Name, existing.spec.Key)
+	}
+
+	updated := existing.spec
+	updated.Indexes = nil
+	wanted := map[string]bool{}
+
+	for _, index := range spec.Indexes {
+		wanted[index.Name] = true
+
+		if before, ok := existing.index(index.Name); ok {
+			if !sameShape(*before, index) {
+				return nil, fmt.Errorf("%w: index %q of %q is already declared differently", ErrIncompatible, index.Name, spec.Name)
+			}
+			updated.Indexes = append(updated.Indexes, *before)
+			continue
+		}
+
+		index.ID = updated.NextIndexID
+		updated.NextIndexID++
+		updated.Indexes = append(updated.Indexes, index)
+	}
+
+	// Indexes left out of the declaration are dropped, entries and all.
+	for _, before := range existing.spec.Indexes {
+		if !wanted[before.Name] {
+			if err := existing.dropIndex(before); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	collection := &Collection{store: s, spec: updated}
+	for _, index := range updated.Indexes {
+		if _, ok := existing.index(index.Name); ok {
+			continue
+		}
+		if err := collection.buildIndex(index); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.writeSpec(updated); err != nil {
+		return nil, err
+	}
+	s.collections[spec.Name] = collection
+	return collection, nil
+}
+
+// Collection is a collection that has been declared.
+func (s *Store) Collection(name string) (*Collection, error) {
+	collection, found := s.collections[name]
+	if !found {
+		return nil, fmt.Errorf("%w: %q", ErrNoCollection, name)
+	}
+	return collection, nil
+}
+
+// Collections is every declared collection, by name.
+func (s *Store) Collections() []string {
+	names := make([]string, 0, len(s.collections))
+	for name := range s.collections {
+		names = append(names, name)
+	}
+	return names
+}
+
+// Drop removes a collection: its documents, its index entries and its
+// declaration.
+func (s *Store) Drop(name string) error {
+	collection, err := s.Collection(name)
+	if err != nil {
+		return err
+	}
+
+	for _, index := range collection.spec.Indexes {
+		if err := collection.dropIndex(index); err != nil {
+			return err
+		}
+	}
+	if err := s.deleteRange(collection.documents()); err != nil {
+		return err
+	}
+	if _, err := s.tree.Delete(catalogKey(name)); err != nil {
+		return err
+	}
+
+	delete(s.collections, name)
+	return nil
+}
+
+func (s *Store) writeSpec(spec Spec) error {
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+	return s.tree.Put(catalogKey(spec.Name), encoded)
+}
+
+func (s *Store) takeCollectionID() (uint32, error) {
+	next := uint32(1)
+	if value, found, err := s.tree.Get(nextCollection); err != nil {
+		return 0, err
+	} else if found {
+		if len(value) != 4 {
+			return 0, fmt.Errorf("%w: the collection counter is %d bytes", ErrDamaged, len(value))
+		}
+		next = binary.BigEndian.Uint32(value)
+	}
+
+	var raw [4]byte
+	binary.BigEndian.PutUint32(raw[:], next+1)
+	if err := s.tree.Put(nextCollection, raw[:]); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+// deleteRange removes every key that starts with a prefix.
+//
+// Collected first and deleted afterwards: deleting while walking would be
+// changing the tree under the walk.
+func (s *Store) deleteRange(prefix []byte) error {
+	var doomed [][]byte
+
+	err := s.tree.Ascend(prefix, func(key, _ []byte) bool {
+		if !bytes.HasPrefix(key, prefix) {
+			return false
+		}
+		doomed = append(doomed, append([]byte(nil), key...))
+		return true
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, key := range doomed {
+		if _, err := s.tree.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func catalogKey(name string) []byte {
+	return append([]byte{spaceCatalog}, name...)
+}
+
+// documents is the stretch of the tree holding this collection's documents.
+func (c *Collection) documents() []byte {
+	key := make([]byte, 5)
+	key[0] = spaceDoc
+	binary.BigEndian.PutUint32(key[1:], c.spec.ID)
+	return key
+}
+
+// entries is the stretch holding one index.
+func (c *Collection) entries(index Index) []byte {
+	key := make([]byte, 7)
+	key[0] = spaceIndex
+	binary.BigEndian.PutUint32(key[1:], c.spec.ID)
+	binary.BigEndian.PutUint16(key[5:], index.ID)
+	return key
+}
+
+// encodeKey turns a primary key value into the bytes a document is stored at.
+func (c *Collection) encodeKey(value any) ([]byte, error) {
+	if !matches(c.spec.Key.Type, value) {
+		return nil, fmt.Errorf("%w: the primary key of %q is %s, and this is %T", ErrType, c.spec.Name, c.spec.Key.Type, value)
+	}
+	return keys.Encode(c.documents(), value, keys.Field{})
+}
+
+// matches says whether a value is the type a field was declared as.
+//
+// Null is allowed everywhere: it is a value the document carries, as opposed
+// to a field it does not have, and the two sort in different places. Refusing
+// it would make "the field is explicitly nothing" unindexable.
+func matches(declared string, value any) bool {
+	if value == nil {
+		return true
+	}
+	switch declared {
+	case TypeAny:
+		return true
+	case TypeString:
+		_, ok := value.(string)
+		return ok
+	case TypeNumber:
+		switch value.(type) {
+		case float64, float32, int, int64:
+			return true
+		}
+		return false
+	case TypeBool:
+		_, ok := value.(bool)
+		return ok
+	}
+	return false
+}

@@ -1,0 +1,381 @@
+package store
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/material-atomic/rsql/internal/keys"
+)
+
+// Collection is a declared collection: documents in primary-key order, and the
+// indexes declared on them.
+type Collection struct {
+	store *Store
+	spec  Spec
+}
+
+// Spec is the declaration this collection is running.
+func (c *Collection) Spec() Spec { return c.spec }
+
+func (c *Collection) index(name string) (*Index, bool) {
+	for i := range c.spec.Indexes {
+		if c.spec.Indexes[i].Name == name {
+			return &c.spec.Indexes[i], true
+		}
+	}
+	return nil, false
+}
+
+// Put stores a document, replacing whatever was under the same primary key,
+// and returns that key.
+//
+// The document and every index entry that describes it are written together.
+// Half of that is worse than none: an index entry with no document behind it
+// makes a query return something that is not there.
+func (c *Collection) Put(document map[string]any) (any, error) {
+	key, found := document[c.spec.Key.Path]
+	if !found || key == nil {
+		if c.spec.Key.Auto != "ulid" {
+			return nil, fmt.Errorf("%w: %q has no %q", ErrNoKey, c.spec.Name, c.spec.Key.Path)
+		}
+		generated, err := c.store.ids.Next()
+		if err != nil {
+			return nil, err
+		}
+		// Written into the document, not just used as its address: a document
+		// that does not carry its own key is one a reader cannot refer back to.
+		document[c.spec.Key.Path] = generated
+		key = generated
+	}
+
+	stored, err := c.encodeKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	previous, replaced, err := c.read(stored)
+	if err != nil {
+		return nil, err
+	}
+
+	// Worked out before anything is written, so that a document the indexes
+	// cannot describe is refused whole rather than half stored.
+	additions, err := c.entriesFor(document, key)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.checkUnique(additions, stored); err != nil {
+		return nil, err
+	}
+
+	if replaced {
+		removals, err := c.entriesFor(previous, key)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range removals {
+			if _, err := c.store.tree.Delete(entry.key); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("rsql/store: this document cannot be stored: %w", err)
+	}
+	if err := c.store.tree.Put(stored, encoded); err != nil {
+		return nil, err
+	}
+	for _, entry := range additions {
+		if err := c.store.tree.Put(entry.key, entry.value); err != nil {
+			return nil, err
+		}
+	}
+
+	return key, nil
+}
+
+// Get is the document under a primary key.
+func (c *Collection) Get(key any) (map[string]any, bool, error) {
+	stored, err := c.encodeKey(key)
+	if err != nil {
+		return nil, false, err
+	}
+	return c.read(stored)
+}
+
+// Delete removes a document and everything the indexes say about it.
+func (c *Collection) Delete(key any) (bool, error) {
+	stored, err := c.encodeKey(key)
+	if err != nil {
+		return false, err
+	}
+
+	document, found, err := c.read(stored)
+	if err != nil || !found {
+		return false, err
+	}
+
+	removals, err := c.entriesFor(document, key)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range removals {
+		if _, err := c.store.tree.Delete(entry.key); err != nil {
+			return false, err
+		}
+	}
+	return c.store.tree.Delete(stored)
+}
+
+func (c *Collection) read(stored []byte) (map[string]any, bool, error) {
+	value, found, err := c.store.tree.Get(stored)
+	if err != nil || !found {
+		return nil, false, err
+	}
+
+	document := map[string]any{}
+	if err := json.Unmarshal(value, &document); err != nil {
+		return nil, false, fmt.Errorf("%w: a document of %q: %v", ErrDamaged, c.spec.Name, err)
+	}
+	return document, true, nil
+}
+
+// entry is one index entry: where it goes and what it carries.
+type entry struct {
+	key   []byte
+	value []byte
+	// index and prefix are kept for the uniqueness check, which has to look at
+	// the field values without the primary key on the end.
+	index  *Index
+	prefix int
+}
+
+// entriesFor is every index entry that describes a document.
+func (c *Collection) entriesFor(document map[string]any, key any) ([]entry, error) {
+	var all []entry
+
+	for i := range c.spec.Indexes {
+		index := &c.spec.Indexes[i]
+		made, err := c.entriesForIndex(document, key, index)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, made...)
+	}
+	return all, nil
+}
+
+func (c *Collection) entriesForIndex(document map[string]any, key any, index *Index) ([]entry, error) {
+	values := make([]any, len(index.Fields))
+	spread := -1
+
+	for i, field := range index.Fields {
+		value, found := at(document, field.Path)
+		if !found {
+			if field.Missing == MissingSkip {
+				// The index was told not to hold documents without this field.
+				return nil, nil
+			}
+			values[i] = keys.Absent
+			continue
+		}
+		if index.Array == field.Path {
+			spread = i
+			values[i] = value
+			continue
+		}
+		if !matches(field.Type, value) {
+			return nil, fmt.Errorf("%w: index %q of %q wants %s at %q, and this is %T",
+				ErrType, index.Name, c.spec.Name, field.Type, field.Path, value)
+		}
+		values[i] = value
+	}
+
+	// One entry per element of the spread field. A document with no elements
+	// is in no entry at all: there is nothing to look it up by.
+	elements := []any{nil}
+	if spread >= 0 {
+		elements = spreadOf(values[spread])
+		field := index.Fields[spread]
+		for _, element := range elements {
+			if !matches(field.Type, element) {
+				return nil, fmt.Errorf("%w: index %q of %q wants %s in %q, and this is %T",
+					ErrType, index.Name, c.spec.Name, field.Type, field.Path, element)
+			}
+		}
+	}
+
+	carried, err := c.include(document, index)
+	if err != nil {
+		return nil, err
+	}
+
+	made := make([]entry, 0, len(elements))
+	seen := map[string]bool{}
+
+	for _, element := range elements {
+		if spread >= 0 {
+			values[spread] = element
+		}
+
+		prefix := c.entries(*index)
+		encoded, err := keys.EncodeKey(prefix, values, encodings(index.Fields))
+		if err != nil {
+			return nil, fmt.Errorf("index %q of %q: %w", index.Name, c.spec.Name, err)
+		}
+		length := len(encoded)
+
+		encoded, err = keys.Encode(encoded, key, keys.Field{})
+		if err != nil {
+			return nil, err
+		}
+
+		// The same element twice in one array encodes to the same key, so the
+		// tree would hold it once whatever happened here. Skipping it saves the
+		// write rather than preventing a duplicate — the key doing that.
+		if seen[string(encoded)] {
+			continue
+		}
+		seen[string(encoded)] = true
+
+		made = append(made, entry{key: encoded, value: carried, index: index, prefix: length})
+	}
+	return made, nil
+}
+
+// checkUnique refuses a write that would put a second document under a value a
+// unique index already holds.
+func (c *Collection) checkUnique(additions []entry, stored []byte) error {
+	for _, addition := range additions {
+		if !addition.index.Unique {
+			continue
+		}
+
+		prefix := addition.key[:addition.prefix]
+		var clash []byte
+
+		err := c.store.tree.Ascend(prefix, func(key, _ []byte) bool {
+			if !bytes.HasPrefix(key, prefix) {
+				return false
+			}
+			// The document being replaced is allowed to hold its own value.
+			if bytes.Equal(key[addition.prefix:], stored[len(c.documents()):]) {
+				return true
+			}
+			clash = append([]byte(nil), key...)
+			return false
+		})
+		if err != nil {
+			return err
+		}
+
+		if clash != nil {
+			values, _, err := keys.DecodeKey(clash[len(c.entries(*addition.index)):], encodings(addition.index.Fields))
+			if err != nil {
+				return fmt.Errorf("%w: index %q of %q", ErrDuplicate, addition.index.Name, c.spec.Name)
+			}
+			return fmt.Errorf("%w: index %q of %q already holds %v", ErrDuplicate, addition.index.Name, c.spec.Name, values)
+		}
+	}
+	return nil
+}
+
+func (c *Collection) include(document map[string]any, index *Index) ([]byte, error) {
+	if len(index.Include) == 0 {
+		return nil, nil
+	}
+
+	carried := map[string]any{}
+	for _, path := range index.Include {
+		if value, found := at(document, path); found {
+			carried[path] = value
+		}
+	}
+	return json.Marshal(carried)
+}
+
+// buildIndex fills a new index from the documents already stored.
+func (c *Collection) buildIndex(index Index) error {
+	prefix := c.documents()
+	var made []entry
+
+	err := c.store.tree.Ascend(prefix, func(key, value []byte) bool {
+		if !bytes.HasPrefix(key, prefix) {
+			return false
+		}
+		document := map[string]any{}
+		if err := json.Unmarshal(value, &document); err != nil {
+			return false
+		}
+		entries, err := c.entriesForIndex(document, document[c.spec.Key.Path], &index)
+		if err != nil {
+			return false
+		}
+		made = append(made, entries...)
+		return true
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, one := range made {
+		if index.Unique {
+			// The key of the document this entry describes, as a document key,
+			// so that the check can tell "already there" from "this one".
+			own := append(c.documents(), one.key[one.prefix:]...)
+			if err := c.checkUnique([]entry{one}, own); err != nil {
+				return err
+			}
+		}
+		if err := c.store.tree.Put(one.key, one.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Collection) dropIndex(index Index) error {
+	return c.store.deleteRange(c.entries(index))
+}
+
+func encodings(fields []Field) []keys.Field {
+	encoded := make([]keys.Field, len(fields))
+	for i, field := range fields {
+		encoded[i] = field.encoding()
+	}
+	return encoded
+}
+
+// at reads a dotted path out of a document.
+func at(document map[string]any, path string) (any, bool) {
+	current := any(document)
+
+	for _, part := range strings.Split(path, ".") {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		value, found := object[part]
+		if !found {
+			return nil, false
+		}
+		current = value
+	}
+	return current, true
+}
+
+// spreadOf is the elements an array field contributes.
+//
+// A value that is not an array contributes itself, so a field that is
+// sometimes a list and sometimes a single value is still findable either way —
+// which is how documents actually arrive.
+func spreadOf(value any) []any {
+	if list, ok := value.([]any); ok {
+		return list
+	}
+	return []any{value}
+}
