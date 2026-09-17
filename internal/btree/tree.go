@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/material-atomic/rsql/internal/pager"
@@ -63,7 +64,8 @@ func (t *Tree) Get(key []byte) ([]byte, bool, error) {
 			if !found {
 				return nil, false, nil
 			}
-			return entries[at].value, true, nil
+			value, err := t.load(entries[at])
+			return value, err == nil, err
 
 		case pager.KindNode:
 			node, err := decodeBranch(page)
@@ -94,8 +96,13 @@ func (t *Tree) Put(key, value []byte) error {
 		return ErrValueTooLarge
 	}
 
+	entry, err := t.store(key, value)
+	if err != nil {
+		return err
+	}
+
 	if t.root == 0 {
-		id, err := t.writeLeaf(0, []kv{{key: copyOf(key), value: copyOf(value)}})
+		id, err := t.writeLeaf(0, []kv{entry})
 		if err != nil {
 			return err
 		}
@@ -103,7 +110,7 @@ func (t *Tree) Put(key, value []byte) error {
 		return nil
 	}
 
-	left, separator, right, err := t.insert(t.root, key, value)
+	left, separator, right, err := t.insert(t.root, entry)
 	if err != nil {
 		return err
 	}
@@ -125,7 +132,7 @@ func (t *Tree) Put(key, value []byte) error {
 // insert writes a new version of the subtree at id. It returns the new node,
 // or — when that node had to split — the two halves and the separator between
 // them for the parent to take.
-func (t *Tree) insert(id uint64, key, value []byte) (uint64, []byte, uint64, error) {
+func (t *Tree) insert(id uint64, entry kv) (uint64, []byte, uint64, error) {
 	page, err := t.pages.Read(id)
 	if err != nil {
 		return 0, nil, 0, err
@@ -138,13 +145,15 @@ func (t *Tree) insert(id uint64, key, value []byte) (uint64, []byte, uint64, err
 			return 0, nil, 0, err
 		}
 
-		at, found := findKey(entries, key)
+		at, found := findKey(entries, entry.key)
 		if found {
-			entries[at].value = copyOf(value)
+			// The value that was there is now unreachable. Its pages, and the
+			// overflow chain behind them, are reclaimed by the freelist.
+			entries[at] = entry
 		} else {
 			entries = append(entries, kv{})
 			copy(entries[at+1:], entries[at:])
-			entries[at] = kv{key: copyOf(key), value: copyOf(value)}
+			entries[at] = entry
 		}
 
 		if leafBytes(entries) <= capacityBytes {
@@ -172,8 +181,8 @@ func (t *Tree) insert(id uint64, key, value []byte) (uint64, []byte, uint64, err
 			return 0, nil, 0, err
 		}
 
-		at := childFor(node.keys, key)
-		child, separator, split, err := t.insert(node.children[at], key, value)
+		at := childFor(node.keys, entry.key)
+		child, separator, split, err := t.insert(node.children[at], entry)
 		if err != nil {
 			return 0, nil, 0, err
 		}
@@ -480,7 +489,11 @@ func (t *Tree) ascend(id uint64, from []byte, visit func(key, value []byte) bool
 			at, _ = findKey(entries, from)
 		}
 		for _, entry := range entries[at:] {
-			if !visit(entry.key, entry.value) {
+			value, err := t.load(entry)
+			if err != nil {
+				return false, err
+			}
+			if !visit(entry.key, value) {
 				return false, nil
 			}
 		}
@@ -539,6 +552,81 @@ func (t *Tree) writeBranch(at uint64, node branch) (uint64, error) {
 		return 0, err
 	}
 	return id, t.pages.Write(page)
+}
+
+// store puts a value where it belongs: beside its key when it is small enough
+// to share a page, and in a chain of its own pages when it is not.
+func (t *Tree) store(key, value []byte) (kv, error) {
+	if len(value) <= MaxInline {
+		return kv{key: copyOf(key), value: copyOf(value)}, nil
+	}
+	head, err := t.writeOverflow(value)
+	if err != nil {
+		return kv{}, err
+	}
+	return kv{key: copyOf(key), head: head, length: uint32(len(value))}, nil
+}
+
+// writeOverflow lays a value out across pages, back to front, so that each one
+// is written already knowing where the rest of it continues.
+func (t *Tree) writeOverflow(value []byte) (uint64, error) {
+	next := uint64(0)
+
+	for start := (len(value) - 1) / overflowChunk * overflowChunk; start >= 0; start -= overflowChunk {
+		chunk := value[start:min(start+overflowChunk, len(value))]
+
+		id, err := t.pages.Allocate()
+		if err != nil {
+			return 0, err
+		}
+		page := t.pages.NewPage(id, pager.KindBlob)
+		payload := page.Payload()
+		binary.BigEndian.PutUint64(payload[overflowNext:], next)
+		binary.BigEndian.PutUint32(payload[overflowLength:], uint32(len(chunk)))
+		copy(payload[overflowHeader:], chunk)
+		if err := t.pages.Write(page); err != nil {
+			return 0, err
+		}
+		next = id
+	}
+
+	return next, nil
+}
+
+// load is the value an entry stands for, following its chain when it has one.
+//
+// Every step is checked against what the entry said to expect: a chain that is
+// too short, too long, or made of pages that are not chunks is an error rather
+// than a value with a hole in it.
+func (t *Tree) load(entry kv) ([]byte, error) {
+	if !entry.overflows() {
+		return entry.value, nil
+	}
+
+	value := make([]byte, 0, entry.length)
+	for id := entry.head; id != 0; {
+		page, err := t.pages.Read(id)
+		if err != nil {
+			return nil, err
+		}
+		if page.Kind != pager.KindBlob {
+			return nil, fmt.Errorf("%w: page %d is kind %d", ErrBrokenChain, id, page.Kind)
+		}
+
+		payload := page.Payload()
+		length := int(binary.BigEndian.Uint32(payload[overflowLength:]))
+		if length == 0 || length > overflowChunk || len(value)+length > int(entry.length) {
+			return nil, fmt.Errorf("%w: page %d carries %d bytes of a %d-byte value", ErrBrokenChain, id, length, entry.length)
+		}
+
+		value = append(value, payload[overflowHeader:overflowHeader+length]...)
+		id = binary.BigEndian.Uint64(payload[overflowNext:])
+	}
+
+	if len(value) != int(entry.length) {
+		return nil, fmt.Errorf("%w: the chain held %d bytes of a %d-byte value", ErrBrokenChain, len(value), entry.length)
+	}
+	return value, nil
 }
 
 // place is where a rewritten node goes: back where it was if no reader can see

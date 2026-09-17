@@ -179,10 +179,10 @@ func (d *SimDisk) apply(write pendingWrite, n int) {
 // grow lengthens an image with zeros, the way writing past the end of a file
 // leaves a hole.
 func grow(image []byte, size int64) []byte {
-	for int64(len(image)) < size {
-		image = append(image, 0)
+	if int64(len(image)) >= size {
+		return image
 	}
-	return image
+	return append(image, make([]byte, size-int64(len(image)))...)
 }
 
 // land decides what the pending writes leave behind when the power goes.

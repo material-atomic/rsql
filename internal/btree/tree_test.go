@@ -454,9 +454,9 @@ func TestAKeyOrValueThatDoesNotFitIsRefused(t *testing.T) {
 		t.Errorf("long value: want ErrValueTooLarge, got %v", err)
 	}
 
-	// The largest key and value the tree accepts must actually fit, twice over:
-	// two of them have to share a page for a split to be possible.
-	big := bytes.Repeat([]byte("v"), MaxValue)
+	// The largest key and the largest value that stays in the leaf must fit
+	// twice over: two of them have to share a page for a split to be possible.
+	big := bytes.Repeat([]byte("v"), MaxInline)
 	for i := 0; i < 50; i++ {
 		key := append(bytes.Repeat([]byte("k"), MaxKey-4), []byte(fmt.Sprintf("%04d", i))...)
 		if err := tree.Put(key, big); err != nil {
@@ -758,5 +758,248 @@ func TestBranchesTooFullToMergeAreSplitAgainCorrectly(t *testing.T) {
 	walked, _ := collect(t, tree, nil)
 	if len(walked) != 11 {
 		t.Errorf("the walk has %d keys, want 11", len(walked))
+	}
+}
+
+// A value too big for a leaf goes to pages of its own, and has to come back
+// exactly — including at the sizes where it lands on a page boundary.
+func TestLargeValuesGoOutOfLineAndComeBackWhole(t *testing.T) {
+	sizes := []int{
+		MaxInline,     // the last size that stays in the leaf
+		MaxInline + 1, // the first that does not
+		overflowChunk - 1, overflowChunk, overflowChunk + 1,
+		2*overflowChunk - 1, 2 * overflowChunk, 2*overflowChunk + 1,
+		300 * 1024,
+	}
+
+	_, tree := freshTree(t, 17)
+	model := map[string][]byte{}
+
+	for i, size := range sizes {
+		key := fmt.Sprintf("value-%02d", i)
+		value := make([]byte, size)
+		for at := range value {
+			// Not a repeated byte: a chain stitched together in the wrong order
+			// would still look right if every byte were the same.
+			value[at] = byte(at*7 + i)
+		}
+		if err := tree.Put([]byte(key), value); err != nil {
+			t.Fatalf("put %d bytes: %v", size, err)
+		}
+		model[key] = value
+	}
+	check(t, tree)
+
+	// The boundary is where it says it is: one more byte and the leaf holds a
+	// reference instead of the value.
+	page, err := tree.pages.Read(tree.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := decodeLeaf(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		size := len(model[string(entry.key)])
+		if entry.overflows() != (size > MaxInline) {
+			t.Errorf("a %d-byte value: overflows=%v", size, entry.overflows())
+		}
+		if entry.overflows() && int(entry.length) != size {
+			t.Errorf("a %d-byte value says it is %d bytes", size, entry.length)
+		}
+	}
+
+	for key, want := range model {
+		got, found, err := tree.Get([]byte(key))
+		if err != nil || !found {
+			t.Fatalf("%s: found=%v, err=%v", key, found, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: %d bytes back of %d, and not the same ones", key, len(got), len(want))
+		}
+	}
+}
+
+// Large values must survive everything the tree does to its leaves: splits,
+// merges, overwrites, and a restart.
+func TestLargeValuesSurviveSplitsAndARestart(t *testing.T) {
+	disk := vfs.NewSim(18, vfs.Faults{})
+	pages, err := pager.Create(disk, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := New(pages)
+
+	// With the value out of line a leaf entry is only a key and a page number,
+	// so it takes rather more documents than it used to before a leaf splits —
+	// which is the point of moving them out.
+	body := func(i int) []byte {
+		value := make([]byte, 5000+i%97*13)
+		for at := range value {
+			value[at] = byte(at + i)
+		}
+		return value
+	}
+
+	const count = 1200
+	for i := 0; i < count; i++ {
+		if err := tree.Put([]byte(fmt.Sprintf("doc-%04d", i)), body(i)); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if check(t, tree) < 2 {
+		t.Fatal("this test wants the leaves to have split")
+	}
+
+	// Overwritten with something of a different shape, so the entry changes
+	// from one chain to another and, for some, back into the leaf.
+	for i := 0; i < count; i += 3 {
+		small := []byte(fmt.Sprintf("small-%d", i))
+		if err := tree.Put([]byte(fmt.Sprintf("doc-%04d", i)), small); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tree.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	restart := vfs.NewSim(18, vfs.Faults{})
+	restart.Restore(disk.Durable())
+	reopened, err := pager.Open(restart, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := New(reopened)
+	check(t, after)
+
+	for i := 0; i < count; i++ {
+		want := body(i)
+		if i%3 == 0 {
+			want = []byte(fmt.Sprintf("small-%d", i))
+		}
+		got, found, err := after.Get([]byte(fmt.Sprintf("doc-%04d", i)))
+		if err != nil || !found {
+			t.Fatalf("doc %d: found=%v, err=%v", i, found, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("doc %d came back as %d bytes, want %d", i, len(got), len(want))
+		}
+	}
+
+	// And the walk hands back the same values the search does.
+	keys, values := collect(t, after, nil)
+	if len(keys) != count {
+		t.Fatalf("the walk has %d keys of %d", len(keys), count)
+	}
+	for i, key := range keys {
+		got, _, err := after.Get([]byte(key))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if values[i] != string(got) {
+			t.Fatalf("%s reads differently through the walk than through a search", key)
+		}
+	}
+}
+
+// A chain that does not hold together is an error, never a value with a hole
+// in it.
+func TestABrokenChainIsRefused(t *testing.T) {
+	damage := map[string]func(t *testing.T, tree *Tree, head uint64){
+		"a chunk that claims more than a page holds": func(t *testing.T, tree *Tree, head uint64) {
+			page, err := tree.pages.Read(head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binary.BigEndian.PutUint32(page.Payload()[overflowLength:], uint32(capacityBytes+1))
+			if err := tree.pages.Write(page); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a chain that ends early": func(t *testing.T, tree *Tree, head uint64) {
+			page, err := tree.pages.Read(head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binary.BigEndian.PutUint64(page.Payload()[overflowNext:], 0)
+			if err := tree.pages.Write(page); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a chunk that is not a chunk at all": func(t *testing.T, tree *Tree, head uint64) {
+			page, err := tree.pages.Read(head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page.Kind = pager.KindLeaf
+			if err := tree.pages.Write(page); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+
+	for name, break_ := range damage {
+		t.Run(name, func(t *testing.T) {
+			_, tree := freshTree(t, 19)
+			if err := tree.Put([]byte("big"), bytes.Repeat([]byte("v"), 3*overflowChunk)); err != nil {
+				t.Fatal(err)
+			}
+
+			page, err := tree.pages.Read(tree.Root())
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := decodeLeaf(page)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !entries[0].overflows() {
+				t.Fatal("this test needs a value that overflowed")
+			}
+
+			break_(t, tree, entries[0].head)
+
+			if _, _, err := tree.Get([]byte("big")); !errors.Is(err, ErrBrokenChain) {
+				t.Errorf("want ErrBrokenChain, got %v", err)
+			}
+		})
+	}
+}
+
+// A leaf whose reference points at a meta page is damage, not a value: a chain
+// may never start at page 0 or 1.
+//
+// Page 0 has to be written into the page by hand. In memory a head of zero is
+// how an entry says it holds its value inline, so only the bytes on disk can
+// say "out of line, starting at page zero" — which is exactly the damaged
+// leaf this guards against.
+func TestAChainThatStartsAtAMetaPageIsRefused(t *testing.T) {
+	for _, head := range []uint64{0, 1} {
+		t.Run(fmt.Sprintf("head %d", head), func(t *testing.T) {
+			_, tree := freshTree(t, 20)
+			if err := tree.Put([]byte("big"), bytes.Repeat([]byte("v"), 2*overflowChunk)); err != nil {
+				t.Fatal(err)
+			}
+
+			page, err := tree.pages.Read(tree.Root())
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := page.Payload()
+			at := int(binary.BigEndian.Uint16(payload[leafHeader:]))
+			keyLen := int(binary.BigEndian.Uint16(payload[at:]))
+			if binary.BigEndian.Uint32(payload[at+2:])&overflowFlag == 0 {
+				t.Fatal("this test needs a value that overflowed")
+			}
+			binary.BigEndian.PutUint64(payload[at+leafEntry+keyLen:], head)
+			if err := tree.pages.Write(page); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, _, err := tree.Get([]byte("big")); !errors.Is(err, ErrMalformed) {
+				t.Errorf("want ErrMalformed, got %v", err)
+			}
+		})
 	}
 }

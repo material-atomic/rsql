@@ -41,17 +41,39 @@ const (
 // children, so the tree stays shallow.
 const MaxKey = 512
 
-// MaxValue is the largest value that fits beside a key in a leaf.
+// MaxInline is the largest value kept beside its key in the leaf.
 //
 // Two entries of the largest size must share a page, so that a leaf which
-// overflows can always be split into two that fit. Anything bigger than this
-// belongs in overflow pages, which the tree does not have yet and which is why
-// this is an error rather than a silent slow path.
-const MaxValue = capacityBytes/2 - leafEntry - slotBytes - MaxKey
+// overflows can always be split into two that fit. Anything bigger goes to
+// overflow pages, and the leaf keeps only where to find it.
+const MaxInline = capacityBytes/2 - leafEntry - slotBytes - MaxKey
+
+// MaxValue is the largest value the tree stores at all. It matches the largest
+// frame the protocol carries, so a value that reaches the engine can always be
+// handed back over the wire.
+const MaxValue = 16 << 20
+
+// overflowFlag in an entry's length field says the bytes in the leaf are not
+// the value but the page its chain starts at. The length field is a u32 and a
+// value is capped well under 2GiB, so the top bit is free to say so.
+const overflowFlag uint32 = 1 << 31
+
+// An overflow page is a chunk of a value: where the rest of it continues, how
+// much of it is here, and then the bytes.
+const (
+	overflowNext   = 0 // u64
+	overflowLength = 8 // u32
+	overflowHeader = 12
+	// overflowChunk is how much of a value one page carries.
+	overflowChunk = capacityBytes - overflowHeader
+	// referenceBytes is what a leaf keeps instead of the value: the head page.
+	referenceBytes = 8
+)
 
 var (
 	ErrKeyTooLarge   = fmt.Errorf("rsql/btree: a key may be at most %d bytes", MaxKey)
 	ErrValueTooLarge = fmt.Errorf("rsql/btree: a value may be at most %d bytes", MaxValue)
+	ErrBrokenChain   = errors.New("rsql/btree: the overflow chain of a value does not hold together")
 	ErrEmptyKey      = errors.New("rsql/btree: a key may not be empty")
 	ErrMalformed     = errors.New("rsql/btree: the page is not a node this build can read")
 	ErrNotANode      = errors.New("rsql/btree: the page is not a tree node")
@@ -62,10 +84,27 @@ var (
 	ErrCannotSplit = errors.New("rsql/btree: a node overflowed with nowhere to split it")
 )
 
-// kv is one leaf entry.
+// kv is one leaf entry as it is stored.
+//
+// A small value sits in `value`. A large one lives in a chain of overflow
+// pages: `head` is where the chain starts, `length` is how long the value is,
+// and the leaf holds neither the bytes nor any part of them.
 type kv struct {
-	key   []byte
-	value []byte
+	key    []byte
+	value  []byte
+	head   uint64
+	length uint32
+}
+
+// overflows reports whether the value is out of line.
+func (e kv) overflows() bool { return e.head != 0 }
+
+// inlineBytes is how much of a page this entry's value takes.
+func (e kv) inlineBytes() int {
+	if e.overflows() {
+		return referenceBytes
+	}
+	return len(e.value)
 }
 
 // branch is an internal node: n separator keys and n+1 children.
@@ -91,7 +130,7 @@ func checkKey(key []byte) error {
 func leafBytes(entries []kv) int {
 	total := leafHeader
 	for _, entry := range entries {
-		total += slotBytes + leafEntry + len(entry.key) + len(entry.value)
+		total += slotBytes + leafEntry + len(entry.key) + entry.inlineBytes()
 	}
 	return total
 }
@@ -116,12 +155,19 @@ func encodeLeaf(page *pager.Page, entries []kv) error {
 	// meet, which leafBytes has already established.
 	heap := len(payload)
 	for i, entry := range entries {
-		heap -= leafEntry + len(entry.key) + len(entry.value)
+		heap -= leafEntry + len(entry.key) + entry.inlineBytes()
 		binary.BigEndian.PutUint16(payload[leafHeader+i*slotBytes:], uint16(heap))
 		binary.BigEndian.PutUint16(payload[heap:], uint16(len(entry.key)))
-		binary.BigEndian.PutUint32(payload[heap+2:], uint32(len(entry.value)))
 		copy(payload[heap+leafEntry:], entry.key)
-		copy(payload[heap+leafEntry+len(entry.key):], entry.value)
+
+		at := heap + leafEntry + len(entry.key)
+		if entry.overflows() {
+			binary.BigEndian.PutUint32(payload[heap+2:], entry.length|overflowFlag)
+			binary.BigEndian.PutUint64(payload[at:], entry.head)
+			continue
+		}
+		binary.BigEndian.PutUint32(payload[heap+2:], uint32(len(entry.value)))
+		copy(payload[at:], entry.value)
 	}
 	return nil
 }
@@ -151,13 +197,32 @@ func decodeLeaf(page *pager.Page) ([]kv, error) {
 			return nil, ErrMalformed
 		}
 		keyLen := int(binary.BigEndian.Uint16(payload[at:]))
-		valueLen := int(binary.BigEndian.Uint32(payload[at+2:]))
+		stored := binary.BigEndian.Uint32(payload[at+2:])
 		start := at + leafEntry
-		if keyLen > MaxKey || valueLen > capacityBytes || start+keyLen+valueLen > len(payload) {
+		if keyLen > MaxKey || start+keyLen > len(payload) {
+			return nil, ErrMalformed
+		}
+		key := append([]byte(nil), payload[start:start+keyLen]...)
+
+		if stored&overflowFlag != 0 {
+			length := stored &^ overflowFlag
+			if length > MaxValue || start+keyLen+referenceBytes > len(payload) {
+				return nil, ErrMalformed
+			}
+			head := binary.BigEndian.Uint64(payload[start+keyLen:])
+			if head <= 1 {
+				return nil, ErrMalformed
+			}
+			entries = append(entries, kv{key: key, head: head, length: length})
+			continue
+		}
+
+		valueLen := int(stored)
+		if valueLen > capacityBytes || start+keyLen+valueLen > len(payload) {
 			return nil, ErrMalformed
 		}
 		entries = append(entries, kv{
-			key:   append([]byte(nil), payload[start:start+keyLen]...),
+			key:   key,
 			value: append([]byte(nil), payload[start+keyLen:start+keyLen+valueLen]...),
 		})
 	}
@@ -237,7 +302,7 @@ func findKey(entries []kv, key []byte) (int, bool) {
 func splitLeaf(entries []kv) (int, bool) {
 	prefix := make([]int, len(entries)+1)
 	for i, entry := range entries {
-		prefix[i+1] = prefix[i] + slotBytes + leafEntry + len(entry.key) + len(entry.value)
+		prefix[i+1] = prefix[i] + slotBytes + leafEntry + len(entry.key) + entry.inlineBytes()
 	}
 
 	best, bestSkew := 0, 0
