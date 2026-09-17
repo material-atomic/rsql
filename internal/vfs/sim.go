@@ -55,6 +55,10 @@ type Faults struct {
 // done, so that is the only place this simulator tears one.
 type SimDisk struct {
 	durable []byte
+	// current is the file as the writer sees it: durable with every pending
+	// write laid over it. Kept as an image rather than rebuilt per read, so a
+	// long run between syncs does not make reads quadratic.
+	current []byte
 	// pending is the writes since the last honest Sync, in the order they were
 	// made. Each is kept whole: what a crash does to it is decided then.
 	pending []pendingWrite
@@ -100,7 +104,7 @@ func (d *SimDisk) alive() error {
 }
 
 // ReadAt reads what the file looks like right now: durable bytes, with
-// anything written since laid over them in the order it was written.
+// anything written since laid over them.
 func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 	if err := d.alive(); err != nil {
 		return 0, err
@@ -109,35 +113,12 @@ func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 		return 0, errors.New("rsql/vfs: negative offset")
 	}
 
-	size := d.size()
+	size := int64(len(d.current))
 	if off >= size {
 		return 0, fmt.Errorf("rsql/vfs: read at %d past end %d", off, size)
 	}
 
-	n := 0
-	for i := range p {
-		at := off + int64(i)
-		if at >= size {
-			break
-		}
-		if at < int64(len(d.durable)) {
-			p[i] = d.durable[at]
-		} else {
-			p[i] = 0
-		}
-		n++
-	}
-
-	for _, write := range d.pending {
-		for i := range write.data {
-			at := write.off + int64(i)
-			if at < off || at >= off+int64(n) {
-				continue
-			}
-			p[at-off] = write.data[i]
-		}
-	}
-
+	n := copy(p, d.current[off:])
 	if n < len(p) {
 		return n, fmt.Errorf("rsql/vfs: short read of %d of %d bytes", n, len(p))
 	}
@@ -155,7 +136,10 @@ func (d *SimDisk) WriteAt(p []byte, off int64) (int, error) {
 	}
 
 	d.writes++
-	d.pending = append(d.pending, pendingWrite{off: off, data: append([]byte(nil), p...)})
+	write := pendingWrite{off: off, data: append([]byte(nil), p...)}
+	d.pending = append(d.pending, write)
+	d.current = grow(d.current, off+int64(len(p)))
+	copy(d.current[off:], write.data)
 
 	if d.faults.PowerCutAfter > 0 && d.writes >= d.faults.PowerCutAfter {
 		d.logf("power cut after %d writes", d.writes)
@@ -178,9 +162,9 @@ func (d *SimDisk) Sync() error {
 		return nil
 	}
 
-	for _, write := range d.pending {
-		d.apply(write, len(write.data))
-	}
+	// Everything pending is already in the current image, which is therefore
+	// exactly what a restart would now find.
+	d.durable = append([]byte(nil), d.current...)
 	d.pending = nil
 	d.logf("sync made everything durable")
 	return nil
@@ -188,10 +172,17 @@ func (d *SimDisk) Sync() error {
 
 // apply puts the first n bytes of a write into the durable image.
 func (d *SimDisk) apply(write pendingWrite, n int) {
-	for int64(len(d.durable)) < write.off+int64(n) {
-		d.durable = append(d.durable, 0)
-	}
+	d.durable = grow(d.durable, write.off+int64(n))
 	copy(d.durable[write.off:], write.data[:n])
+}
+
+// grow lengthens an image with zeros, the way writing past the end of a file
+// leaves a hole.
+func grow(image []byte, size int64) []byte {
+	for int64(len(image)) < size {
+		image = append(image, 0)
+	}
+	return image
 }
 
 // land decides what the pending writes leave behind when the power goes.
@@ -207,6 +198,7 @@ func (d *SimDisk) land() {
 	if !d.faults.ReorderWrites && d.faults.TornWrite <= 0 {
 		d.logf("crash lost all %d pending writes", len(d.pending))
 		d.pending = nil
+		d.current = append([]byte(nil), d.durable...)
 		return
 	}
 
@@ -229,17 +221,10 @@ func (d *SimDisk) land() {
 
 	d.logf("crash kept %d of %d pending writes, reordered=%v", kept, len(writes), d.faults.ReorderWrites)
 	d.pending = nil
+	d.current = append([]byte(nil), d.durable...)
 }
 
-func (d *SimDisk) size() int64 {
-	size := int64(len(d.durable))
-	for _, write := range d.pending {
-		if end := write.off + int64(len(write.data)); end > size {
-			size = end
-		}
-	}
-	return size
-}
+func (d *SimDisk) size() int64 { return int64(len(d.current)) }
 
 // Size is what a restart would report, plus anything written since.
 func (d *SimDisk) Size() (int64, error) {
@@ -262,9 +247,12 @@ func (d *SimDisk) Truncate(size int64) error {
 	if size < int64(len(d.durable)) {
 		d.durable = d.durable[:size]
 	} else {
-		for int64(len(d.durable)) < size {
-			d.durable = append(d.durable, 0)
-		}
+		d.durable = grow(d.durable, size)
+	}
+	if size < int64(len(d.current)) {
+		d.current = d.current[:size]
+	} else {
+		d.current = grow(d.current, size)
 	}
 
 	kept := d.pending[:0]
@@ -299,6 +287,7 @@ func (d *SimDisk) Crash() *SimDisk {
 
 	restarted := NewSim(d.random.Int63(), d.faults)
 	restarted.durable = image
+	restarted.current = append([]byte(nil), image...)
 	restarted.Trace = append(restarted.Trace, fmt.Sprintf("restarted with %d durable bytes", len(image)))
 	return restarted
 }
@@ -307,6 +296,7 @@ func (d *SimDisk) Crash() *SimDisk {
 // file another disk left behind.
 func (d *SimDisk) Restore(image []byte) {
 	d.durable = append([]byte(nil), image...)
+	d.current = append([]byte(nil), image...)
 	d.pending = nil
 	d.cut = false
 	d.writes = 0

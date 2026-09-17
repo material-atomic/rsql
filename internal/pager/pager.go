@@ -121,6 +121,9 @@ type Pager struct {
 	// maxPages is the quota, enforced by the engine rather than accounted for
 	// elsewhere: a page that would go past it is not allocated.
 	maxPages uint64
+	// committed is how many pages the last completed transaction had. Anything
+	// from here up was allocated by the transaction in progress.
+	committed uint64
 }
 
 // Create writes a fresh database: two meta pages, no data.
@@ -138,6 +141,7 @@ func Create(file vfs.File, maxPages uint64) (*Pager, error) {
 	}
 
 	pager.nextMeta = 0
+	pager.committed = pager.meta.PageCount
 	return pager, nil
 }
 
@@ -170,6 +174,7 @@ func Open(file vfs.File, maxPages uint64) (*Pager, error) {
 		pager.meta, pager.nextMeta = first, 1
 	}
 
+	pager.committed = pager.meta.PageCount
 	return pager, nil
 }
 
@@ -185,6 +190,15 @@ func (p *Pager) Allocate() (uint64, error) {
 	p.meta.PageCount++
 	return id, nil
 }
+
+// Dirty reports whether a page was allocated by the transaction in progress.
+//
+// Nothing a reader can reach points at such a page — the committed meta page
+// does not count it — so it may be written again in place. That is what keeps
+// copy-on-write from allocating a fresh page every time the same node is
+// touched twice before a commit: the copy is owed to readers, and a page no
+// reader can see is owed nothing.
+func (p *Pager) Dirty(id uint64) bool { return id > 1 && id >= p.committed }
 
 // NewPage is an empty page of a kind, ready to be filled and written.
 func (p *Pager) NewPage(id uint64, kind uint8) *Page {
@@ -250,6 +264,7 @@ func (p *Pager) Commit(root uint64) error {
 
 	p.meta = next
 	p.nextMeta = 1 - p.nextMeta
+	p.committed = next.PageCount
 	return nil
 }
 
