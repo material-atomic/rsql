@@ -124,11 +124,19 @@ type Pager struct {
 	// committed is how many pages the last completed transaction had. Anything
 	// from here up was allocated by the transaction in progress.
 	committed uint64
+	// taken is the pages this transaction has allocated from the free list.
+	// They are below the committed mark but are no less its own.
+	taken map[uint64]bool
+	// free is what earlier transactions left behind, and when it may be used.
+	free *freelist
+	// readers counts the snapshots held at each transaction.
+	readers map[uint64]int
 }
 
 // Create writes a fresh database: two meta pages, no data.
 func Create(file vfs.File, maxPages uint64) (*Pager, error) {
-	pager := &Pager{file: file, maxPages: maxPages, meta: Meta{TxID: 1, Root: 0, Freelist: 0, PageCount: 2}}
+	pager := newPager(file, maxPages)
+	pager.meta = Meta{TxID: 1, Root: 0, Freelist: 0, PageCount: 2}
 
 	// Both meta pages, so a first crash still finds one.
 	for _, id := range []uint64{0, 1} {
@@ -146,8 +154,18 @@ func Create(file vfs.File, maxPages uint64) (*Pager, error) {
 }
 
 // Open reads an existing database and takes the newer of its two meta pages.
+func newPager(file vfs.File, maxPages uint64) *Pager {
+	return &Pager{
+		file:     file,
+		maxPages: maxPages,
+		taken:    map[uint64]bool{},
+		free:     newFreelist(),
+		readers:  map[uint64]int{},
+	}
+}
+
 func Open(file vfs.File, maxPages uint64) (*Pager, error) {
-	pager := &Pager{file: file, maxPages: maxPages}
+	pager := newPager(file, maxPages)
 
 	first, firstErr := pager.readMeta(0)
 	second, secondErr := pager.readMeta(1)
@@ -175,19 +193,36 @@ func Open(file vfs.File, maxPages uint64) (*Pager, error) {
 	}
 
 	pager.committed = pager.meta.PageCount
+	if err := pager.readFreelist(pager.meta.Freelist); err != nil {
+		return nil, err
+	}
 	return pager, nil
 }
 
 // Meta is the state of the last completed transaction.
 func (p *Pager) Meta() Meta { return p.meta }
 
-// Allocate hands out the next page id, refusing to go past the quota.
+// Allocate hands out a page: one an earlier transaction left behind if any is
+// free to use, and otherwise a new one at the end of the file.
 func (p *Pager) Allocate() (uint64, error) {
+	p.promote()
+
+	if last := len(p.free.ready) - 1; last >= 0 {
+		id := p.free.ready[last]
+		p.free.ready = p.free.ready[:last]
+		p.taken[id] = true
+		delete(p.free.seen, id)
+		return id, nil
+	}
+
+	// The quota counts the file, not the tree: reusing a page costs nothing, so
+	// only growing is refused.
 	if p.maxPages > 0 && p.meta.PageCount >= p.maxPages {
 		return 0, fmt.Errorf("%w: %d pages", ErrQuota, p.maxPages)
 	}
 	id := p.meta.PageCount
 	p.meta.PageCount++
+	p.taken[id] = true
 	return id, nil
 }
 
@@ -198,7 +233,7 @@ func (p *Pager) Allocate() (uint64, error) {
 // copy-on-write from allocating a fresh page every time the same node is
 // touched twice before a commit: the copy is owed to readers, and a page no
 // reader can see is owed nothing.
-func (p *Pager) Dirty(id uint64) bool { return id > 1 && id >= p.committed }
+func (p *Pager) Dirty(id uint64) bool { return id > 1 && (id >= p.committed || p.taken[id]) }
 
 // NewPage is an empty page of a kind, ready to be filled and written.
 func (p *Pager) NewPage(id uint64, kind uint8) *Page {
@@ -250,11 +285,31 @@ func (p *Pager) Write(page *Page) error {
 // the previous transaction, whole. A crash after it leaves the new one, whole.
 // There is no third outcome, which is why there is no recovery pass.
 func (p *Pager) Commit(root uint64) error {
+	next := Meta{TxID: p.meta.TxID + 1, Root: root}
+
+	// The list pages written last time are replaced by the ones written below,
+	// so they are this transaction's garbage like any other page. Freed before
+	// the roll, so that they wait a transaction like everything else: a crash
+	// here still falls back to a state that points at them.
+	for _, id := range p.free.chain {
+		p.Free(id)
+	}
+	if len(p.free.freeing) > 0 {
+		next := p.meta.TxID + 1
+		p.free.pending[next] = append(p.free.pending[next], p.free.freeing...)
+		p.free.freeing = nil
+	}
+
+	head, chain, err := p.writeFreelist()
+	if err != nil {
+		return err
+	}
+	next.Freelist = head
+	next.PageCount = p.meta.PageCount
+
 	if err := p.file.Sync(); err != nil {
 		return err
 	}
-
-	next := Meta{TxID: p.meta.TxID + 1, Root: root, Freelist: p.meta.Freelist, PageCount: p.meta.PageCount}
 	if err := p.writeMeta(p.nextMeta, next); err != nil {
 		return err
 	}
@@ -265,6 +320,9 @@ func (p *Pager) Commit(root uint64) error {
 	p.meta = next
 	p.nextMeta = 1 - p.nextMeta
 	p.committed = next.PageCount
+	p.free.chain = chain
+	p.free.seen = map[uint64]bool{}
+	p.taken = map[uint64]bool{}
 	return nil
 }
 

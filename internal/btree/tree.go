@@ -147,8 +147,10 @@ func (t *Tree) insert(id uint64, entry kv) (uint64, []byte, uint64, error) {
 
 		at, found := findKey(entries, entry.key)
 		if found {
-			// The value that was there is now unreachable. Its pages, and the
-			// overflow chain behind them, are reclaimed by the freelist.
+			// Whatever the key held is now unreachable, chain and all.
+			if err := t.release(entries[at]); err != nil {
+				return 0, nil, 0, err
+			}
 			entries[at] = entry
 		} else {
 			entries = append(entries, kv{})
@@ -253,6 +255,7 @@ func (t *Tree) Delete(key []byte) (bool, error) {
 			if len(node.children) > 1 {
 				return true, nil
 			}
+			t.pages.Free(t.root)
 			t.root = node.children[0]
 
 		case pager.KindLeaf:
@@ -261,6 +264,7 @@ func (t *Tree) Delete(key []byte) (bool, error) {
 				return false, err
 			}
 			if len(entries) == 0 {
+				t.pages.Free(t.root)
 				t.root = 0
 			}
 			return true, nil
@@ -289,6 +293,9 @@ func (t *Tree) remove(id uint64, key []byte) (uint64, bool, error) {
 		at, found := findKey(entries, key)
 		if !found {
 			return id, false, nil
+		}
+		if err := t.release(entries[at]); err != nil {
+			return 0, false, err
 		}
 		entries = append(entries[:at], entries[at+1:]...)
 		newID, err := t.writeLeaf(id, entries)
@@ -365,6 +372,7 @@ func (t *Tree) rebalance(node branch, at int) (branch, error) {
 			if err != nil {
 				return branch{}, err
 			}
+			t.pages.Free(node.children[left+1])
 			return collapse(node, left, id), nil
 		}
 
@@ -406,6 +414,7 @@ func (t *Tree) rebalance(node branch, at int) (branch, error) {
 			if err != nil {
 				return branch{}, err
 			}
+			t.pages.Free(node.children[left+1])
 			return collapse(node, left, id), nil
 		}
 
@@ -630,12 +639,38 @@ func (t *Tree) load(entry kv) ([]byte, error) {
 }
 
 // place is where a rewritten node goes: back where it was if no reader can see
-// it, and on a new page otherwise.
+// it, and on a new page otherwise — in which case the version that was there
+// is now nobody's, and goes on the free list.
 func (t *Tree) place(at uint64) (uint64, error) {
-	if at != 0 && t.pages.Dirty(at) {
-		return at, nil
+	if at != 0 {
+		if t.pages.Dirty(at) {
+			return at, nil
+		}
+		t.pages.Free(at)
 	}
 	return t.pages.Allocate()
+}
+
+// release gives back the pages a value was living in. A value kept beside its
+// key has none of its own; one in a chain has the whole chain.
+func (t *Tree) release(entry kv) error {
+	if !entry.overflows() {
+		return nil
+	}
+
+	for id := entry.head; id != 0; {
+		page, err := t.pages.Read(id)
+		if err != nil {
+			return err
+		}
+		if page.Kind != pager.KindBlob {
+			return fmt.Errorf("%w: page %d is kind %d", ErrBrokenChain, id, page.Kind)
+		}
+		next := binary.BigEndian.Uint64(page.Payload()[overflowNext:])
+		t.pages.Free(id)
+		id = next
+	}
+	return nil
 }
 
 func copyOf(b []byte) []byte { return append([]byte(nil), b...) }

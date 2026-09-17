@@ -62,7 +62,10 @@ func check(t *testing.T, tree *Tree) int {
 		return 0
 	}
 	depths := map[int]bool{}
-	checkNode(t, tree, tree.root, nil, nil, 1, depths)
+	// Nothing the tree can reach may also be on the free list. A page handed
+	// out twice is the one way a tree that looks right can still be wrong.
+	free := tree.pages.FreeSet()
+	checkNode(t, tree, tree.root, nil, nil, 1, depths, free)
 	if len(depths) != 1 {
 		t.Fatalf("leaves sit at %d different depths: %v", len(depths), depths)
 	}
@@ -72,8 +75,12 @@ func check(t *testing.T, tree *Tree) int {
 	return 0
 }
 
-func checkNode(t *testing.T, tree *Tree, id uint64, low, high []byte, depth int, depths map[int]bool) {
+func checkNode(t *testing.T, tree *Tree, id uint64, low, high []byte, depth int, depths map[int]bool, free map[uint64]bool) {
 	t.Helper()
+
+	if free[id] {
+		t.Fatalf("page %d is part of the tree and on the free list", id)
+	}
 
 	page, err := tree.pages.Read(id)
 	if err != nil {
@@ -104,6 +111,21 @@ func checkNode(t *testing.T, tree *Tree, id uint64, low, high []byte, depth int,
 				t.Fatalf("leaf %d holds %q, at or above its subtree's ceiling %q", id, key, high)
 			}
 		}
+		for _, entry := range entries {
+			for at := entry.head; at != 0; {
+				if free[at] {
+					t.Fatalf("page %d holds part of a value and is on the free list", at)
+				}
+				chunk, err := tree.pages.Read(at)
+				if err != nil {
+					t.Fatalf("read chain page %d: %v", at, err)
+				}
+				if chunk.Kind != pager.KindBlob {
+					t.Fatalf("chain page %d is kind %d", at, chunk.Kind)
+				}
+				at = binary.BigEndian.Uint64(chunk.Payload()[overflowNext:])
+			}
+		}
 		depths[depth] = true
 
 	case pager.KindNode:
@@ -128,7 +150,7 @@ func checkNode(t *testing.T, tree *Tree, id uint64, low, high []byte, depth int,
 			if i < len(node.keys) {
 				childHigh = node.keys[i]
 			}
-			checkNode(t, tree, child, childLow, childHigh, depth+1, depths)
+			checkNode(t, tree, child, childLow, childHigh, depth+1, depths, free)
 		}
 
 	default:
@@ -1001,5 +1023,255 @@ func TestAChainThatStartsAtAMetaPageIsRefused(t *testing.T) {
 				t.Errorf("want ErrMalformed, got %v", err)
 			}
 		})
+	}
+}
+
+// A database that is only ever updated must stop growing. Without a free list
+// every overwrite costs pages forever; with one the file settles at the size of
+// what is actually stored.
+func TestOverwritingTheSameKeysStopsGrowingTheFile(t *testing.T) {
+	_, tree := freshTree(t, 21)
+
+	const keys = 400
+	write := func(round int) {
+		for i := 0; i < keys; i++ {
+			put(t, tree, fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%d-value-%d", round, i))
+		}
+		if err := tree.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(0)
+	settled := tree.pages.Meta().PageCount
+
+	var sizes []uint64
+	for round := 1; round <= 12; round++ {
+		write(round)
+		check(t, tree)
+		sizes = append(sizes, tree.pages.Meta().PageCount)
+	}
+
+	// The last rounds must all be the same size: freed pages come back one
+	// transaction later, so the first round or two may still grow.
+	last := sizes[len(sizes)-1]
+	for _, size := range sizes[len(sizes)-5:] {
+		if size != last {
+			t.Fatalf("the file is still growing: %v", sizes)
+		}
+	}
+	if last > settled*3 {
+		t.Errorf("the file settled at %d pages, %d were needed to store the data", last, settled)
+	}
+
+	// And it still holds what it should.
+	for i := 0; i < keys; i++ {
+		want := fmt.Sprintf("round-%d-value-%d", 12, i)
+		if value, found := get(t, tree, fmt.Sprintf("key-%04d", i)); !found || value != want {
+			t.Fatalf("key %d = %q, want %q", i, value, want)
+		}
+	}
+}
+
+// The promise copy-on-write makes, now that pages are reused: a reader that
+// holds a snapshot sees the database as it was, however many times the writer
+// goes round and whatever it hands back out.
+func TestASnapshotReaderIsSafeWhilePagesAreReused(t *testing.T) {
+	_, tree := freshTree(t, 22)
+
+	const keys = 300
+	for i := 0; i < keys; i++ {
+		put(t, tree, fmt.Sprintf("key-%04d", i), "first")
+	}
+	if err := tree.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	held := tree.pages.Snapshot()
+	reader := At(tree.pages, held.Root)
+
+	// Enough rounds that, without the hold, the reader's pages would have been
+	// handed out several times over.
+	for round := 0; round < 10; round++ {
+		for i := 0; i < keys; i++ {
+			put(t, tree, fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%d", round))
+		}
+		if err := tree.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		walked, values := collect(t, reader, nil)
+		if len(walked) != keys {
+			t.Fatalf("round %d: the reader sees %d keys of %d", round, len(walked), keys)
+		}
+		for i, value := range values {
+			if value != "first" {
+				t.Fatalf("round %d: the reader sees %q at %s", round, value, walked[i])
+			}
+		}
+	}
+
+	// Once it lets go, those pages are ordinary free space again.
+	before := tree.pages.FreePages()
+	held.Release()
+	if _, err := tree.pages.Allocate(); err != nil {
+		t.Fatal(err)
+	}
+	if after := tree.pages.FreePages(); after >= before {
+		t.Errorf("after the snapshot was released the list still holds %d of %d pages", after, before)
+	}
+}
+
+// Reuse and the crash fallback have to agree. A transaction may write into
+// pages the one before it gave up, because a crash lands on the last committed
+// state and that state does not point at them. It may never write into pages
+// it is giving up itself: those are exactly what the state a crash lands on is
+// made of.
+func TestACrashWhileReusingPagesLeavesTheCommittedTreeIntact(t *testing.T) {
+	const keys = 400
+
+	for attempt := int64(0); attempt < 8; attempt++ {
+		disk := vfs.NewSim(23+attempt, vfs.Faults{})
+		pages, err := pager.Create(disk, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree := New(pages)
+
+		// Several rounds, so that by the last one the writer is working almost
+		// entirely in pages earlier rounds gave back.
+		round := 0
+		for ; round < 4; round++ {
+			for i := 0; i < keys; i++ {
+				put(t, tree, fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%d", round))
+			}
+			if err := tree.Commit(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if tree.pages.FreePages() == 0 {
+			t.Fatal("this test is only worth running once pages are being reused")
+		}
+		committed := fmt.Sprintf("round-%d", round-1)
+
+		// One more round that never commits, cut off part way through.
+		stop := int(attempt+1) * keys / 8
+		for i := 0; i < stop; i++ {
+			put(t, tree, fmt.Sprintf("key-%04d", i), "never committed")
+		}
+
+		after, err := pager.Open(disk.Crash(), 0)
+		if err != nil {
+			t.Fatalf("attempt %d: open after the crash: %v", attempt, err)
+		}
+		restored := New(after)
+		check(t, restored)
+
+		walked, values := collect(t, restored, nil)
+		if len(walked) != keys {
+			t.Fatalf("attempt %d: the restored tree has %d keys of %d", attempt, len(walked), keys)
+		}
+		for i, value := range values {
+			if value != committed {
+				t.Fatalf("attempt %d: %s reads as %q, want %q", attempt, walked[i], value, committed)
+			}
+		}
+	}
+}
+
+// The same, for values that live in pages of their own: overwriting one has to
+// give its chain back, or a database of documents grows without bound however
+// small it really is.
+func TestOverwritingLargeValuesStopsGrowingTheFile(t *testing.T) {
+	_, tree := freshTree(t, 40)
+
+	const keys = 60
+	body := func(round, i int) []byte {
+		value := make([]byte, 3*overflowChunk+i)
+		for at := range value {
+			value[at] = byte(at + round)
+		}
+		return value
+	}
+	write := func(round int) {
+		for i := 0; i < keys; i++ {
+			if err := tree.Put([]byte(fmt.Sprintf("doc-%03d", i)), body(round, i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tree.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(0)
+	settled := tree.pages.Meta().PageCount
+
+	var sizes []uint64
+	for round := 1; round <= 8; round++ {
+		write(round)
+		sizes = append(sizes, tree.pages.Meta().PageCount)
+	}
+	check(t, tree)
+
+	last := sizes[len(sizes)-1]
+	for _, size := range sizes[len(sizes)-3:] {
+		if size != last {
+			t.Fatalf("the file is still growing: %v", sizes)
+		}
+	}
+	if last > settled*3 {
+		t.Errorf("the file settled at %d pages; %d hold the data", last, settled)
+	}
+
+	for i := 0; i < keys; i++ {
+		want := body(8, i)
+		got, found, err := tree.Get([]byte(fmt.Sprintf("doc-%03d", i)))
+		if err != nil || !found || !bytes.Equal(got, want) {
+			t.Fatalf("doc %d: %d bytes, found=%v, err=%v", i, len(got), found, err)
+		}
+	}
+}
+
+// Space that deletion frees has to come back — including the pages of nodes
+// that were merged away, which is most of them when a tree empties.
+func TestTheSpaceDeletionFreesComesBack(t *testing.T) {
+	_, tree := freshTree(t, 41)
+
+	const keys = 1500
+	refill := func() {
+		for i := 0; i < keys; i++ {
+			put(t, tree, fmt.Sprintf("key-%05d", i), fmt.Sprintf("value-%d", i))
+		}
+		if err := tree.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	refill()
+	full := tree.pages.Meta().PageCount
+
+	for i := 0; i < keys; i++ {
+		if removed, err := tree.Delete([]byte(fmt.Sprintf("key-%05d", i))); err != nil || !removed {
+			t.Fatalf("delete %d: %v, %v", i, removed, err)
+		}
+	}
+	if err := tree.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// A second commit, so that what the first one freed is past the crash
+	// fallback and available again.
+	if err := tree.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if freed := tree.pages.FreePages(); freed < int(full)/2 {
+		t.Fatalf("emptying a %d-page tree gave back only %d pages", full, freed)
+	}
+
+	refill()
+	check(t, tree)
+
+	if grown := tree.pages.Meta().PageCount; grown > full*3/2 {
+		t.Errorf("refilling the same data grew the file from %d to %d pages", full, grown)
 	}
 }
