@@ -220,32 +220,9 @@ func Open(file vfs.File, maxPages uint64) (*Pager, error) {
 func OpenWith(file vfs.File, options Options) (*Pager, error) {
 	pager := newPager(file, options.MaxPages)
 
-	first, firstErr := pager.readMeta(0)
-	second, secondErr := pager.readMeta(1)
-
-	switch {
-	case firstErr != nil && secondErr != nil:
-		// Both unreadable: say which way it failed, since "not our file" and
-		// "our file, damaged" call for different answers.
-		if errors.Is(firstErr, ErrNotRsql) || errors.Is(firstErr, ErrFormat) {
-			return nil, firstErr
-		}
-		return nil, fmt.Errorf("%w: %v / %v", ErrNoMeta, firstErr, secondErr)
-
-	case secondErr != nil:
-		pager.meta, pager.nextMeta = first, 1
-
-	case firstErr != nil:
-		pager.meta, pager.nextMeta = second, 0
-
-	case second.TxID > first.TxID:
-		pager.meta, pager.nextMeta = second, 0
-
-	default:
-		pager.meta, pager.nextMeta = first, 1
+	if err := pager.loadMeta(); err != nil {
+		return nil, err
 	}
-
-	pager.committed = pager.meta.PageCount
 
 	// Whether the key is right is settled here, before a single page of data is
 	// read: a wrong key found later looks exactly like a damaged file.
@@ -271,6 +248,71 @@ func OpenWith(file vfs.File, options Options) (*Pager, error) {
 		return nil, err
 	}
 	return pager, nil
+}
+
+// loadMeta takes the newer of the two meta pages, which is the last completed
+// transaction.
+//
+// One function rather than two, because opening a file and abandoning a
+// transaction are the same question — "what did the last commit leave?" — and
+// two answers to one question is one of them being wrong eventually.
+func (p *Pager) loadMeta() error {
+	first, firstErr := p.readMeta(0)
+	second, secondErr := p.readMeta(1)
+
+	switch {
+	case firstErr != nil && secondErr != nil:
+		// Both unreadable: say which way it failed, since "not our file" and
+		// "our file, damaged" call for different answers.
+		if errors.Is(firstErr, ErrNotRsql) || errors.Is(firstErr, ErrFormat) {
+			return firstErr
+		}
+		return fmt.Errorf("%w: %v / %v", ErrNoMeta, firstErr, secondErr)
+
+	case secondErr != nil:
+		p.meta, p.nextMeta = first, 1
+
+	case firstErr != nil:
+		p.meta, p.nextMeta = second, 0
+
+	case second.TxID > first.TxID:
+		p.meta, p.nextMeta = second, 0
+
+	default:
+		p.meta, p.nextMeta = first, 1
+	}
+
+	p.committed = p.meta.PageCount
+	return nil
+}
+
+// Rollback throws away everything written since the last commit.
+//
+// Copy-on-write makes this nearly free, and that is the design paying for
+// itself: nothing written since the commit is durable, nothing durable points
+// at any of it, and the pages it used were never counted by the meta on disk.
+// So abandoning a transaction is reading the file's own answer to "what did
+// the last commit leave?" — the same answer opening it would get.
+//
+// Nothing is written here. A crash mid-rollback is a crash mid-transaction,
+// which was already the case a moment before.
+func (p *Pager) Rollback() error {
+	if err := p.loadMeta(); err != nil {
+		return err
+	}
+
+	// Reading the list back is the part that matters: pages the abandoned
+	// transaction marked as rubbish are pages the live tree points at again,
+	// and anything still holding them as rubbish would hand them out to be
+	// written over. Nothing complains when that happens — the damage is found
+	// later by whoever reads through a pointer that still leads there.
+	//
+	// Clearing `taken` is housekeeping rather than a guard: no page of the
+	// committed tree can be in it, so nothing observable depends on it. It is
+	// here so that "a rollback leaves none of the transaction's bookkeeping"
+	// is true without an exception nobody would remember.
+	p.taken = map[uint64]bool{}
+	return p.readFreelist(p.meta.Freelist)
 }
 
 // Meta is the state of the last completed transaction.

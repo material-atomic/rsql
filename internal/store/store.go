@@ -62,6 +62,22 @@ func (s *Store) Identifiers(source *ulid.Source) { s.ids = source }
 // Commit makes everything written since the last one durable.
 func (s *Store) Commit() error { return s.tree.Commit() }
 
+// Rollback throws away everything written since the last commit: the
+// documents, the index entries, the log entries, the declarations.
+//
+// Every handle taken before this is refused afterwards rather than quietly
+// writing into a collection that no longer exists in the shape it had. A
+// caller that rolls back and carries on asks for what it needs again.
+func (s *Store) Rollback() error {
+	if err := s.pages.Rollback(); err != nil {
+		return err
+	}
+
+	s.tree = btree.New(s.pages)
+	s.collections = map[string]*Collection{}
+	return s.load()
+}
+
 func (s *Store) load() error {
 	prefix := []byte{spaceCatalog}
 
