@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/material-atomic/rsql/internal/btree"
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/btree"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // One database, several files, one commit.
@@ -46,11 +46,11 @@ const partRecord = 24
 var (
 	// ErrNoFiles is a database asked for a partition when it was opened
 	// without anywhere to put one.
-	ErrNoFiles = errors.New("rsql/store: this database has nowhere to keep partitions")
+	ErrNoFiles = errors.New("sapedb/store: this database has nowhere to keep partitions")
 	// ErrPartName is a partition name that cannot be part of a file name.
-	ErrPartName = errors.New("rsql/store: a partition name may hold letters, digits, dot, dash and underscore")
+	ErrPartName = errors.New("sapedb/store: a partition name may hold letters, digits, dot, dash and underscore")
 	// ErrStray is a file in the directory that no partition claims.
-	ErrStray = errors.New("rsql/store: a file is here that this database does not know about")
+	ErrStray = errors.New("sapedb/store: a file is here that this database does not know about")
 )
 
 // Files is where the other files of one database come from.

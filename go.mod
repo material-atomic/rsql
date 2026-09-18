@@ -1,4 +1,4 @@
-module github.com/material-atomic/rsql
+module github.com/sapedb/sapedb
 
 go 1.24
 

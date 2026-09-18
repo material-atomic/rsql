@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // Operating a database over the wire.
@@ -23,7 +23,7 @@ import (
 // change log with a name against it, which reading the files is not.
 
 // ErrNotOperator is an explore on a connection that has not proved itself.
-var ErrNotOperator = errors.New("rsql/server: this connection may not explore; prove the server secret first")
+var ErrNotOperator = errors.New("sapedb/server: this connection may not explore; prove the server secret first")
 
 // elevating is the answer to the challenge in the welcome.
 type elevating struct {
@@ -59,7 +59,7 @@ type explored struct {
 func (s *Server) elevate(live *session, payload []byte) error {
 	asked := elevating{}
 	if err := json.Unmarshal(payload, &asked); err != nil {
-		return fmt.Errorf("rsql/server: the proof does not read as one: %w", err)
+		return fmt.Errorf("sapedb/server: the proof does not read as one: %w", err)
 	}
 
 	// Checked against the challenge this connection was given, so a proof
@@ -80,7 +80,7 @@ func (s *Server) explore(live *session, payload []byte) ([]byte, error) {
 
 	asked := exploring{}
 	if err := json.Unmarshal(payload, &asked); err != nil {
-		return nil, fmt.Errorf("rsql/server: the access does not read as one: %w", err)
+		return nil, fmt.Errorf("sapedb/server: the access does not read as one: %w", err)
 	}
 
 	// Reached exactly as a call reaches a database: being an operator says

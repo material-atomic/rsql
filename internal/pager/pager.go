@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"hash/crc32"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // PageBytes is the size of every page in the file.
@@ -39,6 +39,14 @@ const MetaBytes = 256
 // Magic marks the file as ours, and Format is the version of the layout.
 // Both are read before anything else; a file that does not carry them is not
 // opened, rather than read as if it were.
+//
+// The first four of those bytes still spell the product's old name, on
+// purpose, not by oversight: this is the format tag written into every
+// database file that already exists, and changing it would make every one
+// of those files fail to open as "not ours" — for a file that is, in fact,
+// ours. It is a format tag, not a product name, and it only ever changes
+// together with Format, in a commit that also ships a migration for reading
+// the old tag. This is not that commit.
 var Magic = [8]byte{'R', 'S', 'Q', 'L', 'D', 'B', 0, 1}
 
 const Format uint16 = 1
@@ -96,15 +104,15 @@ const (
 )
 
 var (
-	ErrNotRsql      = errors.New("rsql/pager: not an rsql file")
-	ErrFormat       = errors.New("rsql/pager: file format is from another version")
-	ErrChecksum     = errors.New("rsql/pager: page failed its checksum")
-	ErrNoMeta       = errors.New("rsql/pager: neither meta page is readable")
-	ErrPageKind     = errors.New("rsql/pager: page is not of the expected kind")
-	ErrQuota        = errors.New("rsql/pager: database is at its page limit")
-	ErrOutOfRange   = errors.New("rsql/pager: page id past the end of the file")
-	ErrReadOnlyPage = errors.New("rsql/pager: the pages at the front of a file are not written by hand")
-	ErrTruncated    = errors.New("rsql/pager: the file is shorter than its meta page says")
+	ErrNotSapedb    = errors.New("sapedb/pager: not a sapedb file")
+	ErrFormat       = errors.New("sapedb/pager: file format is from another version")
+	ErrChecksum     = errors.New("sapedb/pager: page failed its checksum")
+	ErrNoMeta       = errors.New("sapedb/pager: neither meta page is readable")
+	ErrPageKind     = errors.New("sapedb/pager: page is not of the expected kind")
+	ErrQuota        = errors.New("sapedb/pager: database is at its page limit")
+	ErrOutOfRange   = errors.New("sapedb/pager: page id past the end of the file")
+	ErrReadOnlyPage = errors.New("sapedb/pager: the pages at the front of a file are not written by hand")
+	ErrTruncated    = errors.New("sapedb/pager: the file is shorter than its meta page says")
 )
 
 // castagnoli is the polynomial with hardware support on the machines this runs
@@ -192,7 +200,7 @@ func CreateWith(file vfs.File, options Options) (*Pager, error) {
 
 	if len(options.Key) > 0 {
 		if _, err := rand.Read(pager.meta.Salt[:]); err != nil {
-			return nil, fmt.Errorf("rsql/pager: no randomness for the salt: %w", err)
+			return nil, fmt.Errorf("sapedb/pager: no randomness for the salt: %w", err)
 		}
 		if err := makeCheck(options.Key, pager.meta.Salt[:], pager.meta.Check[:]); err != nil {
 			return nil, err
@@ -284,7 +292,7 @@ func (p *Pager) loadMeta() error {
 	case firstErr != nil && secondErr != nil:
 		// Both unreadable: say which way it failed, since "not our file" and
 		// "our file, damaged" call for different answers.
-		if errors.Is(firstErr, ErrNotRsql) || errors.Is(firstErr, ErrFormat) {
+		if errors.Is(firstErr, ErrNotSapedb) || errors.Is(firstErr, ErrFormat) {
 			return firstErr
 		}
 		return fmt.Errorf("%w: %v / %v", ErrNoMeta, firstErr, secondErr)
@@ -438,7 +446,7 @@ func (p *Pager) Write(page *Page) error {
 		return ErrReadOnlyPage
 	}
 	if len(page.Data) != PageBytes {
-		return fmt.Errorf("rsql/pager: page %d is %d bytes, want %d", page.ID, len(page.Data), PageBytes)
+		return fmt.Errorf("sapedb/pager: page %d is %d bytes, want %d", page.ID, len(page.Data), PageBytes)
 	}
 
 	seal(page.Data, page.ID, page.Kind)
@@ -548,7 +556,7 @@ func (p *Pager) readMeta(id uint64) (Meta, error) {
 	}
 
 	if string(data[offMagic:offMagic+8]) != string(Magic[:]) {
-		return Meta{}, ErrNotRsql
+		return Meta{}, ErrNotSapedb
 	}
 	if format := binary.BigEndian.Uint16(data[offFormat:]); format != Format {
 		return Meta{}, fmt.Errorf("%w: file says %d, this build reads %d", ErrFormat, format, Format)

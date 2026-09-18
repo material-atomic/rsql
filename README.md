@@ -1,4 +1,4 @@
-# rsql
+# sapedb
 
 A storage service whose only interface is a **named, declared operation**.
 
@@ -39,8 +39,8 @@ Said plainly, because a database that oversells itself costs somebody a quarter.
 
 | Path | What |
 | --- | --- |
-| `cmd/rsqld` | The server |
-| `cmd/rsql` | The CLI: apply, ls, dump, restore, log, url, shell |
+| `cmd/sapedbd` | The server |
+| `cmd/sapedb` | The CLI: apply, ls, dump, restore, log, url, shell |
 | `internal/vfs` | The only thing that touches a disk, and a simulated disk that can be told to lie |
 | `internal/pager` | Pages, checksums, two alternating meta pages, encryption at rest |
 | `internal/btree` | Copy-on-write B+tree |
@@ -53,11 +53,11 @@ Said plainly, because a database that oversells itself costs somebody a quarter.
 | `examples/ledger` | Order → payment → double-entry ledger, running |
 
 The client for TypeScript applications is
-[`@ecosy/rsql`](https://github.com/material-atomic/ecosy-rsql).
+[`@ecosy/sapedb`](https://github.com/material-atomic/ecosy-sapedb).
 
 ## The parts, briefly
 
-**Operations.** Declared in a JSON file and applied with `rsql apply`. Get by
+**Operations.** Declared in a JSON file and applied with `sapedb apply`. Get by
 key, scan a declared index between declared bounds, count, insert, put, update,
 delete — and `batch`, which is several of those in one transaction, where a step
 may require the document to already be in a particular state. That last part is
@@ -82,7 +82,7 @@ operation is declared rather than where it runs.
 **Rollups** are totals kept by the transaction that changes them, so a count can
 never disagree with the data it counts.
 
-**The operator shell** (`rsql shell`) is for the question nobody declared. It
+**The operator shell** (`sapedb shell`) is for the question nobody declared. It
 can do exactly what an operation could declare, nothing more; it proves it holds
 the server's own secret before it may; every access it makes goes into the
 change log with a name against it; and `declare` prints the operation that would
@@ -94,19 +94,19 @@ without the key or "not our file" and "wrong key" become one answer.
 
 ## Running it
 
-    go build ./cmd/rsqld ./cmd/rsql
+    go build ./cmd/sapedbd ./cmd/sapedb
 
-    export RSQL_SECRET=... RSQL_DIR=/var/lib/rsql RSQL_ACCOUNT=acme RSQL_DB=main
-    rsql apply schema.json
-    rsqld
+    export SAPEDB_SECRET=... SAPEDB_DIR=/var/lib/sapedb SAPEDB_ACCOUNT=acme SAPEDB_DB=main
+    sapedb apply schema.json
+    sapedbd
 
-The server refuses to start without TLS unless `RSQL_INSECURE=1` says you meant
+The server refuses to start without TLS unless `SAPEDB_INSECURE=1` says you meant
 it. The Docker image ships the server binary and nothing else — no shell, no
 package manager, no libc.
 
 To watch the example end to end:
 
-    RSQL_SERVER_BIN=./rsqld RSQL_CLI_BIN=./rsql node examples/ledger/run.mjs
+    SAPEDB_SERVER_BIN=./sapedbd SAPEDB_CLI_BIN=./sapedb node examples/ledger/run.mjs
 
 ## How this is tested
 
@@ -132,7 +132,7 @@ with itself. Only running them together found any of them.
 ## The shared fixture
 
 `fixtures/signing.json` carries connection triples with their expected digests.
-Both this repository's tests and `@ecosy/rsql`'s read it, so a change to the
+Both this repository's tests and `@ecosy/sapedb`'s read it, so a change to the
 contract turns both suites red at once — instead of arriving as a user who
 cannot connect, with nothing in a log to say which side is wrong.
 

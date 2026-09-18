@@ -5,56 +5,56 @@
     "derived": "key = HMAC-SHA256(secret, label); sig = hex(HMAC-SHA256(key, message)) — the default",
     "direct": "sig = hex(HMAC-SHA256(secret, message)) — pass label: null"
   },
-  "secret": "rsql-fixture-secret-do-not-use-in-production",
-  "label": "ecosy/rsql:connection:v1",
+  "secret": "sapedb-fixture-secret-do-not-use-in-production",
+  "label": "ecosy/sapedb:connection:v1",
   "cases": [
     {
       "name": "plain",
       "accountId": "11111111-1111-4111-8111-111111111111",
       "password": "matkhau-don-gian",
       "dbname": "22222222-2222-4222-8222-222222222222",
-      "derived": "403a3de18acbccafa321b0fa54a4e898f99dd9b90c7a21073c12284e7a0bef0c",
-      "direct": "30f6b28e266f18c5816ee8692f24f4cb9a0d189676f7db4d792ca763ef89a976"
+      "derived": "9f2feb72b2bcc1bcfbd34a3fe9a14782184581562d375baff0584ea298452129",
+      "direct": "098384caaf3da5647d25a4d4546979611f9c36383a5a9e1338177e6dc056fcd1"
     },
     {
       "name": "every allowed character class",
       "accountId": "0",
       "password": "aA0._~-aA0._~-aA0._~-",
       "dbname": "p",
-      "derived": "f29e4d1217a7261d24f1d1e984778cfed48b5e988839a3fa0f3f472010db2b8f",
-      "direct": "db115d84207d06b9e75fd8b83e0cfca71a26beae3dce7ea751206e1e10695ec6"
+      "derived": "3cdaa3b7032eaba65e7e4bc744333f0eca8726508d07d0daab4c11ac155af5ea",
+      "direct": "e9fb0e51b68f30ee31756d0dac07d54a22b6573dc68ad965526106b00633f8b1"
     },
     {
       "name": "longest password",
       "accountId": "u",
       "password": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
       "dbname": "proj",
-      "derived": "fe2d993e266ee3334362edd16eea995609f448b2b09cf0e027dda32a1ddaf5eb",
-      "direct": "aad7fda955778ff9f1ce91186c2d8c4c48da3d31f2778f1b5c6dcab73c2c05fa"
+      "derived": "53c74ce3f22e439b0c4a9672962c37aafc14a4b179975133ea6a6d800d36441f",
+      "direct": "cd9f06add415b3d670dcb876df9c7f251f16b1a37d020ffcc5f75806fb8e3798"
     },
     {
       "name": "shortest password",
       "accountId": "user",
       "password": "yyyyyyyyyyyyyyyy",
       "dbname": "project",
-      "derived": "cd12ee10ebed2c09d46bfe3bf98e399300692389a56395aa7442f22f59c48715",
-      "direct": "b40f87391c2af50631be64a9d507e653e635c171f63014cbfec47026e926ebff"
+      "derived": "380d60da5000739108d1a55858f80e9441c4c15ec02960247af7d6422bb8e0af",
+      "direct": "601e612b01b5c94c7e2bfac6255691650153313336f49f2c5b1c0fb069d38553"
     },
     {
       "name": "one split of ab|c…",
       "accountId": "ab",
       "password": "cccccccccccccccc",
       "dbname": "x",
-      "derived": "2aac3f424e229bb2a04286156ca5790b65ced0475f5a14b43f52f035723e24a8",
-      "direct": "6fd37b7be0f00cc382f4ea1008c56aa8d4b61a2768e45770c1496ebbb2618d2f"
+      "derived": "a5c3add112876a8a3d20c11df0546e70ab6687039a156ee276b9bdc15b84929a",
+      "direct": "c0a5144c171aa2b49df0b6b3007165116589b99451d033666cd7070a2f25c5ba"
     },
     {
       "name": "the other split, a|bc… — same characters, must differ",
       "accountId": "a",
       "password": "bcccccccccccccccc",
       "dbname": "x",
-      "derived": "0daf93eb29bd94367a22efe1959ce2356ace1d25b45d5075ac5ed668122bd36d",
-      "direct": "8e383ee0000ff8c4034bb4bb806c834f45d42e9dbac89d1920e6f8a2174401b1"
+      "derived": "81af18e602219869506fdfb8160253bd4339874706a34883178ff5c79b39e398",
+      "direct": "c986915424f5bd3de0a47ee93246ce56bf2dcbe6c3c3427e05cb55ee4b8e72d0"
     }
   ]
 }

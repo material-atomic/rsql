@@ -15,7 +15,7 @@ COPY cmd ./cmd
 # Stripped: the symbol table is of no use in production and is of some use to
 # whoever is reading the binary.
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /rsqld ./cmd/rsqld
+RUN go build -trimpath -ldflags="-s -w" -o /sapedbd ./cmd/sapedbd
 
 # The data directory is made here, with its ownership, because the runtime
 # image has no shell to make one in.
@@ -23,15 +23,15 @@ RUN mkdir -p /data && chown 65532:65532 /data
 
 FROM scratch
 
-COPY --from=build /rsqld /rsqld
-COPY --from=build --chown=65532:65532 /data /var/lib/rsql
+COPY --from=build /sapedbd /sapedbd
+COPY --from=build --chown=65532:65532 /data /var/lib/sapedb
 
 # Numeric, because there is no /etc/passwd here to hold a name. 65532 is the
 # convention distroless uses for "nonroot".
 USER 65532:65532
 
 # Databases live here and must outlast the container.
-VOLUME ["/var/lib/rsql"]
+VOLUME ["/var/lib/sapedb"]
 
 EXPOSE 7433
 
@@ -40,4 +40,4 @@ EXPOSE 7433
 # a check that proves a database is answering needs a signed connection string,
 # which does not belong baked into an image. A health check that passes while
 # the thing it checks is broken is worse than none.
-ENTRYPOINT ["/rsqld"]
+ENTRYPOINT ["/sapedbd"]

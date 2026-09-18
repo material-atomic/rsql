@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/connection"
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
-	"github.com/material-atomic/rsql/internal/wire"
+	"github.com/sapedb/sapedb/internal/connection"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
+	"github.com/sapedb/sapedb/internal/wire"
 )
 
 // The shell an operator types at.
@@ -76,7 +76,7 @@ func Shell(look Looking, dbname string, in io.Reader, out io.Writer) error {
 	// through the parser thinks ran.
 	var drafted *store.Operation
 
-	fmt.Fprintf(out, "rsql %s — type help, or exit when you are done\n", dbname)
+	fmt.Fprintf(out, "sapedb %s — type help, or exit when you are done\n", dbname)
 
 	for {
 		line, err := next()

@@ -31,7 +31,7 @@ const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 // ErrExhausted is the once-in-a-lifetime case where a single millisecond used
 // up all 2^80 identifiers. Reported rather than wrapped around: wrapping would
 // hand out an identifier that sorts before one already given away.
-var ErrExhausted = errors.New("rsql/ulid: this millisecond has no identifiers left")
+var ErrExhausted = errors.New("sapedb/ulid: this millisecond has no identifiers left")
 
 // Source hands out identifiers. The zero value is not usable; use New.
 type Source struct {
@@ -63,13 +63,13 @@ func (s *Source) Next() (string, error) {
 
 	stamp := uint64(s.now().UnixMilli())
 	if stamp>>48 != 0 {
-		return "", fmt.Errorf("rsql/ulid: the clock is past what 48 bits hold: %d", stamp)
+		return "", fmt.Errorf("sapedb/ulid: the clock is past what 48 bits hold: %d", stamp)
 	}
 
 	switch {
 	case stamp > s.last:
 		if _, err := io.ReadFull(s.random, s.seed[:]); err != nil {
-			return "", fmt.Errorf("rsql/ulid: no randomness: %w", err)
+			return "", fmt.Errorf("sapedb/ulid: no randomness: %w", err)
 		}
 		s.last = stamp
 
@@ -146,7 +146,7 @@ func write(stamp uint64, seed [10]byte) string {
 // keeping a separate field for it.
 func Time(id string) (time.Time, error) {
 	if len(id) != Size {
-		return time.Time{}, fmt.Errorf("rsql/ulid: %q is %d characters, want %d", id, len(id), Size)
+		return time.Time{}, fmt.Errorf("sapedb/ulid: %q is %d characters, want %d", id, len(id), Size)
 	}
 
 	// Twenty-six characters hold 130 bits and a ULID is 128, so the stream
@@ -156,7 +156,7 @@ func Time(id string) (time.Time, error) {
 	for i := 0; i < 10; i++ {
 		value := index(id[i])
 		if value < 0 {
-			return time.Time{}, fmt.Errorf("rsql/ulid: %q is not base32 at %d", id, i)
+			return time.Time{}, fmt.Errorf("sapedb/ulid: %q is not base32 at %d", id, i)
 		}
 		stamp = stamp<<5 | uint64(value)
 	}

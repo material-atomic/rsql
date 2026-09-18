@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // populate fills a store with two collections, some operations and a few

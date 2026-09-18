@@ -307,7 +307,7 @@ func equalStrings(a, b []string) bool {
 // detect and no checksum can catch. The lock is the only thing between that
 // and a server started twice on one directory.
 func TestADatabaseFileIsOpenedByOneProcessAtATime(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "held.rsql")
+	path := filepath.Join(t.TempDir(), "held.sapedb")
 
 	first, err := OpenFile(path, 0o600)
 	if err != nil {
@@ -334,7 +334,7 @@ func TestADatabaseFileIsOpenedByOneProcessAtATime(t *testing.T) {
 // Refusing must not depend on the file already existing: the race that matters
 // is two processes starting at once on a directory that is empty.
 func TestTheLockIsTakenOnAFileBeingCreated(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "new.rsql")
+	path := filepath.Join(t.TempDir(), "new.sapedb")
 
 	first, err := OpenFile(path, 0o600)
 	if err != nil {

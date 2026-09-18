@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/material-atomic/rsql/internal/btree"
-	"github.com/material-atomic/rsql/internal/pager"
+	"github.com/sapedb/sapedb/internal/btree"
+	"github.com/sapedb/sapedb/internal/pager"
 )
 
 // A dump is the database written out as itself: declarations, operations and
@@ -42,9 +42,9 @@ const (
 )
 
 var (
-	ErrDumpFormat     = errors.New("rsql/store: this is not a dump this build can read")
-	ErrDumpIncomplete = errors.New("rsql/store: the dump ends before it says it does")
-	ErrNotEmpty       = errors.New("rsql/store: a restore needs a database with nothing in it")
+	ErrDumpFormat     = errors.New("sapedb/store: this is not a dump this build can read")
+	ErrDumpIncomplete = errors.New("sapedb/store: the dump ends before it says it does")
+	ErrNotEmpty       = errors.New("sapedb/store: a restore needs a database with nothing in it")
 )
 
 type line struct {

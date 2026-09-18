@@ -82,12 +82,12 @@ var Absent any = absent{}
 const exactIntegers = 1 << 53
 
 var (
-	ErrNotIndexable = errors.New("rsql/keys: this type cannot be part of a key")
-	ErrNotANumber   = errors.New("rsql/keys: NaN cannot be part of a key")
-	ErrTooLarge     = errors.New("rsql/keys: this integer cannot be held exactly")
-	ErrSkipped      = errors.New("rsql/keys: this field skips documents that do not have it")
-	ErrTruncated    = errors.New("rsql/keys: the key ends in the middle of a value")
-	ErrTag          = errors.New("rsql/keys: the key holds a value this build does not know")
+	ErrNotIndexable = errors.New("sapedb/keys: this type cannot be part of a key")
+	ErrNotANumber   = errors.New("sapedb/keys: NaN cannot be part of a key")
+	ErrTooLarge     = errors.New("sapedb/keys: this integer cannot be held exactly")
+	ErrSkipped      = errors.New("sapedb/keys: this field skips documents that do not have it")
+	ErrTruncated    = errors.New("sapedb/keys: the key ends in the middle of a value")
+	ErrTag          = errors.New("sapedb/keys: the key holds a value this build does not know")
 )
 
 // Encode appends one value to a key.
@@ -201,7 +201,7 @@ func encodeString(dst []byte, value string) []byte {
 // EncodeKey appends a whole key: one component per field, in order.
 func EncodeKey(dst []byte, values []any, fields []Field) ([]byte, error) {
 	if len(values) != len(fields) {
-		return nil, fmt.Errorf("rsql/keys: %d values for %d fields", len(values), len(fields))
+		return nil, fmt.Errorf("sapedb/keys: %d values for %d fields", len(values), len(fields))
 	}
 	for i, value := range values {
 		var err error

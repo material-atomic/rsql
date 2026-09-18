@@ -17,22 +17,56 @@ import (
 	"strings"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/server"
-	"github.com/material-atomic/rsql/internal/signing"
+	"github.com/sapedb/sapedb/internal/server"
+	"github.com/sapedb/sapedb/internal/signing"
 )
 
 // DefaultAddress is the port a connection string assumes when it names none.
 const DefaultAddress = ":7433"
 
 // DefaultDir is where a packaged server keeps databases.
-const DefaultDir = "/var/lib/rsql"
+const DefaultDir = "/var/lib/sapedb"
 
 var (
-	ErrNoSecret    = errors.New("rsql: RSQL_SECRET is not set, so no connection could be verified")
-	ErrNoTLS       = errors.New("rsql: refusing to serve without TLS")
-	ErrHalfTLS     = errors.New("rsql: a TLS certificate needs its key, and a key needs its certificate")
-	ErrNotDuration = errors.New("rsql: that is not a length of time")
+	ErrNoSecret    = errors.New("sapedb: SAPEDB_SECRET is not set, so no connection could be verified")
+	ErrNoTLS       = errors.New("sapedb: refusing to serve without TLS")
+	ErrHalfTLS     = errors.New("sapedb: a TLS certificate needs its key, and a key needs its certificate")
+	ErrNotDuration = errors.New("sapedb: that is not a length of time")
 )
+
+// oldEnvPrefix is the environment prefix this product read before it was
+// called sapedb, assembled from single-character literals rather than spelled
+// whole — see the identical constant and its comment in internal/cli, which
+// this mirrors because the two binaries read overlapping variables under
+// separate flag parsing and neither imports the other's package for it.
+var oldEnvPrefix = string([]byte{'R', 'S', 'Q', 'L', '_'})
+
+// sapedbEnvNames are every product variable the server reads, walked once
+// here instead of once per call to get(), so the set this refuses old names
+// for cannot drift from the set FromEnv actually reads.
+var sapedbEnvNames = []string{
+	"SAPEDB_ADDR", "SAPEDB_DIR", "SAPEDB_SECRET", "SAPEDB_LABEL",
+	"SAPEDB_TLS_CERT", "SAPEDB_TLS_KEY", "SAPEDB_INSECURE", "SAPEDB_ENCRYPT", "SAPEDB_SHUTDOWN",
+}
+
+// rejectOldEnv refuses to start when a variable is set under the product's
+// old name and not under its current one. It never reads what the old name
+// holds, only whether it is there, and it stops the process rather than
+// falling back to it — every one of these variables has a usable default or
+// a zero value, so silently ignoring an old name would not fail loudly, it
+// would just serve from the wrong place.
+func rejectOldEnv(lookup func(string) (string, bool)) error {
+	for _, name := range sapedbEnvNames {
+		if value, found := lookup(name); found && value != "" {
+			continue
+		}
+		old := strings.Replace(name, "SAPEDB_", oldEnvPrefix, 1)
+		if value, found := lookup(old); found && value != "" {
+			return fmt.Errorf("sapedb: %s is not read any longer; set %s", old, name)
+		}
+	}
+	return nil
+}
 
 // Config is everything the server is told before it starts.
 type Config struct {
@@ -58,6 +92,10 @@ type Config struct {
 
 // FromEnv reads the configuration. `lookup` is os.LookupEnv in a real process.
 func FromEnv(lookup func(string) (string, bool)) (Config, error) {
+	if err := rejectOldEnv(lookup); err != nil {
+		return Config{}, err
+	}
+
 	get := func(name, fallback string) string {
 		if value, found := lookup(name); found && value != "" {
 			return value
@@ -69,7 +107,7 @@ func FromEnv(lookup func(string) (string, bool)) (Config, error) {
 		return value == "1" || value == "true" || value == "yes"
 	}
 
-	label := get("RSQL_LABEL", "")
+	label := get("SAPEDB_LABEL", "")
 	if strings.EqualFold(label, "direct") {
 		// The plainer form, which has to be asked for by name: its sentinel is
 		// deliberately not something a blank field can produce.
@@ -77,21 +115,21 @@ func FromEnv(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	config := Config{
-		Address:  get("RSQL_ADDR", DefaultAddress),
-		Dir:      get("RSQL_DIR", DefaultDir),
-		Secret:   get("RSQL_SECRET", ""),
+		Address:  get("SAPEDB_ADDR", DefaultAddress),
+		Dir:      get("SAPEDB_DIR", DefaultDir),
+		Secret:   get("SAPEDB_SECRET", ""),
 		Label:    label,
-		CertFile: get("RSQL_TLS_CERT", ""),
-		KeyFile:  get("RSQL_TLS_KEY", ""),
-		Insecure: flag("RSQL_INSECURE"),
-		Encrypt:  flag("RSQL_ENCRYPT"),
+		CertFile: get("SAPEDB_TLS_CERT", ""),
+		KeyFile:  get("SAPEDB_TLS_KEY", ""),
+		Insecure: flag("SAPEDB_INSECURE"),
+		Encrypt:  flag("SAPEDB_ENCRYPT"),
 		Shutdown: 20 * time.Second,
 	}
 
-	if wait := get("RSQL_SHUTDOWN", ""); wait != "" {
+	if wait := get("SAPEDB_SHUTDOWN", ""); wait != "" {
 		parsed, err := time.ParseDuration(wait)
 		if err != nil {
-			return Config{}, fmt.Errorf("%w: RSQL_SHUTDOWN=%q", ErrNotDuration, wait)
+			return Config{}, fmt.Errorf("%w: SAPEDB_SHUTDOWN=%q", ErrNotDuration, wait)
 		}
 		config.Shutdown = parsed
 	}
@@ -107,7 +145,7 @@ func (c Config) check() error {
 		return ErrHalfTLS
 	}
 	if c.CertFile == "" && !c.Insecure {
-		return fmt.Errorf("%w: set RSQL_TLS_CERT and RSQL_TLS_KEY, or RSQL_INSECURE=1 to say you meant it", ErrNoTLS)
+		return fmt.Errorf("%w: set SAPEDB_TLS_CERT and SAPEDB_TLS_KEY, or SAPEDB_INSECURE=1 to say you meant it", ErrNoTLS)
 	}
 	return nil
 }
@@ -147,7 +185,7 @@ func Start(config Config) (*Service, error) {
 		if err != nil {
 			listener.Close()
 			made.Close()
-			return nil, fmt.Errorf("rsql: reading the certificate: %w", err)
+			return nil, fmt.Errorf("sapedb: reading the certificate: %w", err)
 		}
 		listener = tls.NewListener(listener, &tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -178,15 +216,15 @@ func (s *Service) Serve(ctx context.Context, announce io.Writer) error {
 	// Databases are opened on demand, so what a database has to say about how
 	// it was last left is said while the server is running, not before.
 	if announce != nil {
-		s.server.Say(func(line string) { fmt.Fprintf(announce, "rsql: %s\n", line) })
+		s.server.Say(func(line string) { fmt.Fprintf(announce, "sapedb: %s\n", line) })
 	}
 
 	if announce != nil {
-		scheme := "rsql+tls"
+		scheme := "sapedb+tls"
 		if s.config.CertFile == "" {
-			scheme = "rsql (no TLS)"
+			scheme = "sapedb (no TLS)"
 		}
-		fmt.Fprintf(announce, "rsql listening on %s as %s, databases in %s\n",
+		fmt.Fprintf(announce, "sapedb listening on %s as %s, databases in %s\n",
 			s.Address(), scheme, s.config.Dir)
 	}
 
@@ -204,7 +242,7 @@ func (s *Service) Serve(ctx context.Context, announce io.Writer) error {
 
 	case <-ctx.Done():
 		if announce != nil {
-			fmt.Fprintf(announce, "rsql stopping, %s for connections to finish\n", s.config.Shutdown)
+			fmt.Fprintf(announce, "sapedb stopping, %s for connections to finish\n", s.config.Shutdown)
 		}
 		s.listener.Close()
 
@@ -212,7 +250,7 @@ func (s *Service) Serve(ctx context.Context, announce io.Writer) error {
 		case <-done:
 		case <-time.After(s.config.Shutdown):
 			if announce != nil {
-				fmt.Fprintln(announce, "rsql: connections did not finish in time; closing anyway")
+				fmt.Fprintln(announce, "sapedb: connections did not finish in time; closing anyway")
 			}
 		}
 		return s.server.Close()

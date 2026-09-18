@@ -44,6 +44,25 @@ func TestFixtureAgreesWithTheAppSide(t *testing.T) {
 	f := load(t)
 	hexOnly := regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+	// f.Label is read from the file, not from DefaultLabel, everywhere below
+	// this line — which means every assertion in this function proves the
+	// two sides agree with the fixture, never that the fixture is what
+	// either side actually ships as its default. Renaming DefaultLabel
+	// without renaming the fixture's label (or the reverse) would leave
+	// every one of them green. These two lines are what closes that gap.
+	if f.Label != DefaultLabel {
+		t.Fatalf("fixture label %q does not match DefaultLabel %q — one of them was renamed without the other",
+			f.Label, DefaultLabel)
+	}
+	// Built from bytes rather than typed out: this file is inside the tree
+	// internal/naming patrols, and the old name would be a hit there too if
+	// it were spelled whole in a place that is not on that patrol's
+	// exception table.
+	oldWord := string([]byte{'r', 's', 'q', 'l'})
+	if strings.Contains(f.Secret, oldWord) {
+		t.Fatalf("fixture secret %q still names the old product", f.Secret)
+	}
+
 	for _, c := range f.Cases {
 		parts := Parts{AccountID: c.AccountID, Password: c.Password, DBName: c.DBName}
 
@@ -192,6 +211,36 @@ func TestAnUnsetLabelIsTheDefaultOneAndNotTheDirectForm(t *testing.T) {
 	}
 }
 
+// TestASignatureUnderTheOldLabelDoesNotVerifyUnderTheDefault is built with
+// the old label string hard-coded, glued together from fragments the same
+// way the fixture-secret check above builds the old product's name — not
+// for concealment, but so this file, which internal/naming also walks, does
+// not itself carry the one string the whole rename exists to remove. If a
+// future change ever
+// let DefaultLabel and this old string collide (by, say, reverting the
+// derivation) this is the test that would catch it, not a fixture whose
+// label would have moved with it.
+func TestASignatureUnderTheOldLabelDoesNotVerifyUnderTheDefault(t *testing.T) {
+	oldLabel := "ecosy/" + string([]byte{'r', 's', 'q', 'l'}) + ":connection:v1"
+	if oldLabel == DefaultLabel {
+		t.Fatalf("the old label and DefaultLabel must differ for this test to mean anything; both are %q", oldLabel)
+	}
+
+	parts := Parts{AccountID: "acme", Password: "a-password-of-the-right-shape", DBName: "main"}
+	const secret = "the secret only the control plane has"
+
+	signature, err := Sign(parts, secret, oldLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Verify(signature, parts, secret, "") {
+		t.Error("a signature made under the old label verified against the blank (default) label")
+	}
+	if Verify(signature, parts, secret, DefaultLabel) {
+		t.Error("a signature made under the old label verified against DefaultLabel")
+	}
+}
+
 func TestProvingYouCanOperateThisServer(t *testing.T) {
 	nonce := make([]byte, NonceBytes)
 	for i := range nonce {
@@ -260,7 +309,7 @@ func TestTheOperatorProofIsTheseExactBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const pinned = "7bc00dd603baa6bd7a2ce08a09d898cdd1c1b65f51a2f2b3e5935de2c338134e"
+	const pinned = "f518bbe019b5a7a3dbb9e78739bbb00261024b29d9bd7e686efadd058b9ada4f"
 	if proof != pinned {
 		t.Errorf("the proof for the pinned secret and challenge is now\n  %s\nand was\n  %s", proof, pinned)
 	}

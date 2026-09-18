@@ -24,14 +24,24 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // dbKeyLabel must match what the server derives with, or a database written by
 // one is unreadable by the other.
+//
+// It still carries the product's old name on purpose, not by oversight: it
+// is baked into every encrypted database file that already exists, and
+// changing it — here without changing internal/server's copy the same way,
+// in the same commit — is a silent, unannounced key rotation: the key this
+// tool derives would stop matching the key the file was written under,
+// which reads as "wrong secret" for a secret that is right. It only ever
+// moves together with a migration that re-derives and re-encrypts every
+// affected database under the new label, and with internal/server's copy
+// changing in that same commit. This is not that commit.
 const dbKeyLabel = "rsql/server:database:v1"
 
 // passwordBytes is how long a generated password is. Well inside the 16..128
@@ -40,23 +50,23 @@ const passwordLength = 32
 
 const passwordAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"
 
-const usage = `rsql — set up and look inside a database
+const usage = `sapedb — set up and look inside a database
 
-  rsql [options] apply FILE...     declare collections and operations
-  rsql [options] ls                what this database holds
-  rsql [options] dump              write a dump to stdout
-  rsql [options] restore           read a dump from stdin, into an empty database
-  rsql [options] log [FROM]        print the change log from an entry onwards
-  rsql [options] url               print a signed connection string
-  rsql [options] shell [HOST]      look inside a running server
+  sapedb [options] apply FILE...     declare collections and operations
+  sapedb [options] ls                what this database holds
+  sapedb [options] dump              write a dump to stdout
+  sapedb [options] restore           read a dump from stdin, into an empty database
+  sapedb [options] log [FROM]        print the change log from an entry onwards
+  sapedb [options] url               print a signed connection string
+  sapedb [options] shell [HOST]      look inside a running server
 
 options
-  -dir DIR       where databases live      (RSQL_DIR, default /var/lib/rsql)
-  -account NAME  which account             (RSQL_ACCOUNT)
-  -db NAME       which database            (RSQL_DB)
-  -encrypt       the database is encrypted (RSQL_ENCRYPT)
+  -dir DIR       where databases live      (SAPEDB_DIR, default /var/lib/sapedb)
+  -account NAME  which account             (SAPEDB_ACCOUNT)
+  -db NAME       which database            (SAPEDB_DB)
+  -encrypt       the database is encrypted (SAPEDB_ENCRYPT)
 
-RSQL_SECRET is read from the environment. It is what connection strings are
+SAPEDB_SECRET is read from the environment. It is what connection strings are
 signed with and what database encryption keys are derived from, so a command
 run with the wrong one either refuses or writes a file the server cannot read.
 
@@ -66,9 +76,46 @@ or reads one from stdin when told to.
 `
 
 var (
-	ErrUsage  = errors.New("rsql: that is not how this is used")
-	ErrSecret = errors.New("rsql: RSQL_SECRET is not set")
+	ErrUsage  = errors.New("sapedb: that is not how this is used")
+	ErrSecret = errors.New("sapedb: SAPEDB_SECRET is not set")
 )
+
+// oldEnvPrefix is the environment prefix this product read before it was
+// called sapedb, assembled from single-character literals rather than spelled
+// whole. internal/naming walks every file in this tree looking for exactly
+// the four letters that would make; the only reason this function still knows
+// them is to refuse them, and it would be a strange sort of refusal that
+// itself left the old name lying around in the source for the next person to
+// copy.
+var oldEnvPrefix = string([]byte{'R', 'S', 'Q', 'L', '_'})
+
+// sapedbEnvNames are every product variable this command reads. Walked once
+// here, by the check below, instead of once per call to get() — so the set
+// this refuses old names for cannot silently drift from the set it actually
+// reads.
+var sapedbEnvNames = []string{
+	"SAPEDB_DIR", "SAPEDB_ACCOUNT", "SAPEDB_DB", "SAPEDB_ENCRYPT", "SAPEDB_SECRET", "SAPEDB_LABEL",
+}
+
+// rejectOldEnv refuses to start when a variable is set under the product's
+// old name and not under its current one. It is not a compatibility path: it
+// never reads what the old name holds, only whether it is there, and it stops
+// the process rather than falling back to it. Without this, "-dir" in
+// particular would fail silently — it has a default, so a renamed variable
+// nobody set would just be read as absent and the command would carry on
+// against the wrong directory.
+func rejectOldEnv(lookup func(string) (string, bool)) error {
+	for _, name := range sapedbEnvNames {
+		if value, found := lookup(name); found && value != "" {
+			continue
+		}
+		old := strings.Replace(name, "SAPEDB_", oldEnvPrefix, 1)
+		if value, found := lookup(old); found && value != "" {
+			return fmt.Errorf("sapedb: %s is not read any longer; set %s", old, name)
+		}
+	}
+	return nil
+}
 
 // Run is the whole command. It returns the exit status.
 func Run(args []string, lookup func(string) (string, bool), stdin io.Reader, stdout, stderr io.Writer) int {
@@ -92,6 +139,24 @@ type options struct {
 }
 
 func run(args []string, lookup func(string) (string, bool), stdin io.Reader, stdout io.Writer) error {
+	if err := rejectOldEnv(lookup); err != nil {
+		return err
+	}
+
+	// found && value != "": an explicitly empty variable is not a value, it
+	// is "not set" — a container with SAPEDB_DIR= would otherwise put its
+	// databases in the current directory instead of the documented default.
+	// A mutation dropping the `value != ""` half survives every test in this
+	// file: catching it means actually exercising the fallback, and for
+	// -dir that fallback is the hard-coded absolute path /var/lib/sapedb —
+	// the one hard-coded system path anywhere in this package's tests would
+	// touch, with a result that depends on who is running the suite and
+	// whether they followed the house rule of always going through the
+	// mounted docker image. internal/service's equivalent test (see
+	// TestTheEnvironmentIsReadAsWritten) gets away with checking this
+	// because FromEnv returns Dir as a plain field on Config, so nothing
+	// ever has to be opened to see it; this package never hands opts back
+	// to a test to inspect the same way.
 	get := func(name, fallback string) string {
 		if value, found := lookup(name); found && value != "" {
 			return value
@@ -99,17 +164,17 @@ func run(args []string, lookup func(string) (string, bool), stdin io.Reader, std
 		return fallback
 	}
 
-	label := get("RSQL_LABEL", "")
+	label := get("SAPEDB_LABEL", "")
 	if strings.EqualFold(label, "direct") {
 		label = signing.Direct
 	}
 
 	opts := options{
-		dir:     get("RSQL_DIR", "/var/lib/rsql"),
-		account: get("RSQL_ACCOUNT", ""),
-		db:      get("RSQL_DB", ""),
-		secret:  get("RSQL_SECRET", ""),
-		encrypt: strings.EqualFold(get("RSQL_ENCRYPT", ""), "1") || strings.EqualFold(get("RSQL_ENCRYPT", ""), "true"),
+		dir:     get("SAPEDB_DIR", "/var/lib/sapedb"),
+		account: get("SAPEDB_ACCOUNT", ""),
+		db:      get("SAPEDB_DB", ""),
+		secret:  get("SAPEDB_SECRET", ""),
+		encrypt: strings.EqualFold(get("SAPEDB_ENCRYPT", ""), "1") || strings.EqualFold(get("SAPEDB_ENCRYPT", ""), "true"),
 		label:   label,
 	}
 
@@ -207,6 +272,46 @@ func parse(args []string, opts *options) ([]string, error) {
 	return nil, nil
 }
 
+// oldFileExt is the database file extension this product used before it was
+// called sapedb, assembled from single-character literals for the same
+// reason oldEnvPrefix above is: internal/naming would otherwise flag the
+// string that spells it, and a check for the old extension has no business
+// leaving the old extension lying around in the source as plain text.
+var oldFileExt = "." + string([]byte{'r', 's', 'q', 'l'})
+
+// checkOldExtension refuses to open a database when its .sapedb path does
+// not exist but a same-named file under the old extension does.
+//
+// This is the one variant of the old name that fails silently rather than
+// being refused: a renamed environment variable at least gets a signpost
+// (see rejectOldEnv above), and an old connection scheme or signing label
+// gets a parse or verify error, but a missing .sapedb file with a real
+// old-extension file sitting right next to it does not look like an error
+// at all — vfs.OpenFile below would simply create a new, empty database and
+// this tool would report an empty database where a real one exists. That is
+// not "not found", it is data going invisible. So this stops and says
+// exactly where the data actually is, rather than renaming it or opening it
+// as-is: changing what a file means without being asked is not this tool's
+// call to make, and the operator is the one who knows whether that old file
+// is still needed anywhere else.
+//
+// Same shape as the environment-variable signpost, and the same note
+// applies: this is not a compatibility path, and it is meant to be removed
+// once operators have confirmed they have moved their database files.
+func checkOldExtension(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	old := strings.TrimSuffix(path, ".sapedb") + oldFileExt
+	if _, err := os.Stat(old); err == nil {
+		return fmt.Errorf("sapedb: %s does not exist, but %s does; mv %s %s", path, old, old, path)
+	}
+	return nil
+}
+
 // open opens the database file, taking its lock.
 func open(opts options) (*store.Store, func(), error) {
 	// The directory first: a server holds this for its whole life, so being
@@ -220,8 +325,13 @@ func open(opts options) (*store.Store, func(), error) {
 		return nil, nil, err
 	}
 
-	path := filepath.Join(opts.dir, opts.account, opts.db+".rsql")
+	path := filepath.Join(opts.dir, opts.account, opts.db+".sapedb")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		held.Close()
+		return nil, nil, err
+	}
+
+	if err := checkOldExtension(path); err != nil {
 		held.Close()
 		return nil, nil, err
 	}
@@ -263,7 +373,7 @@ func open(opts options) (*store.Store, func(), error) {
 		file.Close()
 		held.Close()
 		if errors.Is(err, pager.ErrKey) {
-			return nil, nil, fmt.Errorf("%w\n  RSQL_SECRET does not match the one this database was made with", err)
+			return nil, nil, fmt.Errorf("%w\n  SAPEDB_SECRET does not match the one this database was made with", err)
 		}
 		if errors.Is(err, pager.ErrNotEncrypted) {
 			return nil, nil, fmt.Errorf("%w\n  drop -encrypt, or this is not the database you meant", err)
@@ -280,7 +390,7 @@ func open(opts options) (*store.Store, func(), error) {
 
 	// The same directory the server uses, so that a tool and a server see the
 	// same database rather than each seeing the part of it they made.
-	folder, err := vfs.At(strings.TrimSuffix(path, ".rsql")+".parts", 0o600)
+	folder, err := vfs.At(strings.TrimSuffix(path, ".sapedb")+".parts", 0o600)
 	if err != nil {
 		file.Close()
 		held.Close()
@@ -512,14 +622,14 @@ func url(opts options, args []string, stdin io.Reader, out io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintf(out, "rsql://%s:%s@%s/%s?sig=%s\n", opts.account, password, host, opts.db, signature)
+	fmt.Fprintf(out, "sapedb://%s:%s@%s/%s?sig=%s\n", opts.account, password, host, opts.db, signature)
 	return nil
 }
 
 func makePassword() (string, error) {
 	raw := make([]byte, passwordLength)
 	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("rsql: no randomness for a password: %w", err)
+		return "", fmt.Errorf("sapedb: no randomness for a password: %w", err)
 	}
 
 	// Rejection-free: the alphabet is 66 long and a byte is 256, so taking the

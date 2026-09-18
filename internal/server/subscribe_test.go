@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // read waits for one frame, so a test that is wrong fails instead of hanging.

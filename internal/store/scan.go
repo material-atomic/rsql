@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // Bound is one end of a scan: values for the first fields of the index, and

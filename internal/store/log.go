@@ -46,7 +46,7 @@ const (
 var nextLSN = []byte{spaceMeta, 'l', 's', 'n'}
 
 // ErrOutOfOrder is a replay that skipped or repeated the wrong entry.
-var ErrOutOfOrder = errors.New("rsql/store: this entry does not follow the one before it")
+var ErrOutOfOrder = errors.New("sapedb/store: this entry does not follow the one before it")
 
 // Attribution is who made a change and why: which declared operation, which
 // version of it, on whose behalf, and under which write id.

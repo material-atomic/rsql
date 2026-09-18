@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // Line editing, when there is somebody there to edit.

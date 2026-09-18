@@ -1,31 +1,31 @@
-# Một cách chạy rsql bằng docker. Sửa cho hợp chỗ anh chạy.
+# Một cách chạy sapedb bằng docker. Sửa cho hợp chỗ anh chạy.
 #
 # Hai điều đáng để ý, vì cả hai đều là chỗ dễ làm sai mà không có triệu chứng:
 #
-# 1. RSQL_SECRET là gốc của mọi tin cậy. Ai có nó thì ký được chuỗi kết nối cho
+# 1. SAPEDB_SECRET là gốc của mọi tin cậy. Ai có nó thì ký được chuỗi kết nối cho
 #    bất kỳ account và database nào. Nó KHÔNG được nằm trong file này — ở đây
 #    đọc từ môi trường, và ở production thì dùng docker secret hoặc vault.
 #
 # 2. Volume phải là volume thật. Không mount thì database sống trong lớp ghi
 #    của container và biến mất cùng container, im lặng, không báo gì.
 services:
-  rsql:
-    image: rsql:latest
+  sapedb:
+    image: sapedb:latest
     restart: unless-stopped
     ports:
       - "7433:7433"
     environment:
-      RSQL_SECRET: ${RSQL_SECRET:?đặt RSQL_SECRET trong môi trường hoặc .env}
-      RSQL_TLS_CERT: /etc/rsql/tls/cert.pem
-      RSQL_TLS_KEY: /etc/rsql/tls/key.pem
-      # Mã hoá khi lưu trữ: khoá dẫn xuất từ RSQL_SECRET. Nó bảo vệ một cái đĩa
+      SAPEDB_SECRET: ${SAPEDB_SECRET:?đặt SAPEDB_SECRET trong môi trường hoặc .env}
+      SAPEDB_TLS_CERT: /etc/sapedb/tls/cert.pem
+      SAPEDB_TLS_KEY: /etc/sapedb/tls/key.pem
+      # Mã hoá khi lưu trữ: khoá dẫn xuất từ SAPEDB_SECRET. Nó bảo vệ một cái đĩa
       # bị lấy mất, không bảo vệ trước một server bị chiếm — server đọc được
       # mọi database nó phục vụ, theo thiết kế.
-      RSQL_ENCRYPT: "1"
-      RSQL_SHUTDOWN: 30s
+      SAPEDB_ENCRYPT: "1"
+      SAPEDB_SHUTDOWN: 30s
     volumes:
-      - data:/var/lib/rsql
-      - ./tls:/etc/rsql/tls:ro
+      - data:/var/lib/sapedb
+      - ./tls:/etc/sapedb/tls:ro
     # Không có shell trong image, nên healthcheck phải là thứ orchestrator tự
     # làm từ ngoài. Một TCP probe tới 7433 là đủ để biết cổng đang mở; muốn
     # biết database còn trả lời thì cần một chuỗi kết nối đã ký, mà thứ đó

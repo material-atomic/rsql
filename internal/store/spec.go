@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // Types a field may be declared as. Declaring it is not bureaucracy: the key
@@ -40,16 +40,16 @@ const (
 )
 
 var (
-	ErrName         = errors.New("rsql/store: that is not a usable name")
-	ErrDeclaration  = errors.New("rsql/store: the declaration does not make sense")
-	ErrIncompatible = errors.New("rsql/store: this does not match what was declared before")
-	ErrNoCollection = errors.New("rsql/store: no such collection")
-	ErrNoIndex      = errors.New("rsql/store: no such index")
-	ErrNoRollup     = errors.New("rsql/store: no such rollup")
-	ErrNoKey        = errors.New("rsql/store: the document has no primary key")
-	ErrType         = errors.New("rsql/store: the value is not the type the field was declared as")
-	ErrDuplicate    = errors.New("rsql/store: a unique index already holds this value")
-	ErrDamaged      = errors.New("rsql/store: what is stored does not read back")
+	ErrName         = errors.New("sapedb/store: that is not a usable name")
+	ErrDeclaration  = errors.New("sapedb/store: the declaration does not make sense")
+	ErrIncompatible = errors.New("sapedb/store: this does not match what was declared before")
+	ErrNoCollection = errors.New("sapedb/store: no such collection")
+	ErrNoIndex      = errors.New("sapedb/store: no such index")
+	ErrNoRollup     = errors.New("sapedb/store: no such rollup")
+	ErrNoKey        = errors.New("sapedb/store: the document has no primary key")
+	ErrType         = errors.New("sapedb/store: the value is not the type the field was declared as")
+	ErrDuplicate    = errors.New("sapedb/store: a unique index already holds this value")
+	ErrDamaged      = errors.New("sapedb/store: what is stored does not read back")
 )
 
 // Spec is a collection as it was declared.

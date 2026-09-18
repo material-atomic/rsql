@@ -1,7 +1,7 @@
 // Package signing carries the one contract this store shares with the app:
-// the signature in an rsql:// connection string.
+// the signature in a sapedb:// connection string.
 //
-// The app side is @ecosy/rsql/signer. Both read fixtures/signing.json, so a
+// The app side is @ecosy/sapedb/signer. Both read fixtures/signing.json, so a
 // change on either side turns both test suites red at once instead of arriving
 // as a user who cannot connect.
 package signing
@@ -18,7 +18,7 @@ import (
 
 // DefaultLabel derives the signing key from the secret. Both sides must agree
 // on the mode: this label, or Direct.
-const DefaultLabel = "ecosy/rsql:connection:v1"
+const DefaultLabel = "ecosy/sapedb:connection:v1"
 
 // Direct signs with the secret itself, the plainer form — the app passes
 // label: null for it.
@@ -29,7 +29,7 @@ const DefaultLabel = "ecosy/rsql:connection:v1"
 // ordinary way, and every test on one side would still pass because both sides
 // of that side agree. That is exactly what happened here before this was a
 // sentinel.
-const Direct = "\x00rsql:direct"
+const Direct = "\x00sapedb:direct"
 
 // PasswordPattern is what a password may be.
 //
@@ -52,10 +52,10 @@ type Parts struct {
 }
 
 var (
-	ErrEmptySecret  = errors.New("rsql: secret must not be empty")
-	ErrPassword     = errors.New("rsql: password must be 16-128 characters of A-Z a-z 0-9 . _ ~ -")
-	ErrFieldDelim   = errors.New(`rsql: account_id and dbname must not be empty or contain ":"`)
-	ErrBadSignature = errors.New("rsql: signature does not verify")
+	ErrEmptySecret  = errors.New("sapedb: secret must not be empty")
+	ErrPassword     = errors.New("sapedb: password must be 16-128 characters of A-Z a-z 0-9 . _ ~ -")
+	ErrFieldDelim   = errors.New(`sapedb: account_id and dbname must not be empty or contain ":"`)
+	ErrBadSignature = errors.New("sapedb: signature does not verify")
 )
 
 // ValidPassword reports whether the protocol can carry this password.
@@ -145,11 +145,11 @@ func Verify(signature string, parts Parts, secret, label string) bool {
 // The nonce is what stops the proof being a password. One is good for one
 // connection, so it cannot be copied out of a log or a process listing and
 // used again.
-const OperatorLabel = "rsql/operator:v1"
+const OperatorLabel = "sapedb/operator:v1"
 
 // ErrNonce is a challenge that is not one: empty, or not the length the server
 // issues. A proof over a nonce the client chose proves nothing.
-var ErrNonce = errors.New("rsql: the challenge is not one the server issued")
+var ErrNonce = errors.New("sapedb: the challenge is not one the server issued")
 
 // NonceBytes is how long a challenge is.
 const NonceBytes = 32

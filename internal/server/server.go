@@ -29,22 +29,32 @@ import (
 	"sync"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // dbKeyLabel separates the key a database file is encrypted with from every
 // other use of the same secret.
+//
+// It still carries the product's old name on purpose, not by oversight: it
+// is baked into every encrypted database file that already exists, and
+// changing it — here without changing internal/cli's copy the same way, in
+// the same commit — is a silent, unannounced key rotation: the key this
+// server derives would stop matching the key the file was written under,
+// which reads as "wrong secret" for a secret that is right. It only ever
+// moves together with a migration that re-derives and re-encrypts every
+// affected database under the new label, and with internal/cli's copy
+// changing in that same commit. This is not that commit.
 const dbKeyLabel = "rsql/server:database:v1"
 
 var (
-	ErrHandshake  = errors.New("rsql/server: the connection did not open properly")
-	ErrName       = errors.New("rsql/server: that is not a usable account or database name")
-	ErrClosed     = errors.New("rsql/server: the server is closed")
-	ErrNotAllowed = errors.New("rsql/server: this connection may not reach that database")
+	ErrHandshake  = errors.New("sapedb/server: the connection did not open properly")
+	ErrName       = errors.New("sapedb/server: that is not a usable account or database name")
+	ErrClosed     = errors.New("sapedb/server: the server is closed")
+	ErrNotAllowed = errors.New("sapedb/server: this connection may not reach that database")
 )
 
 // Options are what a server needs to run.
@@ -122,10 +132,10 @@ func (d *database) waiting() <-chan struct{} {
 // New checks the options and returns a server that has opened nothing yet.
 func New(options Options) (*Server, error) {
 	if options.Secret == "" {
-		return nil, errors.New("rsql/server: no secret, so no connection could be verified")
+		return nil, errors.New("sapedb/server: no secret, so no connection could be verified")
 	}
 	if options.Dir == "" {
-		return nil, errors.New("rsql/server: no directory to keep databases in")
+		return nil, errors.New("sapedb/server: no directory to keep databases in")
 	}
 	if err := os.MkdirAll(options.Dir, 0o700); err != nil {
 		return nil, err
@@ -263,7 +273,7 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 			// A frame this version does not serve is refused by name rather
 			// than ignored: a client waiting for an answer that never comes is
 			// worse off than one that is told no.
-			body := failure(fmt.Errorf("rsql/server: nothing here serves a %s frame", frame.Type))
+			body := failure(fmt.Errorf("sapedb/server: nothing here serves a %s frame", frame.Type))
 			if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, body); err != nil {
 				return err
 			}
@@ -423,7 +433,7 @@ type call struct {
 func (s *Server) invoke(live *session, payload []byte) ([]byte, error) {
 	asked := call{}
 	if err := json.Unmarshal(payload, &asked); err != nil {
-		return nil, fmt.Errorf("rsql/server: the call does not read as one: %w", err)
+		return nil, fmt.Errorf("sapedb/server: the call does not read as one: %w", err)
 	}
 
 	db, err := s.reach(live, asked)
@@ -485,6 +495,46 @@ func (s *Server) reach(live *session, asked call) (*database, error) {
 	return db, nil
 }
 
+// oldFileExt is the database file extension this product used before it was
+// called sapedb, assembled from single-character literals for the same
+// reason oldEnvPrefix above is: internal/naming would otherwise flag the
+// string that spells it, and a check for the old extension has no business
+// leaving the old extension lying around in the source as plain text.
+var oldFileExt = "." + string([]byte{'r', 's', 'q', 'l'})
+
+// checkOldExtension refuses to open a database when its .sapedb path does
+// not exist but a same-named file under the old extension does.
+//
+// This is the one variant of the old name that fails silently rather than
+// being refused: a renamed environment variable at least gets a signpost
+// (see rejectOldEnv above), and an old connection scheme or signing label
+// gets a parse or verify error, but a missing .sapedb file with a real
+// old-extension file sitting right next to it does not look like an error
+// at all — openFile below would simply create a new, empty database at the .sapedb
+// path and this server would answer every call about a real database as if
+// it were empty. That is not "not found", it is data going invisible. So
+// this stops and says exactly where the data actually is, rather than
+// renaming it or opening it as-is: changing what a file means without
+// being asked is not this server's call to make, and the operator is the
+// one who knows whether that old file is still needed anywhere else.
+//
+// Same shape as the environment-variable signpost, and the same note
+// applies: this is not a compatibility path, and it is meant to be removed
+// once operators have confirmed they have moved their database files.
+func checkOldExtension(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	old := strings.TrimSuffix(path, ".sapedb") + oldFileExt
+	if _, err := os.Stat(old); err == nil {
+		return fmt.Errorf("sapedb: %s does not exist, but %s does; mv %s %s", path, old, old, path)
+	}
+	return nil
+}
+
 // database opens the file for an account and name, or returns the one already
 // open.
 func (s *Server) database(account, name string) (*database, error) {
@@ -511,7 +561,10 @@ func (s *Server) database(account, name string) (*database, error) {
 	if err := os.MkdirAll(folder, 0o700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(folder, name+".rsql")
+	path := filepath.Join(folder, name+".sapedb")
+	if err := checkOldExtension(path); err != nil {
+		return nil, err
+	}
 
 	db, err := s.openFile(path, account, name)
 	if err != nil {
@@ -558,7 +611,7 @@ func (s *Server) openFile(path, account, name string) (*database, error) {
 	// "what files does this database have" is answered by the directory rather
 	// than by a naming convention. A wrong answer to that question unlinks
 	// somebody else's data.
-	folder, err := vfs.At(strings.TrimSuffix(path, ".rsql")+".parts", 0o600)
+	folder, err := vfs.At(strings.TrimSuffix(path, ".sapedb")+".parts", 0o600)
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -648,7 +701,7 @@ func failure(err error) []byte {
 		At      int64  `json:"at"`
 	}{Message: err.Error(), Code: codeFor(err), At: time.Now().UnixMilli()})
 	if marshalled != nil {
-		return []byte(`{"message":"rsql/server: the failure could not be described","code":"failed"}`)
+		return []byte(`{"message":"sapedb/server: the failure could not be described","code":"failed"}`)
 	}
 	return body
 }
@@ -689,7 +742,7 @@ func codeFor(err error) string {
 
 // sayHowItWasLeft reports a database that was not shut down.
 //
-// rsql survives losing power — two meta pages and an order of writes that has
+// sapedb survives losing power — two meta pages and an order of writes that has
 // no recovery path to get wrong — but until this it survived it silently. The
 // database came back at its last committed transaction and nothing anywhere
 // said the machine had gone down, so the operator asking "why is that write

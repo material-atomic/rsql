@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/material-atomic/rsql/internal/btree"
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/btree"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // Totals kept as the writes happen, rather than worked out when asked.

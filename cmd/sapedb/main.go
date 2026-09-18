@@ -1,4 +1,4 @@
-// Command rsql sets a database up and looks inside it.
+// Command sapedb sets a database up and looks inside it.
 //
 // It exists because declaring is not an operation: a new database can do
 // nothing over the wire until somebody puts the first declarations in it, and
@@ -11,7 +11,7 @@ package main
 import (
 	"os"
 
-	"github.com/material-atomic/rsql/internal/cli"
+	"github.com/sapedb/sapedb/internal/cli"
 )
 
 func main() {

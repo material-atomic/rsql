@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/connection"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/connection"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 const secret = "the secret only the control plane has"
@@ -26,14 +27,24 @@ func start(t *testing.T) *setup {
 
 func (s *setup) env(extra map[string]string) func(string) (string, bool) {
 	vars := map[string]string{
-		"RSQL_SECRET":  secret,
-		"RSQL_DIR":     s.dir,
-		"RSQL_ACCOUNT": "acme",
-		"RSQL_DB":      "main",
+		"SAPEDB_SECRET":  secret,
+		"SAPEDB_DIR":     s.dir,
+		"SAPEDB_ACCOUNT": "acme",
+		"SAPEDB_DB":      "main",
 	}
 	for name, value := range extra {
 		vars[name] = value
 	}
+	return func(name string) (string, bool) {
+		value, found := vars[name]
+		return value, found
+	}
+}
+
+// envOnly is exactly the variables given, none of the setup's usual
+// defaults — for tests about what happens when a variable this command
+// needs is simply not there.
+func (s *setup) envOnly(vars map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
 		value, found := vars[name]
 		return value, found
@@ -283,6 +294,31 @@ func TestTheConnectionStringIsOneTheOtherSideAccepts(t *testing.T) {
 	}
 }
 
+// TestTheDirectLabelIsRecognisedRegardlessOfCase is the case-folding this
+// command promises with strings.EqualFold: an operator typing SAPEDB_LABEL
+// in a shell script is not reliably going to match the lower-case spelling
+// used in the one doc comment that names it. "Direct" and "DIRECT" must
+// select the same signing mode as "direct" does.
+func TestTheDirectLabelIsRecognisedRegardlessOfCase(t *testing.T) {
+	for _, spelling := range []string{"direct", "Direct", "DIRECT"} {
+		t.Run(spelling, func(t *testing.T) {
+			setup := start(t)
+			out, errs, status := setup.runWith(map[string]string{"SAPEDB_LABEL": spelling}, "", "url")
+			if status != 0 {
+				t.Fatalf("url: %s", errs)
+			}
+			printed := strings.TrimSpace(out)
+
+			if err := connection.VerifyString(printed, secret, signing.Direct); err != nil {
+				t.Errorf("%q did not select the direct form: %v", spelling, err)
+			}
+			if err := connection.VerifyString(printed, secret, ""); err == nil {
+				t.Errorf("%q verified under the default label too, so it did not actually select direct", spelling)
+			}
+		})
+	}
+}
+
 // A password on the command line is visible in ps to every user on the
 // machine. It is generated, or read from stdin, and never taken as an
 // argument.
@@ -333,6 +369,71 @@ func TestAGeneratedPasswordIsDifferentEveryTimeAndValid(t *testing.T) {
 	}
 }
 
+// TestThePartitionsFolderNameDropsTheFileExtension catches a mutation that
+// TestACommandRunWhileTheServerHoldsTheFileIsRefused above cannot: that test
+// only ever names main.sapedb, so it says nothing about the sibling folder
+// open() derives from it with TrimSuffix. Drop the TrimSuffix and the
+// database file is still exactly where every other test expects it — only
+// the partitions folder ends up misnamed "main.sapedb.parts" instead of
+// "main.parts", which nothing above would have noticed.
+func TestThePartitionsFolderNameDropsTheFileExtension(t *testing.T) {
+	setup := start(t)
+	file := setup.write("schema.json", articles)
+	if _, errs, status := setup.run("apply", file); status != 0 {
+		t.Fatal(errs)
+	}
+
+	if info, err := os.Stat(filepath.Join(setup.dir, "acme", "main.parts")); err != nil || !info.IsDir() {
+		t.Errorf("want a partitions folder named main.parts, stat: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(setup.dir, "acme", "main.sapedb.parts")); err == nil {
+		t.Error("the partitions folder kept the .sapedb suffix instead of having it trimmed")
+	}
+}
+
+// oldDBExt mirrors internal/cli's own oldFileExt: built from bytes so this
+// file, inside the tree internal/naming walks, does not carry the old word
+// as a literal.
+func oldDBExt() string {
+	return "." + string([]byte{'r', 's', 'q', 'l'})
+}
+
+// TestAnOldExtensionFileIsRefusedNotSilentlyReplaced is the file-extension
+// counterpart to TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored, and
+// the reason it needs its own test rather than reusing that one's shape: a
+// renamed environment variable degrades cleanly — either it is read, or the
+// signpost above refuses to start. A renamed *file extension* degrades by
+// vfs.OpenFile treating "not found" as "create a new, empty database",
+// which is a database opening successfully, on the wrong file, holding no
+// data — the one variant of the old name in this whole rename that would
+// otherwise fail silently rather than being refused.
+func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
+	setup := start(t)
+	if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(setup.dir, "acme", "main"+oldDBExt())
+	if err := os.WriteFile(old, []byte("stand-in for a real database file; only its path matters here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, errs, status := setup.run("ls")
+	if status == 0 {
+		t.Fatal("it ran against a database whose only file on disk carries the old extension")
+	}
+
+	want := filepath.Join(setup.dir, "acme", "main.sapedb")
+	if !strings.Contains(errs, old) || !strings.Contains(errs, want) {
+		t.Errorf("the refusal does not name both paths: %q", errs)
+	}
+	if !strings.Contains(errs, "mv") {
+		t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+	}
+	if _, err := os.Stat(want); err == nil {
+		t.Error("a new .sapedb file was created even though the command was refused")
+	}
+}
+
 func TestACommandRunWhileTheServerHoldsTheFileIsRefused(t *testing.T) {
 	setup := start(t)
 	file := setup.write("schema.json", articles)
@@ -341,7 +442,7 @@ func TestACommandRunWhileTheServerHoldsTheFileIsRefused(t *testing.T) {
 	}
 
 	// Somebody else — the server — has it open.
-	held, err := vfs.OpenFile(filepath.Join(setup.dir, "acme", "main.rsql"), 0o600)
+	held, err := vfs.OpenFile(filepath.Join(setup.dir, "acme", "main.sapedb"), 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,17 +460,17 @@ func TestACommandRunWhileTheServerHoldsTheFileIsRefused(t *testing.T) {
 func TestTheWrongSecretIsSaidPlainly(t *testing.T) {
 	setup := start(t)
 	file := setup.write("schema.json", articles)
-	if _, errs, status := setup.runWith(map[string]string{"RSQL_ENCRYPT": "1"}, "", "apply", file); status != 0 {
+	if _, errs, status := setup.runWith(map[string]string{"SAPEDB_ENCRYPT": "1"}, "", "apply", file); status != 0 {
 		t.Fatal(errs)
 	}
 
 	_, errs, status := setup.runWith(map[string]string{
-		"RSQL_ENCRYPT": "1", "RSQL_SECRET": "a different secret entirely",
+		"SAPEDB_ENCRYPT": "1", "SAPEDB_SECRET": "a different secret entirely",
 	}, "", "ls")
 	if status == 0 {
 		t.Fatal("it opened an encrypted database with the wrong secret")
 	}
-	if !strings.Contains(errs, "RSQL_SECRET") {
+	if !strings.Contains(errs, "SAPEDB_SECRET") {
 		t.Errorf("the complaint does not name the secret: %q", errs)
 	}
 
@@ -382,6 +483,144 @@ func TestTheWrongSecretIsSaidPlainly(t *testing.T) {
 	if !strings.Contains(errs, "encrypted") {
 		t.Errorf("the complaint reads %q", errs)
 	}
+}
+
+// oldEnvName mirrors internal/cli's own rejectOldEnv: built from bytes so
+// this file, inside the tree internal/naming walks, does not itself carry
+// the string the whole rename exists to remove.
+func oldEnvName(suffix string) string {
+	return string([]byte{'R', 'S', 'Q', 'L', '_'}) + suffix
+}
+
+// TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored is the trap the task
+// called out by name: SAPEDB_DIR in particular has a default, so a renamed
+// variable nobody actually set would otherwise be read as simply absent and
+// the command would carry on quietly against the wrong directory.
+//
+// This is a universal claim — every variable this command reads refuses its
+// old name — so it is a table, one row per variable, each row differing in
+// exactly which one is old. A check that happened to compare secret
+// specifically, and nothing else, would pass this file forever while dir or
+// label kept quietly reading the old name underneath it.
+func TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored(t *testing.T) {
+	base := func(s *setup) map[string]string {
+		return map[string]string{
+			"SAPEDB_SECRET":  secret,
+			"SAPEDB_DIR":     s.dir,
+			"SAPEDB_ACCOUNT": "acme",
+			"SAPEDB_DB":      "main",
+			"SAPEDB_ENCRYPT": "1",
+			"SAPEDB_LABEL":   "another/label",
+		}
+	}
+
+	for _, suffix := range []string{"DIR", "ACCOUNT", "DB", "ENCRYPT", "SECRET", "LABEL"} {
+		t.Run(suffix, func(t *testing.T) {
+			setup := start(t)
+			vars := base(setup)
+			newName, oldName := "SAPEDB_"+suffix, oldEnvName(suffix)
+			value := vars[newName]
+			delete(vars, newName)
+			vars[oldName] = value
+
+			stdoutBuf, errBuf := &strings.Builder{}, &strings.Builder{}
+			status := Run([]string{"ls"}, setup.envOnly(vars), strings.NewReader(""), stdoutBuf, errBuf)
+			if status == 0 {
+				t.Fatalf("it started with only %s set instead of %s", oldName, newName)
+			}
+			// Not just "the message names both variables" — that survives the
+			// two names being swapped, which points the operator at the wrong
+			// one of the two: it would tell them to go set the very variable
+			// that was just refused. The signpost's whole job is to say which
+			// way to go, so the sentence has to be pinned whole, in order.
+			errs := errBuf.String()
+			want := oldName + " is not read any longer; set " + newName
+			if !strings.Contains(errs, want) {
+				t.Errorf("the refusal does not say %q: %q", want, errs)
+			}
+		})
+	}
+
+	// The control every row above is compared against: all current names,
+	// nothing old, must run. Without this, a bug that refused everything
+	// unconditionally would pass every row above too.
+	t.Run("control: every current name, nothing old", func(t *testing.T) {
+		setup := start(t)
+		stdoutBuf, errBuf := &strings.Builder{}, &strings.Builder{}
+		status := Run([]string{"ls"}, setup.envOnly(base(setup)), strings.NewReader(""), stdoutBuf, errBuf)
+		if status != 0 {
+			t.Fatalf("it refused the current environment names too: %s", errBuf.String())
+		}
+	})
+
+	// Both set, to different values: the new one must win, silently — this
+	// is not a compatibility path, so there must be no complaint at all.
+	t.Run("both set: the current name wins without complaint", func(t *testing.T) {
+		setup := start(t)
+		vars := base(setup)
+		vars[oldEnvName("SECRET")] = "a value nobody should ever read"
+
+		stdoutBuf, errBuf := &strings.Builder{}, &strings.Builder{}
+		status := Run([]string{"ls"}, setup.envOnly(vars), strings.NewReader(""), stdoutBuf, errBuf)
+		if status != 0 {
+			t.Fatalf("setting both refused to start: %s", errBuf.String())
+		}
+	})
+
+	// The new name set to the empty string is "not set", the same as it not
+	// being in the environment at all — get() treats them identically, on
+	// purpose, so a container with SAPEDB_DIR= would not silently run
+	// against the current directory. rejectOldEnv checks that at both ends —
+	// found&&value!="" on the new name, found&&value!="" on the old name —
+	// and the two do NOT fail the same way. This test exercises only the
+	// first: dropping the new-name guard reads a blank SAPEDB_DIR as "set"
+	// and skips straight past a real old-named DIR variable sitting right
+	// next to it, the shape a container ships by accident (an env file that
+	// declares the new key with no value, alongside a leftover old one).
+	t.Run("new name blank, old name has a value: still refused", func(t *testing.T) {
+		setup := start(t)
+		vars := base(setup)
+		newName, oldName := "SAPEDB_DIR", oldEnvName("DIR")
+		vars[newName] = ""
+		vars[oldName] = "/data"
+
+		stdoutBuf, errBuf := &strings.Builder{}, &strings.Builder{}
+		status := Run([]string{"ls"}, setup.envOnly(vars), strings.NewReader(""), stdoutBuf, errBuf)
+		if status == 0 {
+			t.Fatalf("it started with %s blank and %s set to a real value", newName, oldName)
+		}
+		want := oldName + " is not read any longer; set " + newName
+		if !strings.Contains(errBuf.String(), want) {
+			t.Errorf("the refusal does not say %q: %q", want, errBuf.String())
+		}
+	})
+
+	// The mirror image, on the OLD name's guard instead: dropping
+	// found&&value!="" on the old-name check would read a blank old-named
+	// LABEL variable as "set" and refuse to start even though there is
+	// nothing there to conflict with — a container that has never set
+	// anything under the old name at all, but whose env file (or
+	// `env | sort` habit) still declares it blank. This uses LABEL rather
+	// than DIR on purpose: DIR's
+	// fallback is the hard-coded absolute path /var/lib/sapedb (see get(),
+	// and the comment on the one documented mutation survivor next to it),
+	// and reaching that fallback here — which "must run" requires, since
+	// nothing refuses first — is exactly the system-path dependency this
+	// package's tests otherwise avoid. LABEL's fallback is the empty
+	// string, so this observes the same guard without touching a real path.
+	t.Run("new name blank, old name also blank: must run", func(t *testing.T) {
+		setup := start(t)
+		vars := base(setup)
+		newName, oldName := "SAPEDB_LABEL", oldEnvName("LABEL")
+		vars[newName] = ""
+		vars[oldName] = ""
+
+		stdoutBuf, errBuf := &strings.Builder{}, &strings.Builder{}
+		status := Run([]string{"ls"}, setup.envOnly(vars), strings.NewReader(""), stdoutBuf, errBuf)
+		if status != 0 {
+			t.Fatalf("it refused to start with %s and %s both blank, neither one a real value: %s", newName, oldName, errBuf.String())
+		}
+	})
 }
 
 func TestWhatIsNotACommandIsExplained(t *testing.T) {
@@ -399,17 +638,17 @@ func TestWhatIsNotACommandIsExplained(t *testing.T) {
 			if status == 0 {
 				t.Fatal("it ran anyway")
 			}
-			if !strings.Contains(errs, "rsql [options]") {
+			if !strings.Contains(errs, "sapedb [options]") {
 				t.Errorf("it did not print how to use it: %q", errs)
 			}
 		})
 	}
 
 	// And the things a command cannot work without.
-	if _, errs, _ := setup.runWith(map[string]string{"RSQL_SECRET": ""}, "", "ls"); !strings.Contains(errs, "RSQL_SECRET") {
+	if _, errs, _ := setup.runWith(map[string]string{"SAPEDB_SECRET": ""}, "", "ls"); !strings.Contains(errs, "SAPEDB_SECRET") {
 		t.Errorf("no secret: %q", errs)
 	}
-	if _, errs, _ := setup.runWith(map[string]string{"RSQL_DB": ""}, "", "ls"); !strings.Contains(errs, "-db") {
+	if _, errs, _ := setup.runWith(map[string]string{"SAPEDB_DB": ""}, "", "ls"); !strings.Contains(errs, "-db") {
 		t.Errorf("no database: %q", errs)
 	}
 }

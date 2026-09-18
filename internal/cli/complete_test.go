@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 func library() store.Catalogue {

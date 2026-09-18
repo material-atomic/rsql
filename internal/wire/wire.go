@@ -20,10 +20,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/connection"
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/connection"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // ErrRefused is the server saying no. It carries the code, because a tool that
@@ -104,7 +104,7 @@ func Dial(where connection.Connection, options Options) (*Client, error) {
 	}
 	if frame.Type != protocol.Welcome {
 		_ = conn.Close()
-		return nil, fmt.Errorf("rsql/wire: the server opened with a %s", frame.Type)
+		return nil, fmt.Errorf("sapedb/wire: the server opened with a %s", frame.Type)
 	}
 	if err := json.Unmarshal(frame.Payload, &client.welcome); err != nil {
 		_ = conn.Close()
@@ -127,11 +127,11 @@ func (c *Client) Close() error {
 // server issued with the server's own secret.
 func (c *Client) Operate(secret string) error {
 	if c.welcome.Challenge == "" {
-		return errors.New("rsql/wire: this server issued no challenge, so it cannot be operated")
+		return errors.New("sapedb/wire: this server issued no challenge, so it cannot be operated")
 	}
 	challenge, err := hex.DecodeString(c.welcome.Challenge)
 	if err != nil {
-		return fmt.Errorf("rsql/wire: the challenge is not hex: %w", err)
+		return fmt.Errorf("sapedb/wire: the challenge is not hex: %w", err)
 	}
 	proof, err := signing.Operating(secret, challenge)
 	if err != nil {
@@ -169,7 +169,7 @@ func (c *Client) WhatIsHere() (store.Catalogue, error) {
 		return store.Catalogue{}, err
 	}
 	if answer.Here == nil {
-		return store.Catalogue{}, errors.New("rsql/wire: the server sent no catalogue")
+		return store.Catalogue{}, errors.New("sapedb/wire: the server sent no catalogue")
 	}
 	return *answer.Here, nil
 }
@@ -194,7 +194,7 @@ func (c *Client) ask(kind protocol.Type, body any) ([]byte, error) {
 	if frame.Type == protocol.Failure {
 		refused := &ErrRefused{}
 		if err := json.Unmarshal(frame.Payload, refused); err != nil {
-			return nil, fmt.Errorf("rsql/wire: the server refused it and the reason does not read: %w", err)
+			return nil, fmt.Errorf("sapedb/wire: the server refused it and the reason does not read: %w", err)
 		}
 		return nil, refused
 	}
@@ -214,7 +214,7 @@ func (c *Client) request(kind protocol.Type, body any) (protocol.Frame, error) {
 	// One request at a time, so an answer to something else is a server that
 	// is not the one this speaks to.
 	if frame.ID != id {
-		return protocol.Frame{}, fmt.Errorf("rsql/wire: asked %d and was answered %d", id, frame.ID)
+		return protocol.Frame{}, fmt.Errorf("sapedb/wire: asked %d and was answered %d", id, frame.ID)
 	}
 	return frame, nil
 }

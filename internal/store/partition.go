@@ -5,7 +5,7 @@ import (
 	"hash/fnv"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/ulid"
+	"github.com/sapedb/sapedb/internal/ulid"
 )
 
 // What decides which partition a document goes in.

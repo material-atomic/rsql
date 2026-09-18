@@ -79,7 +79,7 @@ func LockDir(dir string) (io.Closer, error) {
 }
 
 // ErrClosed is returned by every method of a file that has been closed.
-var ErrClosed = errors.New("rsql/vfs: file is closed")
+var ErrClosed = errors.New("sapedb/vfs: file is closed")
 
 // OpenFile opens a real file for reading and writing, creating it if needed,
 // and takes an exclusive lock on it.
@@ -174,7 +174,7 @@ func (f *Folder) Names() ([]string, error) {
 }
 
 // ErrName is a file name that is not one.
-var ErrName = errors.New("rsql/vfs: a file name may not be a path")
+var ErrName = errors.New("sapedb/vfs: a file name may not be a path")
 
 // safeName refuses anything that could leave the folder. The names come from
 // inside this program and are checked before they are used anywhere else, so

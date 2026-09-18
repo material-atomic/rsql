@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/store"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/store"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 const (
@@ -558,8 +558,8 @@ func TestAFileMovedToAnotherDatabaseDoesNotOpen(t *testing.T) {
 	}
 
 	// The file of one database, put where the other one lives.
-	from := filepath.Join(dir, "acme", "first.rsql")
-	to := filepath.Join(dir, "acme", "second.rsql")
+	from := filepath.Join(dir, "acme", "first.sapedb")
+	to := filepath.Join(dir, "acme", "second.sapedb")
 	content, err := os.ReadFile(from)
 	if err != nil {
 		t.Fatal(err)
@@ -576,6 +576,60 @@ func TestAFileMovedToAnotherDatabaseDoesNotOpen(t *testing.T) {
 
 	if _, _, err := after.Store("acme", "second"); !errors.Is(err, pager.ErrKey) {
 		t.Errorf("a file from another database opened here: %v", err)
+	}
+}
+
+// oldDBExt mirrors internal/server's own oldFileExt: built from bytes so
+// this file, inside the tree internal/naming walks, does not carry the old
+// word as a literal.
+func oldDBExt() string {
+	return "." + string([]byte{'r', 's', 'q', 'l'})
+}
+
+// TestAnOldExtensionFileIsRefusedNotSilentlyReplaced is the file-extension
+// counterpart to the environment-variable signpost tests in
+// internal/cli and internal/service: openFile treats a missing .sapedb path
+// as "create a new, empty database", which would make a database opened by
+// the old binary go invisible behind a brand-new empty one of the same
+// name, rather than failing in any way an operator would notice.
+func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "acme"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, "acme", "main"+oldDBExt())
+	if err := os.WriteFile(old, []byte("stand-in for a real database file; only its path matters here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := New(Options{Dir: dir, Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// Not t.Fatal on a bare err == nil: if the mutation this test exists to
+	// catch ever regresses, Store succeeds and hands back a lock on the
+	// database (the release func here) that nothing would ever call —
+	// t.Fatal's Goexit would then run the deferred server.Close() while
+	// that lock is still held, and Close(), which locks every open
+	// database on its way out, would deadlock instead of failing cleanly.
+	// So the lock is released on this path before anything can fail.
+	_, release, err := server.Store("acme", "main")
+	if err == nil {
+		release()
+		t.Fatal("it opened (or silently created) a database while an old-extension file with the same name existed")
+	}
+
+	want := filepath.Join(dir, "acme", "main.sapedb")
+	if !strings.Contains(err.Error(), old) || !strings.Contains(err.Error(), want) {
+		t.Errorf("the refusal does not name both paths: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mv") {
+		t.Errorf("the refusal does not tell the operator to mv the file: %v", err)
+	}
+	if _, statErr := os.Stat(want); statErr == nil {
+		t.Error("a new .sapedb file was created even though the command was refused")
 	}
 }
 

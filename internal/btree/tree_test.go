@@ -9,8 +9,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // sorted reports whether keys are strictly increasing.

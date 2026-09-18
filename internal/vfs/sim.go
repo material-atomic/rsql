@@ -13,7 +13,7 @@ import (
 const SectorBytes = 512
 
 // ErrPowerCut is returned by every operation after the power has gone.
-var ErrPowerCut = errors.New("rsql/vfs: power cut")
+var ErrPowerCut = errors.New("sapedb/vfs: power cut")
 
 // Faults is what a simulated disk is allowed to do to you. Every one of them
 // is something a real disk, filesystem or kernel has been observed to do.
@@ -110,17 +110,17 @@ func (d *SimDisk) ReadAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	if off < 0 {
-		return 0, errors.New("rsql/vfs: negative offset")
+		return 0, errors.New("sapedb/vfs: negative offset")
 	}
 
 	size := int64(len(d.current))
 	if off >= size {
-		return 0, fmt.Errorf("rsql/vfs: read at %d past end %d", off, size)
+		return 0, fmt.Errorf("sapedb/vfs: read at %d past end %d", off, size)
 	}
 
 	n := copy(p, d.current[off:])
 	if n < len(p) {
-		return n, fmt.Errorf("rsql/vfs: short read of %d of %d bytes", n, len(p))
+		return n, fmt.Errorf("sapedb/vfs: short read of %d of %d bytes", n, len(p))
 	}
 	return n, nil
 }
@@ -132,7 +132,7 @@ func (d *SimDisk) WriteAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	if off < 0 {
-		return 0, errors.New("rsql/vfs: negative offset")
+		return 0, errors.New("sapedb/vfs: negative offset")
 	}
 
 	d.writes++
@@ -241,7 +241,7 @@ func (d *SimDisk) Truncate(size int64) error {
 		return err
 	}
 	if size < 0 {
-		return errors.New("rsql/vfs: negative size")
+		return errors.New("sapedb/vfs: negative size")
 	}
 
 	if size < int64(len(d.durable)) {

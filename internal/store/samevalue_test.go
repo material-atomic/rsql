@@ -908,7 +908,7 @@ func TestNumbersAreFloat64OnEveryPathThatFeedsSameValue(t *testing.T) {
 	// package writes one, is not decoded at all — it is whatever untyped
 	// constant Go assigned, which defaults to int. That gap only exists on
 	// the direct Go-API side; a real client, and a schema loaded from a file
-	// with `rsql apply`, both go through json.Unmarshal (measured above) and
+	// with `sapedb apply`, both go through json.Unmarshal (measured above) and
 	// never produce it.
 	direct := Term{Value: 1}
 	if reflect.TypeOf(direct.Value) == reflect.TypeOf(float64(0)) {

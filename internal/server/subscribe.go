@@ -7,8 +7,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // A subscription is the change log, read out loud.
@@ -24,7 +24,7 @@ import (
 // connection can carry several and each knows which is which.
 
 // ErrTooFarBehind is a subscriber asking for entries that have been trimmed.
-var ErrTooFarBehind = errors.New("rsql/server: those changes are no longer kept; start again from a dump")
+var ErrTooFarBehind = errors.New("sapedb/server: those changes are no longer kept; start again from a dump")
 
 // subscribe is what a client asks for.
 type subscribe struct {
@@ -71,7 +71,7 @@ func (s *sender) send(frame protocol.Frame, payload []byte) error {
 func (s *Server) follow(live *session, out *sender, id uint32, payload []byte, done <-chan struct{}) error {
 	asked := subscribe{}
 	if err := json.Unmarshal(payload, &asked); err != nil {
-		return fmt.Errorf("rsql/server: the subscription does not read as one: %w", err)
+		return fmt.Errorf("sapedb/server: the subscription does not read as one: %w", err)
 	}
 
 	db, err := s.reach(live, call{DBName: asked.DBName, Signature: asked.Signature})

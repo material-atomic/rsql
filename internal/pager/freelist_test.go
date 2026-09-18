@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // fill writes a page of `mark` and returns its id.

@@ -1,6 +1,6 @@
 // Package protocol is the wire format: how a frame is written and read.
 //
-// The client side is @ecosy/rsql/protocol. Both read fixtures/frames.json —
+// The client side is @ecosy/sapedb/protocol. Both read fixtures/frames.json —
 // bytes written by one, decoded by the other — so a change to the layout turns
 // both test suites red at once rather than showing up as a connection that
 // hangs with nothing in a log.
@@ -78,8 +78,8 @@ type Frame struct {
 }
 
 var (
-	ErrPayloadTooLarge = errors.New("rsql: frame payload over the limit")
-	ErrVersion         = errors.New("rsql: frame version not readable by this side")
+	ErrPayloadTooLarge = errors.New("sapedb: frame payload over the limit")
+	ErrVersion         = errors.New("sapedb: frame version not readable by this side")
 )
 
 // Encode writes a frame as bytes.

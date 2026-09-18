@@ -14,10 +14,10 @@
  *
  * Run it:
  *
- *   RSQL_SERVER_BIN=…/rsqld RSQL_CLI_BIN=…/rsql node examples/ledger/run.mjs
+ *   SAPEDB_SERVER_BIN=…/sapedbd SAPEDB_CLI_BIN=…/sapedb node examples/ledger/run.mjs
  *
- * RSQL_CLIENT may point at the built driver; it defaults to the sibling
- * ecosy-rsql package in this workspace.
+ * SAPEDB_CLIENT may point at the built driver; it defaults to the sibling
+ * ecosy-sapedb package in this workspace.
  */
 
 import { spawn, execFileSync } from "node:child_process";
@@ -28,12 +28,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer } from "node:net";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SERVER = process.env.RSQL_SERVER_BIN;
-const CLI = process.env.RSQL_CLI_BIN;
-const CLIENT = process.env.RSQL_CLIENT ?? resolve(here, "../../../ecosy-rsql/dist");
+const SERVER = process.env.SAPEDB_SERVER_BIN;
+const CLI = process.env.SAPEDB_CLI_BIN;
+const CLIENT = process.env.SAPEDB_CLIENT ?? resolve(here, "../../../ecosy-sapedb/dist");
 
 if (!SERVER || !CLI) {
-  console.error("set RSQL_SERVER_BIN and RSQL_CLI_BIN to the built binaries");
+  console.error("set SAPEDB_SERVER_BIN and SAPEDB_CLI_BIN to the built binaries");
   process.exit(2);
 }
 
@@ -58,8 +58,8 @@ async function freePort() {
   });
 }
 
-const dir = mkdtempSync(join(tmpdir(), "rsql-ledger-"));
-const env = { ...process.env, RSQL_SECRET: SECRET, RSQL_DIR: dir, RSQL_ACCOUNT: "acme", RSQL_DB: "books" };
+const dir = mkdtempSync(join(tmpdir(), "sapedb-ledger-"));
+const env = { ...process.env, SAPEDB_SECRET: SECRET, SAPEDB_DIR: dir, SAPEDB_ACCOUNT: "acme", SAPEDB_DB: "books" };
 
 say(`a database in ${dir}`);
 execFileSync(CLI, ["apply", join(here, "schema.json")], { env, stdio: "inherit" });
@@ -67,7 +67,7 @@ say("declared: three collections, five operations, one of them a batch of four s
 
 const port = await freePort();
 const server = spawn(SERVER, [], {
-  env: { ...env, RSQL_INSECURE: "1", RSQL_ADDR: `127.0.0.1:${port}` },
+  env: { ...env, SAPEDB_INSECURE: "1", SAPEDB_ADDR: `127.0.0.1:${port}` },
   stdio: ["ignore", "pipe", "inherit"],
 });
 await new Promise((ok, no) => {
@@ -77,7 +77,7 @@ await new Promise((ok, no) => {
 });
 
 const sig = await sign({ accountId: "acme", password: PASSWORD, dbname: "books" }, { secret: SECRET });
-const url = `rsql://acme:${PASSWORD}@127.0.0.1:${port}/books?sig=${sig}`;
+const url = `sapedb://acme:${PASSWORD}@127.0.0.1:${port}/books?sig=${sig}`;
 const client = new (Client({ transport: nodeTransport({ insecure: true }), mode: "bound", requestTimeout: 5000 }))();
 
 let failed = false;

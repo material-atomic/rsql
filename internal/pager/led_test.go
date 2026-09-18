@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // filled writes a page of one repeated byte and returns its id.
@@ -164,7 +164,7 @@ func TestALedStoreSaysWhetherItIsOneOfOurs(t *testing.T) {
 	if _, err := stranger.WriteAt(bytes.Repeat([]byte{0x7F}, PageBytes), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenLed(stranger, Led{}, Options{}); !errors.Is(err, ErrNotRsql) {
+	if _, err := OpenLed(stranger, Led{}, Options{}); !errors.Is(err, ErrNotSapedb) {
 		t.Errorf("a file that is not ours opened as one: %v", err)
 	}
 
@@ -427,7 +427,7 @@ func TestOpeningALedStoreReadsTheFreeListItWasToldAbout(t *testing.T) {
 // TestClosingALedStoreLeavesItsLabelAlone: a led file has no meta pages, so
 // page 0 is its label. A close that wrote a mark there would overwrite the one
 // page saying what the file is — and the partition would come back as not an
-// rsql file at all.
+// sapedb file at all.
 func TestClosingALedStoreLeavesItsLabelAlone(t *testing.T) {
 	disk := vfs.NewSim(14, vfs.Faults{})
 	pages, err := CreateLed(disk, Options{})

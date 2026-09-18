@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/ulid"
+	"github.com/sapedb/sapedb/internal/ulid"
 )
 
 // atMonth makes a store whose generated keys land in a month of your choosing,

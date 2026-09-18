@@ -51,6 +51,14 @@ const (
 
 // The labels that separate one derived key from another. A key derived for one
 // purpose must never be usable for a different one.
+//
+// Both still carry the product's old name on purpose, not by oversight: they
+// are baked into every page of every encrypted database that already exists,
+// and changing either one is a silent, unannounced key rotation — the key
+// derived for an existing file would stop matching the key derived from the
+// same secret, which reads as "wrong key" for a key that is right. They only
+// ever move together with a migration that re-derives and re-encrypts every
+// affected page under the new label. This is not that commit.
 const (
 	pageLabel  = "rsql/pager:page:v1"
 	checkLabel = "rsql/pager:key-check:v1"
@@ -59,12 +67,12 @@ const (
 var (
 	// ErrKey is a database that is encrypted and was opened with the wrong key,
 	// or with none.
-	ErrKey = errors.New("rsql/pager: this database is encrypted and the key does not open it")
+	ErrKey = errors.New("sapedb/pager: this database is encrypted and the key does not open it")
 	// ErrNotEncrypted is a key offered to a database that has none.
-	ErrNotEncrypted = errors.New("rsql/pager: this database is not encrypted")
+	ErrNotEncrypted = errors.New("sapedb/pager: this database is not encrypted")
 	// ErrDecrypt is a page that did not authenticate, on a database whose key
 	// is known to be right — so the page was changed, not the key.
-	ErrDecrypt = errors.New("rsql/pager: a page did not decrypt")
+	ErrDecrypt = errors.New("sapedb/pager: a page did not decrypt")
 )
 
 // Options are how a database is created or opened.
@@ -87,7 +95,7 @@ type crypt struct {
 func newCrypt(secret, salt []byte) (*crypt, error) {
 	derived, err := hkdf.Key(sha256.New, secret, salt, pageLabel, KeyBytes)
 	if err != nil {
-		return nil, fmt.Errorf("rsql/pager: deriving the page key: %w", err)
+		return nil, fmt.Errorf("sapedb/pager: deriving the page key: %w", err)
 	}
 
 	block, err := aes.NewCipher(derived)
@@ -112,7 +120,7 @@ func newCrypt(secret, salt []byte) (*crypt, error) {
 func (c *crypt) encrypt(data []byte) error {
 	nonce := data[offNonce : offNonce+NonceBytes]
 	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("rsql/pager: no randomness for a page nonce: %w", err)
+		return fmt.Errorf("sapedb/pager: no randomness for a page nonce: %w", err)
 	}
 
 	payload := data[HeaderBytes:]
@@ -164,7 +172,7 @@ func makeCheck(secret, salt []byte, into []byte) error {
 
 	nonce := into[:NonceBytes]
 	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("rsql/pager: no randomness for the key check: %w", err)
+		return fmt.Errorf("sapedb/pager: no randomness for the key check: %w", err)
 	}
 
 	tag := aead.Seal(nil, nonce, nil, salt)
@@ -190,7 +198,7 @@ func openCheck(secret, salt []byte, stored []byte) error {
 func checkCipher(secret, salt []byte) (cipher.AEAD, error) {
 	derived, err := hkdf.Key(sha256.New, secret, salt, checkLabel, KeyBytes)
 	if err != nil {
-		return nil, fmt.Errorf("rsql/pager: deriving the check key: %w", err)
+		return nil, fmt.Errorf("sapedb/pager: deriving the check key: %w", err)
 	}
 	block, err := aes.NewCipher(derived)
 	if err != nil {

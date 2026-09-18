@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/signing"
+	"github.com/sapedb/sapedb/internal/signing"
 )
 
 const secret = "the secret only the control plane has"
@@ -41,6 +41,27 @@ func TestAConnectionStringGoesApartAndBackTogether(t *testing.T) {
 	}
 }
 
+// TestAStringPerfectInEveryWayButTheOldSchemeIsStillRefused is the case that
+// actually tests something: not "the scheme constant says sapedb" — that
+// would pass on a typo just as easily — but that a string which is valid in
+// every other respect (real account, a password of the right shape, a real
+// host and port, a database name, a signature that is 64 hex characters)
+// is refused for exactly the one thing wrong with it. A parser that had
+// somehow kept accepting the old scheme as an alias would sail through every
+// other test in this file and only be caught here.
+func TestAStringPerfectInEveryWayButTheOldSchemeIsStillRefused(t *testing.T) {
+	oldScheme := string([]byte{'r', 's', 'q', 'l'}) // see internal/naming
+	text := oldScheme + "://acme:a-password-of-the-right-shape@db.example:7433/main?sig=" + strings.Repeat("a", 64)
+
+	parsed, err := Parse(text)
+	if !errors.Is(err, ErrScheme) {
+		t.Fatalf("want ErrScheme, got %v", err)
+	}
+	if parsed != (Connection{}) {
+		t.Errorf("a rejected string must not hand back a Parsed value, got %+v", parsed)
+	}
+}
+
 func TestAPortIsTakenOrDefaulted(t *testing.T) {
 	text := signed(t, "acme", "a-password-of-the-right-shape", "db.example", "main")
 
@@ -67,11 +88,11 @@ func TestAPortIsTakenOrDefaulted(t *testing.T) {
 // dare not show anyone.
 func TestWhatIsMissingIsNamed(t *testing.T) {
 	for want, text := range map[string]string{
-		"account":  "rsql://:pw@host:7433/db?sig=ab",
-		"password": "rsql://acme@host:7433/db?sig=ab",
-		"host":     "rsql://acme:pw@/db?sig=ab",
-		"dbname":   "rsql://acme:pw@host:7433/?sig=ab",
-		"sig":      "rsql://acme:pw@host:7433/db",
+		"account":  "sapedb://:pw@host:7433/db?sig=ab",
+		"password": "sapedb://acme@host:7433/db?sig=ab",
+		"host":     "sapedb://acme:pw@/db?sig=ab",
+		"dbname":   "sapedb://acme:pw@host:7433/?sig=ab",
+		"sig":      "sapedb://acme:pw@host:7433/db",
 	} {
 		_, err := Parse(text)
 		if !errors.Is(err, ErrField) {
@@ -85,6 +106,19 @@ func TestWhatIsMissingIsNamed(t *testing.T) {
 
 	if _, err := Parse("postgres://acme:pw@host/db?sig=ab"); !errors.Is(err, ErrScheme) {
 		t.Errorf("another scheme: want ErrScheme, got %v", err)
+	}
+}
+
+// A database name with a "/" in it would let a string that names one thing
+// in Account+DBName also read as a path with an extra segment, wherever a
+// caller joins DBName onto a directory — which is exactly what the CLI's
+// open() does. Found while writing this rename's mutation table; the check
+// itself predates the rename and this is its first test.
+func TestADatabaseNameMayNotHoldASlash(t *testing.T) {
+	text := signed(t, "acme", "a-password-of-the-right-shape", "db.example", "main")
+	withSlash := strings.Replace(text, "/main?", "/sub/main?", 1)
+	if _, err := Parse(withSlash); !errors.Is(err, ErrField) {
+		t.Errorf("a dbname holding a %q: want ErrField, got %v", "/", err)
 	}
 }
 

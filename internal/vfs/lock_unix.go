@@ -10,7 +10,7 @@ import (
 )
 
 // ErrLocked is a database another process already has open for writing.
-var ErrLocked = errors.New("rsql/vfs: another process has this database open")
+var ErrLocked = errors.New("sapedb/vfs: another process has this database open")
 
 // lock takes an exclusive lock on the whole file, and does not wait for it.
 //
@@ -28,7 +28,7 @@ func lock(handle *os.File) error {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return fmt.Errorf("%w: %s", ErrLocked, handle.Name())
 		}
-		return fmt.Errorf("rsql/vfs: locking %s: %w", handle.Name(), err)
+		return fmt.Errorf("sapedb/vfs: locking %s: %w", handle.Name(), err)
 	}
 	return nil
 }

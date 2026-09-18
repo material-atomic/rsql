@@ -41,7 +41,7 @@ const (
 const freePerPage = (PageBytes - HeaderBytes - freeHeader) / freeEntry
 
 // ErrFreelist is a free list that does not read back as one.
-var ErrFreelist = errors.New("rsql/pager: the free list is not readable")
+var ErrFreelist = errors.New("sapedb/pager: the free list is not readable")
 
 type freelist struct {
 	// ready is free for the taking right now.

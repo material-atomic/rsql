@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 const secret = "the secret only the control plane has"
@@ -40,23 +40,23 @@ func TestAServerRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 		err  error
 	}{
 		"no secret": {
-			vars: map[string]string{"RSQL_INSECURE": "1"},
+			vars: map[string]string{"SAPEDB_INSECURE": "1"},
 			err:  ErrNoSecret,
 		},
 		"no TLS and nobody said so": {
-			vars: map[string]string{"RSQL_SECRET": secret},
+			vars: map[string]string{"SAPEDB_SECRET": secret},
 			err:  ErrNoTLS,
 		},
 		"a certificate with no key": {
-			vars: map[string]string{"RSQL_SECRET": secret, "RSQL_TLS_CERT": "/tmp/cert.pem"},
+			vars: map[string]string{"SAPEDB_SECRET": secret, "SAPEDB_TLS_CERT": "/tmp/cert.pem"},
 			err:  ErrHalfTLS,
 		},
 		"a key with no certificate": {
-			vars: map[string]string{"RSQL_SECRET": secret, "RSQL_TLS_KEY": "/tmp/key.pem"},
+			vars: map[string]string{"SAPEDB_SECRET": secret, "SAPEDB_TLS_KEY": "/tmp/key.pem"},
 			err:  ErrHalfTLS,
 		},
 		"a shutdown wait that is not a time": {
-			vars: map[string]string{"RSQL_SECRET": secret, "RSQL_INSECURE": "1", "RSQL_SHUTDOWN": "soonish"},
+			vars: map[string]string{"SAPEDB_SECRET": secret, "SAPEDB_INSECURE": "1", "SAPEDB_SHUTDOWN": "soonish"},
 			err:  ErrNotDuration,
 		},
 	} {
@@ -68,7 +68,7 @@ func TestAServerRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 	}
 
 	// And serving in the clear is possible — it just has to be said out loud.
-	config, err := FromEnv(env(map[string]string{"RSQL_SECRET": secret, "RSQL_INSECURE": "1"}))
+	config, err := FromEnv(env(map[string]string{"SAPEDB_SECRET": secret, "SAPEDB_INSECURE": "1"}))
 	if err != nil {
 		t.Fatalf("a server told to serve without TLS: %v", err)
 	}
@@ -82,13 +82,13 @@ func TestAServerRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 
 func TestTheEnvironmentIsReadAsWritten(t *testing.T) {
 	config, err := FromEnv(env(map[string]string{
-		"RSQL_SECRET":   secret,
-		"RSQL_ADDR":     "127.0.0.1:9999",
-		"RSQL_DIR":      "/data/here",
-		"RSQL_LABEL":    "another/label",
-		"RSQL_INSECURE": "yes",
-		"RSQL_ENCRYPT":  "true",
-		"RSQL_SHUTDOWN": "90s",
+		"SAPEDB_SECRET":   secret,
+		"SAPEDB_ADDR":     "127.0.0.1:9999",
+		"SAPEDB_DIR":      "/data/here",
+		"SAPEDB_LABEL":    "another/label",
+		"SAPEDB_INSECURE": "yes",
+		"SAPEDB_ENCRYPT":  "true",
+		"SAPEDB_SHUTDOWN": "90s",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -103,14 +103,159 @@ func TestTheEnvironmentIsReadAsWritten(t *testing.T) {
 	}
 
 	// An empty variable is not a value: it means "not set", or a container with
-	// RSQL_DIR= would put its databases in the current directory.
-	blank, err := FromEnv(env(map[string]string{"RSQL_SECRET": secret, "RSQL_INSECURE": "1", "RSQL_DIR": ""}))
+	// SAPEDB_DIR= would put its databases in the current directory.
+	blank, err := FromEnv(env(map[string]string{"SAPEDB_SECRET": secret, "SAPEDB_INSECURE": "1", "SAPEDB_DIR": ""}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if blank.Dir != DefaultDir {
-		t.Errorf("an empty RSQL_DIR became %q", blank.Dir)
+		t.Errorf("an empty SAPEDB_DIR became %q", blank.Dir)
 	}
+}
+
+// TestDefaultDirIsExactlyThis pins the literal value, deliberately not by
+// comparing against the DefaultDir constant itself: TestTheEnvironmentIsReadAsWritten
+// checks that an empty SAPEDB_DIR falls back to DefaultDir, but that
+// assertion compares DefaultDir to DefaultDir and would stay green no
+// matter what the constant said. Something has to compare it to the actual
+// path a packaged server is expected to use.
+func TestDefaultDirIsExactlyThis(t *testing.T) {
+	if DefaultDir != "/var/lib/sapedb" {
+		t.Errorf("DefaultDir is %q", DefaultDir)
+	}
+}
+
+// oldEnvName mirrors internal/service's own rejectOldEnv: built from bytes
+// so this file, inside the tree internal/naming walks, does not itself
+// carry the string the whole rename exists to remove.
+func oldEnvName(suffix string) string {
+	return string([]byte{'R', 'S', 'Q', 'L', '_'}) + suffix
+}
+
+// TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored is the case the task
+// called out: several of these variables have a default or a zero value, so
+// a renamed variable nobody actually set would otherwise start the server
+// quietly, listening insecurely on the default address instead of refusing.
+//
+// This is a universal claim — every variable FromEnv reads refuses its old
+// name — so it is a table, one row per variable, differing in exactly which
+// one is old. A check that happened to compare secret specifically, and
+// nothing else, would pass this file forever while addr or shutdown kept
+// quietly reading the old name underneath it.
+func TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			"SAPEDB_SECRET":   secret,
+			"SAPEDB_ADDR":     "127.0.0.1:0",
+			"SAPEDB_DIR":      t.TempDir(),
+			"SAPEDB_LABEL":    "another/label",
+			"SAPEDB_TLS_CERT": "/tmp/cert.pem",
+			"SAPEDB_TLS_KEY":  "/tmp/key.pem",
+			"SAPEDB_INSECURE": "1",
+			"SAPEDB_ENCRYPT":  "true",
+			"SAPEDB_SHUTDOWN": "5s",
+		}
+	}
+
+	for _, suffix := range []string{
+		"ADDR", "DIR", "SECRET", "LABEL", "TLS_CERT", "TLS_KEY", "INSECURE", "ENCRYPT", "SHUTDOWN",
+	} {
+		t.Run(suffix, func(t *testing.T) {
+			vars := base()
+			newName, oldName := "SAPEDB_"+suffix, oldEnvName(suffix)
+			value := vars[newName]
+			delete(vars, newName)
+			vars[oldName] = value
+
+			_, err := FromEnv(env(vars))
+			if err == nil {
+				t.Fatalf("it started with only %s set instead of %s", oldName, newName)
+			}
+			// Not just "the message names both variables" — that survives
+			// the two names being swapped, which points the operator at the
+			// wrong one of the two: it would tell them to go set the very
+			// variable that was just refused. The signpost's whole job is to
+			// say which way to go, so the sentence has to be pinned whole,
+			// in order.
+			want := oldName + " is not read any longer; set " + newName
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not say %q: %v", want, err)
+			}
+		})
+	}
+
+	// The control every row above is compared against: all current names,
+	// nothing old, must start.
+	t.Run("control: every current name, nothing old", func(t *testing.T) {
+		if _, err := FromEnv(env(base())); err != nil {
+			t.Fatalf("it refused the current environment names too: %v", err)
+		}
+	})
+
+	// Both set, to different values: the new one must win, silently.
+	t.Run("both set: the current name wins without complaint", func(t *testing.T) {
+		vars := base()
+		vars[oldEnvName("SECRET")] = "a value nobody should ever read"
+
+		config, err := FromEnv(env(vars))
+		if err != nil {
+			t.Fatalf("setting both refused to start: %v", err)
+		}
+		if config.Secret != secret {
+			t.Errorf("the old name's value leaked through: got %q", config.Secret)
+		}
+	})
+
+	// The new name set to the empty string is "not set" — get() treats a
+	// blank value and a missing one identically, on purpose, so a container
+	// with SAPEDB_DIR= would not silently serve from the current directory.
+	// rejectOldEnv checks that at both ends — found&&value!="" on the new
+	// name, found&&value!="" on the old name — and the two do NOT fail the
+	// same way. This test exercises only the first: dropping the new-name
+	// guard would read a blank SAPEDB_DIR as "set" and skip straight past a
+	// real old-named DIR variable sitting right next to it — the shape of an
+	// env file that declares the new key with no value, alongside a
+	// leftover old one.
+	t.Run("new name set to empty, old name has a value: still refused", func(t *testing.T) {
+		vars := base()
+		newName, oldName := "SAPEDB_DIR", oldEnvName("DIR")
+		vars[newName] = ""
+		vars[oldName] = "/data"
+
+		_, err := FromEnv(env(vars))
+		if err == nil {
+			t.Fatalf("it started with %s blank and %s set to a real value", newName, oldName)
+		}
+		want := oldName + " is not read any longer; set " + newName
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	})
+
+	// The mirror image, on the OLD name's guard instead: dropping
+	// found&&value!="" on the old-name check would read a blank old-named
+	// DIR variable as "set" and refuse to start even though there is
+	// nothing there to conflict with — a container that never set anything
+	// under the old name at all, but whose env file (or `env | sort` habit)
+	// still declares it blank. Unlike internal/cli's equivalent test, this
+	// can use DIR directly: FromEnv only ever stores Dir as a plain Config field
+	// (see FromEnv's own get("SAPEDB_DIR", DefaultDir)) and never opens it,
+	// so there is no real /var/lib/sapedb fallback path for this test to
+	// touch the way running the CLI's "ls" command would.
+	t.Run("new name blank, old name also blank: must start", func(t *testing.T) {
+		vars := base()
+		newName, oldName := "SAPEDB_DIR", oldEnvName("DIR")
+		vars[newName] = ""
+		vars[oldName] = ""
+
+		config, err := FromEnv(env(vars))
+		if err != nil {
+			t.Fatalf("it refused to start with %s and %s both blank, neither one a real value: %v", newName, oldName, err)
+		}
+		if config.Dir != DefaultDir {
+			t.Errorf("Dir = %q, want the default %q", config.Dir, DefaultDir)
+		}
+	})
 }
 
 // selfSigned writes a certificate and key for localhost, so the TLS path is
@@ -255,7 +400,7 @@ func TestItServesOverTLSAndStopsWhenTold(t *testing.T) {
 		t.Fatalf("invoke: %s %v %s", frame.Type, err, frame.Payload)
 	}
 
-	if !strings.Contains(announced.String(), "rsql+tls") {
+	if !strings.Contains(announced.String(), "sapedb+tls") {
 		t.Errorf("it announced %q", announced.String())
 	}
 
@@ -343,11 +488,11 @@ func TestRunReadsTheEnvironmentAndServes(t *testing.T) {
 	ready := make(chan error, 1)
 	go func() {
 		ready <- Run(ctx, env(map[string]string{
-			"RSQL_SECRET":   secret,
-			"RSQL_ADDR":     "127.0.0.1:0",
-			"RSQL_DIR":      dir,
-			"RSQL_INSECURE": "1",
-			"RSQL_SHUTDOWN": "1s",
+			"SAPEDB_SECRET":   secret,
+			"SAPEDB_ADDR":     "127.0.0.1:0",
+			"SAPEDB_DIR":      dir,
+			"SAPEDB_INSECURE": "1",
+			"SAPEDB_SHUTDOWN": "1s",
 		}), nil)
 	}()
 

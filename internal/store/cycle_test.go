@@ -89,7 +89,7 @@ func TestSameValueSurvivesASingleSelfReferentialOperand(t *testing.T) {
 // few hundred milliseconds instead of the ~1GB the runtime would otherwise
 // grow the stack to before giving up.
 func TestSameValueOfTwoMutuallyCyclicValuesDiesFatallyAndUncatchably(t *testing.T) {
-	if os.Getenv("RSQL_CYCLE_CHILD") == "1" {
+	if os.Getenv("SAPEDB_CYCLE_CHILD") == "1" {
 		debug.SetMaxStack(16 << 20)
 		// If a fatal error were catchable, this recover would catch it.
 		// Measured, not assumed: it does not run, because the runtime never
@@ -108,7 +108,7 @@ func TestSameValueOfTwoMutuallyCyclicValuesDiesFatallyAndUncatchably(t *testing.
 	cmd := exec.Command(os.Args[0],
 		"-test.run=^TestSameValueOfTwoMutuallyCyclicValuesDiesFatallyAndUncatchably$",
 		"-test.timeout=60s")
-	cmd.Env = append(os.Environ(), "RSQL_CYCLE_CHILD=1")
+	cmd.Env = append(os.Environ(), "SAPEDB_CYCLE_CHILD=1")
 	out, err := cmd.CombinedOutput()
 	text := string(out)
 
@@ -160,7 +160,7 @@ func TestSameValueOfTwoMutuallyCyclicValuesDiesFatallyAndUncatchably(t *testing.
 // test above: this is fatal, not a panic, and would take go test down with
 // it if run inline.
 func TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue(t *testing.T) {
-	if os.Getenv("RSQL_ARGDOOR_CYCLE_CHILD") == "1" {
+	if os.Getenv("SAPEDB_ARGDOOR_CYCLE_CHILD") == "1" {
 		debug.SetMaxStack(16 << 20)
 		defer func() {
 			if r := recover(); r != nil {
@@ -221,7 +221,7 @@ func TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue(t *test
 	cmd := exec.Command(os.Args[0],
 		"-test.run=^TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue$",
 		"-test.timeout=60s")
-	cmd.Env = append(os.Environ(), "RSQL_ARGDOOR_CYCLE_CHILD=1")
+	cmd.Env = append(os.Environ(), "SAPEDB_ARGDOOR_CYCLE_CHILD=1")
 	out, err := cmd.CombinedOutput()
 	text := string(out)
 

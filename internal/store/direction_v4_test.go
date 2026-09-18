@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // This file is round four's front door. Three rounds refused a growing list

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // A led page store keeps pages and no commit point.
@@ -27,8 +27,8 @@ import (
 // What a led file does keep is page 0, saying what it is: the magic, the
 // format, the page size, and the salt its pages are encrypted under. Written
 // once when the file is made and never again, so it is not a second commit
-// point — it is a label. Without it, "this is not an rsql file" and "this is
-// an rsql file and the key is wrong" would be one answer, and a file dropped
+// point — it is a label. Without it, "this is not an sapedb file" and "this is
+// an sapedb file and the key is wrong" would be one answer, and a file dropped
 // into the directory by accident would be read as pages.
 //
 // The cost is that a led file cannot be opened on its own. That is not a
@@ -37,10 +37,10 @@ import (
 // not a smaller database, it is half of one.
 
 // ErrLed is a led store being asked to do what only a leader can.
-var ErrLed = errors.New("rsql/pager: this file has no meta page; its leader commits for it")
+var ErrLed = errors.New("sapedb/pager: this file has no meta page; its leader commits for it")
 
 // ErrNotLed is a leader being asked to do what only a led store can.
-var ErrNotLed = errors.New("rsql/pager: this file has meta pages of its own")
+var ErrNotLed = errors.New("sapedb/pager: this file has meta pages of its own")
 
 // Led is everything the leader remembers about one led store.
 //
@@ -67,7 +67,7 @@ func CreateLed(file vfs.File, options Options) (*Pager, error) {
 
 	if len(options.Key) > 0 {
 		if _, err := rand.Read(pager.meta.Salt[:]); err != nil {
-			return nil, fmt.Errorf("rsql/pager: no randomness for the salt: %w", err)
+			return nil, fmt.Errorf("sapedb/pager: no randomness for the salt: %w", err)
 		}
 		if err := makeCheck(options.Key, pager.meta.Salt[:], pager.meta.Check[:]); err != nil {
 			return nil, err
@@ -85,7 +85,7 @@ func CreateLed(file vfs.File, options Options) (*Pager, error) {
 	}
 	// Synced here because nothing will write this page again. A label that
 	// reached the disk only because a later commit happened to flush it would
-	// be a file that is sometimes not an rsql file.
+	// be a file that is sometimes not an sapedb file.
 	if err := file.Sync(); err != nil {
 		return nil, err
 	}
@@ -233,7 +233,7 @@ func (p *Pager) readLabel() (Meta, error) {
 	}
 
 	if string(data[offMagic:offMagic+8]) != string(Magic[:]) {
-		return Meta{}, ErrNotRsql
+		return Meta{}, ErrNotSapedb
 	}
 	if format := binary.BigEndian.Uint16(data[offFormat:]); format != Format {
 		return Meta{}, fmt.Errorf("%w: file says %d, this build reads %d", ErrFormat, format, Format)

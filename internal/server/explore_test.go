@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/protocol"
-	"github.com/material-atomic/rsql/internal/signing"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/protocol"
+	"github.com/sapedb/sapedb/internal/signing"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // operate answers the challenge in a welcome, the way the shell does.

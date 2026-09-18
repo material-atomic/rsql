@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/btree"
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/btree"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // Collection is a declared collection: documents in primary-key order, and the
@@ -194,7 +194,7 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 
 	encoded, err := json.Marshal(document)
 	if err != nil {
-		return nil, fmt.Errorf("rsql/store: this document cannot be stored: %w", err)
+		return nil, fmt.Errorf("sapedb/store: this document cannot be stored: %w", err)
 	}
 	// The totals move in the same transaction as the document. A counter kept
 	// anywhere else is a counter that stops matching the data the first time

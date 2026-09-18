@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // Completion, which this shell can do exactly rather than approximately.

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 func changes(t *testing.T, store *Store, from uint64) []Change {

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/server"
-	"github.com/material-atomic/rsql/internal/store"
+	"github.com/sapedb/sapedb/internal/server"
+	"github.com/sapedb/sapedb/internal/store"
 )
 
 // TestTheShellAgainstARealServer is the one test here that is not about this
@@ -27,7 +27,7 @@ func TestTheShellAgainstARealServer(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = live.Close() })
 
-	// Something to look at, declared the way `rsql apply` would.
+	// Something to look at, declared the way `sapedb apply` would.
 	db, release, err := live.Store("acme", "books")
 	if err != nil {
 		t.Fatal(err)

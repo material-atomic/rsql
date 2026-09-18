@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // declared is a store with the articles collection and a few operations on it,

@@ -1,7 +1,7 @@
 // Package connection reads the string that says where a database is and
 // proves who said so.
 //
-//	rsql://account:password@host:port/dbname?sig=hex
+//	sapedb://account:password@host:port/dbname?sig=hex
 //
 // The signature covers the account, the password and the database name
 // together, so the string is a whole thing: no part of it can be changed —
@@ -22,21 +22,21 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/material-atomic/rsql/internal/signing"
+	"github.com/sapedb/sapedb/internal/signing"
 )
 
 // Scheme is what a connection string starts with, and DefaultPort is what it
 // means when it names none.
 const (
-	Scheme      = "rsql"
+	Scheme      = "sapedb"
 	DefaultPort = 7433
 )
 
 var (
-	ErrScheme    = errors.New("rsql/connection: that is not an rsql:// string")
-	ErrField     = errors.New("rsql/connection: the connection string is missing something")
-	ErrPort      = errors.New("rsql/connection: that is not a port")
-	ErrSignature = errors.New("rsql/connection: the connection string is not signed for this")
+	ErrScheme    = errors.New("sapedb/connection: that is not an sapedb:// string")
+	ErrField     = errors.New("sapedb/connection: the connection string is missing something")
+	ErrPort      = errors.New("sapedb/connection: that is not a port")
+	ErrSignature = errors.New("sapedb/connection: the connection string is not signed for this")
 )
 
 // Connection is a connection string taken apart.

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/material-atomic/rsql/internal/keys"
+	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // Declared operations are the only way into a database.
@@ -58,13 +58,13 @@ const (
 )
 
 var (
-	ErrNoOperation = errors.New("rsql/store: no such operation")
-	ErrArgument    = errors.New("rsql/store: the arguments do not match what the operation declares")
-	ErrNotAllowed  = errors.New("rsql/store: the caller may not run this operation")
-	ErrExists      = errors.New("rsql/store: a document already has that primary key")
-	ErrMissing     = errors.New("rsql/store: the document this step needs is not there")
-	ErrCondition   = errors.New("rsql/store: the document is not in the state this operation requires")
-	ErrUncommitted = errors.New("rsql/store: a batch needs a database with nothing half-written in it")
+	ErrNoOperation = errors.New("sapedb/store: no such operation")
+	ErrArgument    = errors.New("sapedb/store: the arguments do not match what the operation declares")
+	ErrNotAllowed  = errors.New("sapedb/store: the caller may not run this operation")
+	ErrExists      = errors.New("sapedb/store: a document already has that primary key")
+	ErrMissing     = errors.New("sapedb/store: the document this step needs is not there")
+	ErrCondition   = errors.New("sapedb/store: the document is not in the state this operation requires")
+	ErrUncommitted = errors.New("sapedb/store: a batch needs a database with nothing half-written in it")
 )
 
 // Operation is a declaration: everything about a call except its arguments.

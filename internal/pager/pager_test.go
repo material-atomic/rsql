@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 func fresh(t *testing.T, faults vfs.Faults, seed int64) (*vfs.SimDisk, *Pager) {
@@ -285,8 +285,8 @@ func TestAFileThatIsNotOursIsNotOpened(t *testing.T) {
 	disk := vfs.NewSim(7, vfs.Faults{})
 	disk.Restore(bytes.Repeat([]byte("this is a jpeg, honestly"), 1000))
 
-	if _, err := Open(disk, 0); !errors.Is(err, ErrNotRsql) {
-		t.Errorf("want ErrNotRsql, got %v", err)
+	if _, err := Open(disk, 0); !errors.Is(err, ErrNotSapedb) {
+		t.Errorf("want ErrNotSapedb, got %v", err)
 	}
 }
 
@@ -447,7 +447,7 @@ func crashDuringWork(t *testing.T, seed int64, faults vfs.Faults) (*vfs.SimDisk,
 
 func isOneOfOurs(fill byte) bool { return fill >= 'a' && fill <= 'd' }
 
-// TestADatabaseKnowsWhetherItWasClosedOrLeft: rsql survives losing power, but
+// TestADatabaseKnowsWhetherItWasClosedOrLeft: sapedb survives losing power, but
 // until now it survived it silently — the database came back at the last
 // committed transaction and nothing anywhere said the machine had gone down.
 // The operator reading "why is that write missing" had nothing to read.

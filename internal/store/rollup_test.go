@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // takings is a collection with totals kept per account.

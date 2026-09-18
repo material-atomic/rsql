@@ -132,7 +132,7 @@ func ledger(t *testing.T, store *Store) {
 		}
 	}
 
-	// Declaring is not committed one at a time — `rsql apply` declares a whole
+	// Declaring is not committed one at a time — `sapedb apply` declares a whole
 	// file and commits once, so that half a schema never lands — which means
 	// the setup has to say when it is finished.
 	if err := store.Commit(); err != nil {

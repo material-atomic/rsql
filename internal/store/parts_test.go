@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/pager"
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/pager"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 // shelfOfFiles is a directory that lives in memory, so a test can look at what

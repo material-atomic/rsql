@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/vfs"
+	"github.com/sapedb/sapedb/internal/vfs"
 )
 
 var secret = []byte("a passphrase nobody else has")
@@ -128,7 +128,7 @@ func TestTheWrongKeyIsRefusedBeforeAnythingIsRead(t *testing.T) {
 			}
 			// And not the answer given to a file that is not ours at all: the
 			// two mistakes are different and have to read differently.
-			if errors.Is(err, ErrNotRsql) || errors.Is(err, ErrNoMeta) {
+			if errors.Is(err, ErrNotSapedb) || errors.Is(err, ErrNoMeta) {
 				t.Errorf("a wrong key reads as a damaged file: %v", err)
 			}
 		})

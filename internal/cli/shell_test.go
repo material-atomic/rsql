@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/material-atomic/rsql/internal/store"
-	"github.com/material-atomic/rsql/internal/wire"
+	"github.com/sapedb/sapedb/internal/store"
+	"github.com/sapedb/sapedb/internal/wire"
 )
 
 // looked records what the shell asked for, so a test can check the line that
@@ -201,7 +201,7 @@ func TestExploringEndsInSomethingToDeclare(t *testing.T) {
 // nothing there".
 func TestTheShellSaysWhatTheServerSaid(t *testing.T) {
 	look := &looked{fail: &wire.ErrRefused{
-		Code: "no_collection", Message: "rsql/store: there is no collection called \"boks\"",
+		Code: "no_collection", Message: "sapedb/store: there is no collection called \"boks\"",
 	}}
 	printed := typed(t, look, `scan boks`)
 	if !strings.Contains(printed, "no collection") || !strings.Contains(printed, "no_collection") {
