@@ -1,0 +1,7 @@
+# Only what the build needs. Everything else makes the context bigger and the
+# cache worse, and some of it must never be in an image at all.
+*
+!go.mod
+!go.sum
+!internal/
+!cmd/
