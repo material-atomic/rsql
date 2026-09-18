@@ -52,6 +52,9 @@ const (
 	KindNode uint8 = 3
 	KindFree uint8 = 4
 	KindBlob uint8 = 5
+	// KindLabel is page 0 of a file whose commit point is somewhere else. See
+	// led.go.
+	KindLabel uint8 = 6
 )
 
 // Page header: checksum, kind, page id, and room for a nonce and an
@@ -99,7 +102,7 @@ var (
 	ErrPageKind     = errors.New("rsql/pager: page is not of the expected kind")
 	ErrQuota        = errors.New("rsql/pager: database is at its page limit")
 	ErrOutOfRange   = errors.New("rsql/pager: page id past the end of the file")
-	ErrReadOnlyPage = errors.New("rsql/pager: meta pages are written by Commit")
+	ErrReadOnlyPage = errors.New("rsql/pager: the pages at the front of a file are not written by hand")
 	ErrTruncated    = errors.New("rsql/pager: the file is shorter than its meta page says")
 )
 
@@ -158,6 +161,11 @@ type Pager struct {
 	readers map[uint64]int
 	// cipher is how pages are encrypted, or nil for a database with no key.
 	cipher *crypt
+	// reserved is how many pages at the front are not data: two meta pages in
+	// an ordinary file, one label in a led one.
+	reserved uint64
+	// led says the commit point is in another file. See led.go.
+	led bool
 }
 
 // Create writes a fresh database: two meta pages, no data.
@@ -205,6 +213,7 @@ func newPager(file vfs.File, maxPages uint64) *Pager {
 	return &Pager{
 		file:     file,
 		maxPages: maxPages,
+		reserved: 2,
 		taken:    map[uint64]bool{},
 		free:     newFreelist(),
 		readers:  map[uint64]int{},
@@ -359,7 +368,16 @@ func (p *Pager) Allocate() (uint64, error) {
 // copy-on-write from allocating a fresh page every time the same node is
 // touched twice before a commit: the copy is owed to readers, and a page no
 // reader can see is owed nothing.
-func (p *Pager) Dirty(id uint64) bool { return id > 1 && (id >= p.committed || p.taken[id]) }
+//
+// The pages at the front of a file are not excluded here, and a mutation that
+// let them through survived every test until it was looked at: they cannot be
+// reached. Allocate never hands one out and committed is never below them, so
+// the clause was true of nothing. What actually keeps the label and the meta
+// pages safe is Write refusing them, which is tested. A guard that cannot be
+// observed is not a second line of defence, it is a claim nobody checks.
+func (p *Pager) Dirty(id uint64) bool {
+	return id >= p.committed || p.taken[id]
+}
 
 // NewPage is an empty page of a kind, ready to be filled and written.
 func (p *Pager) NewPage(id uint64, kind uint8) *Page {
@@ -398,7 +416,7 @@ func (p *Pager) Read(id uint64) (*Page, error) {
 // Write puts a page in the file. It is not part of the database until Commit
 // says so.
 func (p *Pager) Write(page *Page) error {
-	if page.ID <= 1 {
+	if page.ID < p.reserved {
 		return ErrReadOnlyPage
 	}
 	if len(page.Data) != PageBytes {
@@ -423,6 +441,10 @@ func (p *Pager) Write(page *Page) error {
 // the previous transaction, whole. A crash after it leaves the new one, whole.
 // There is no third outcome, which is why there is no recovery pass.
 func (p *Pager) Commit(root uint64) error {
+	if p.led {
+		return ErrLed
+	}
+
 	next := p.meta
 	next.TxID, next.Root = p.meta.TxID+1, root
 

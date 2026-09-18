@@ -77,7 +77,7 @@ func (f *freelist) count() int {
 // It is not necessarily free to use: when it may be handed out again is what
 // the list is for.
 func (p *Pager) Free(id uint64) {
-	if id <= 1 || p.free.seen[id] {
+	if id < p.reserved || p.free.seen[id] {
 		return
 	}
 	p.free.seen[id] = true
@@ -236,7 +236,7 @@ func (p *Pager) readFreelist(head uint64) error {
 	p.free = newFreelist()
 
 	for id := head; id != 0; {
-		if id <= 1 || id >= p.meta.PageCount {
+		if id < p.reserved || id >= p.meta.PageCount {
 			return fmt.Errorf("%w: it runs through page %d of %d", ErrFreelist, id, p.meta.PageCount)
 		}
 		if len(p.free.chain) > int(p.meta.PageCount) {
