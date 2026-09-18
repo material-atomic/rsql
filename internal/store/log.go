@@ -37,6 +37,10 @@ const (
 	ChangeDeclare   = "declare"
 	ChangeOperation = "operation"
 	ChangeDrop      = "drop"
+	// ChangeRead is an operator looking at something through the shell. It
+	// changes nothing, which is why it is here: a read that leaves no trace is
+	// a read nobody can be asked about afterwards.
+	ChangeRead = "read"
 )
 
 var nextLSN = []byte{spaceMeta, 'l', 's', 'n'}
@@ -316,6 +320,11 @@ func (s *Store) Apply(change Change) error {
 		if err := s.drop(change.Collection, false); err != nil && !errors.Is(err, ErrNoCollection) {
 			return err
 		}
+
+	case ChangeRead:
+		// Nothing to apply — somebody looked. The entry is still written into
+		// the replica below, because an audit trail that stops at the primary
+		// is one you cannot read from anywhere the primary is not.
 
 	default:
 		return fmt.Errorf("%w: entry %d is a %q", ErrDamaged, change.LSN, change.Kind)

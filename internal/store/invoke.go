@@ -21,6 +21,17 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 		return Result{}, err
 	}
 
+	return s.perform(caller, operation, arguments)
+}
+
+// perform runs an operation that has already been found and allowed.
+//
+// Separate from Invoke because the operator shell runs operations that were
+// never declared — it builds the one its typed access would have to be
+// declared as and runs that. Sharing this means an access somebody types goes
+// down the same path as one somebody declared, rather than down a second path
+// that agrees with the first until the day it does not.
+func (s *Store) perform(caller Caller, operation Operation, arguments map[string]any) (Result, error) {
 	values, err := bind(operation, arguments)
 	if err != nil {
 		return Result{}, err
