@@ -15,6 +15,7 @@
 package pager
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -53,17 +54,29 @@ const (
 	KindBlob uint8 = 5
 )
 
-// Page header: checksum, kind, page id. The checksum covers everything after
-// itself, so it is computed over the page as written.
+// Page header: checksum, kind, page id, and room for a nonce and an
+// authentication tag. The checksum covers everything after itself with the
+// nonce and tag zeroed, so it is the same value before encryption and after
+// decryption.
+//
+// The nonce and tag are reserved whether or not the database is encrypted, so
+// that one layout describes both and turning encryption on is a property of a
+// database rather than a second format.
 const (
 	offChecksum = 0  // u32
 	offKind     = 4  // u8
 	offReserved = 5  // 3 bytes, zero
 	offPageID   = 8  // u64
-	HeaderBytes = 16 // payload starts here
+	offNonce    = 16 // NonceBytes
+	offTag      = 28 // TagBytes
+	HeaderBytes = 48 // payload starts here
 )
 
 // Meta page layout, after the common page header.
+//
+// A meta page is never encrypted: something has to be readable without the key
+// or "not our file" and "wrong key" become one answer. See crypt.go for what
+// that leaks and why it is the trade taken.
 const (
 	offMagic     = HeaderBytes      // 8
 	offFormat    = HeaderBytes + 8  // u16
@@ -72,6 +85,10 @@ const (
 	offRoot      = HeaderBytes + 24 // u64
 	offFreelist  = HeaderBytes + 32 // u64
 	offPageCount = HeaderBytes + 40 // u64
+	offEncrypted = HeaderBytes + 48 // u8
+	offSalt      = HeaderBytes + 56 // SaltBytes
+	offCheck     = HeaderBytes + 72 // NonceBytes + TagBytes
+	metaEnd      = HeaderBytes + 72 + NonceBytes + TagBytes
 )
 
 var (
@@ -90,12 +107,20 @@ var (
 // on, so checking every page on every read costs close to nothing.
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// Meta is what one completed transaction left behind.
+// Meta is what one completed transaction left behind, plus the facts about
+// this database that every transaction carries forward.
 type Meta struct {
 	TxID      uint64
 	Root      uint64
 	Freelist  uint64
 	PageCount uint64
+
+	// Encrypted, Salt and Check describe the key. They do not change after the
+	// database is created, and are copied into every meta page so that either
+	// one is enough to open the file.
+	Encrypted bool
+	Salt      [SaltBytes]byte
+	Check     [NonceBytes + TagBytes]byte
 }
 
 // Page is one page, header and all.
@@ -131,12 +156,35 @@ type Pager struct {
 	free *freelist
 	// readers counts the snapshots held at each transaction.
 	readers map[uint64]int
+	// cipher is how pages are encrypted, or nil for a database with no key.
+	cipher *crypt
 }
 
 // Create writes a fresh database: two meta pages, no data.
 func Create(file vfs.File, maxPages uint64) (*Pager, error) {
-	pager := newPager(file, maxPages)
+	return CreateWith(file, Options{MaxPages: maxPages})
+}
+
+// CreateWith is Create with everything the database is made with, which for
+// now means the key it is encrypted under.
+func CreateWith(file vfs.File, options Options) (*Pager, error) {
+	pager := newPager(file, options.MaxPages)
 	pager.meta = Meta{TxID: 1, Root: 0, Freelist: 0, PageCount: 2}
+
+	if len(options.Key) > 0 {
+		if _, err := rand.Read(pager.meta.Salt[:]); err != nil {
+			return nil, fmt.Errorf("rsql/pager: no randomness for the salt: %w", err)
+		}
+		if err := makeCheck(options.Key, pager.meta.Salt[:], pager.meta.Check[:]); err != nil {
+			return nil, err
+		}
+		cipher, err := newCrypt(options.Key, pager.meta.Salt[:])
+		if err != nil {
+			return nil, err
+		}
+		pager.cipher = cipher
+		pager.meta.Encrypted = true
+	}
 
 	// Both meta pages, so a first crash still finds one.
 	for _, id := range []uint64{0, 1} {
@@ -153,7 +201,6 @@ func Create(file vfs.File, maxPages uint64) (*Pager, error) {
 	return pager, nil
 }
 
-// Open reads an existing database and takes the newer of its two meta pages.
 func newPager(file vfs.File, maxPages uint64) *Pager {
 	return &Pager{
 		file:     file,
@@ -164,8 +211,14 @@ func newPager(file vfs.File, maxPages uint64) *Pager {
 	}
 }
 
+// Open reads an existing database and takes the newer of its two meta pages.
 func Open(file vfs.File, maxPages uint64) (*Pager, error) {
-	pager := newPager(file, maxPages)
+	return OpenWith(file, Options{MaxPages: maxPages})
+}
+
+// OpenWith is Open with the key, when the database has one.
+func OpenWith(file vfs.File, options Options) (*Pager, error) {
+	pager := newPager(file, options.MaxPages)
 
 	first, firstErr := pager.readMeta(0)
 	second, secondErr := pager.readMeta(1)
@@ -193,6 +246,27 @@ func Open(file vfs.File, maxPages uint64) (*Pager, error) {
 	}
 
 	pager.committed = pager.meta.PageCount
+
+	// Whether the key is right is settled here, before a single page of data is
+	// read: a wrong key found later looks exactly like a damaged file.
+	switch {
+	case pager.meta.Encrypted && len(options.Key) == 0:
+		return nil, fmt.Errorf("%w: no key was given", ErrKey)
+
+	case pager.meta.Encrypted:
+		if err := openCheck(options.Key, pager.meta.Salt[:], pager.meta.Check[:]); err != nil {
+			return nil, err
+		}
+		cipher, err := newCrypt(options.Key, pager.meta.Salt[:])
+		if err != nil {
+			return nil, err
+		}
+		pager.cipher = cipher
+
+	case len(options.Key) > 0:
+		return nil, ErrNotEncrypted
+	}
+
 	if err := pager.readFreelist(pager.meta.Freelist); err != nil {
 		return nil, err
 	}
@@ -256,6 +330,12 @@ func (p *Pager) Read(id uint64) (*Page, error) {
 		return nil, fmt.Errorf("%w: page %d: %v", ErrTruncated, id, err)
 	}
 
+	if p.cipher != nil {
+		if err := p.cipher.decrypt(data, id); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := verify(data, id); err != nil {
 		return nil, err
 	}
@@ -274,6 +354,12 @@ func (p *Pager) Write(page *Page) error {
 	}
 
 	seal(page.Data, page.ID, page.Kind)
+	if p.cipher != nil {
+		if err := p.cipher.encrypt(page.Data); err != nil {
+			return err
+		}
+	}
+
 	_, err := p.file.WriteAt(page.Data, int64(page.ID)*PageBytes)
 	return err
 }
@@ -285,7 +371,8 @@ func (p *Pager) Write(page *Page) error {
 // the previous transaction, whole. A crash after it leaves the new one, whole.
 // There is no third outcome, which is why there is no recovery pass.
 func (p *Pager) Commit(root uint64) error {
-	next := Meta{TxID: p.meta.TxID + 1, Root: root}
+	next := p.meta
+	next.TxID, next.Root = p.meta.TxID+1, root
 
 	// The list pages written last time are replaced by the ones written below,
 	// so they are this transaction's garbage like any other page. Freed before
@@ -339,6 +426,11 @@ func (p *Pager) writeMeta(id uint64, meta Meta) error {
 	binary.BigEndian.PutUint64(data[offRoot:], meta.Root)
 	binary.BigEndian.PutUint64(data[offFreelist:], meta.Freelist)
 	binary.BigEndian.PutUint64(data[offPageCount:], meta.PageCount)
+	if meta.Encrypted {
+		data[offEncrypted] = 1
+	}
+	copy(data[offSalt:], meta.Salt[:])
+	copy(data[offCheck:], meta.Check[:])
 
 	seal(data, id, KindMeta)
 
@@ -370,12 +462,16 @@ func (p *Pager) readMeta(id uint64) (Meta, error) {
 		return Meta{}, ErrPageKind
 	}
 
-	return Meta{
+	meta := Meta{
 		TxID:      binary.BigEndian.Uint64(data[offTxID:]),
 		Root:      binary.BigEndian.Uint64(data[offRoot:]),
 		Freelist:  binary.BigEndian.Uint64(data[offFreelist:]),
 		PageCount: binary.BigEndian.Uint64(data[offPageCount:]),
-	}, nil
+		Encrypted: data[offEncrypted] == 1,
+	}
+	copy(meta.Salt[:], data[offSalt:offSalt+SaltBytes])
+	copy(meta.Check[:], data[offCheck:offCheck+NonceBytes+TagBytes])
+	return meta, nil
 }
 
 // Close releases the file. It does not commit: anything not committed was
@@ -387,6 +483,12 @@ func seal(data []byte, id uint64, kind uint8) {
 	data[offKind] = kind
 	data[offReserved], data[offReserved+1], data[offReserved+2] = 0, 0, 0
 	binary.BigEndian.PutUint64(data[offPageID:], id)
+
+	// Zero while hashing, and zeroed again after decryption, so the checksum is
+	// one value whichever side of the cipher it is computed on.
+	for i := offNonce; i < offTag+TagBytes; i++ {
+		data[i] = 0
+	}
 	binary.BigEndian.PutUint32(data[offChecksum:], crc32.Checksum(data[offKind:], castagnoli))
 }
 

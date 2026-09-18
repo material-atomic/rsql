@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/material-atomic/rsql/internal/pager"
+	"github.com/material-atomic/rsql/internal/vfs"
 )
 
 // populate fills a store with two collections, some operations and a few
@@ -406,5 +409,72 @@ func TestASnapshotHoldsTheLastCommitAndNotWorkInProgress(t *testing.T) {
 	}
 	if seen != 20 {
 		t.Errorf("the snapshot holds %d documents, want the 20 that were committed", seen)
+	}
+}
+
+// The end-to-end statement of what encryption at rest is for: a file taken off
+// the disk holds none of the documents in it, and the database still works.
+func TestAnEncryptedDatabaseKeepsItsDocumentsOffTheDisk(t *testing.T) {
+	key := []byte("the key for this database only")
+
+	disk := vfs.NewSim(66, vfs.Faults{})
+	pages, err := pager.CreateWith(disk, pager.Options{Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	collection, err := store.Declare(articles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		put(t, collection, map[string]any{
+			"id": fmt.Sprintf("k%02d", i), "author": "ann",
+			"title": fmt.Sprintf("Bí mật số %d", i), "slug": fmt.Sprintf("s%02d", i),
+			"published": float64(i),
+		})
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	image := disk.Durable()
+	// Not the documents, not the field names, not the names of the collections
+	// or the indexes — all of those are written through the same pages.
+	for _, text := range []string{"Bí mật số 7", "author", "ann", "articles", "by_author", "s07"} {
+		if bytes.Contains(image, []byte(text)) {
+			t.Errorf("the file holds %q in the open", text)
+		}
+	}
+
+	// And with the key it is an ordinary database.
+	restart := vfs.NewSim(66, vfs.Faults{})
+	restart.Restore(image)
+	reopened, err := pager.OpenWith(restart, pager.Options{Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := again.Collection("articles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, found, err := after.Get("k07")
+	if err != nil || !found {
+		t.Fatalf("get: %v, %v", found, err)
+	}
+	if document["title"] != "Bí mật số 7" {
+		t.Errorf("the document reads %v", document)
+	}
+	if entries := scan(t, after, "by_author", Range{}); len(entries) != 50 {
+		t.Errorf("the index came back with %d entries", len(entries))
 	}
 }

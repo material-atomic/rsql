@@ -1,4 +1,4 @@
-GO ?= docker run --rm -v "$(PWD)":/src -w /src golang:1.23-alpine go
+GO ?= docker run --rm -v "$(PWD)":/src -w /src golang:1.24-alpine go
 
 .PHONY: test vet build
 test:
