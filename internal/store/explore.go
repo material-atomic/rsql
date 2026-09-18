@@ -174,3 +174,47 @@ func endpoint(bound *Bound) *Endpoint {
 	}
 	return end
 }
+
+// Catalogue is what a database holds: the collections and their indexes, and
+// the operations declared against them.
+type Catalogue struct {
+	Collections []Spec      `json:"collections"`
+	Operations  []Operation `json:"operations"`
+}
+
+// WhatIsHere answers "what is in this database", and records that it was
+// asked.
+//
+// Audited like any other access, and for the same reason twice over: it is the
+// first thing somebody who should not be here would ask, and the first thing
+// somebody who should be here would ask. A log that shows the scan but not the
+// question that found the collection to scan tells half the story.
+func (s *Store) WhatIsHere(caller Caller) (Catalogue, error) {
+	here := Catalogue{}
+
+	for _, name := range s.Collections() {
+		collection, err := s.Collection(name)
+		if err != nil {
+			return Catalogue{}, err
+		}
+		here.Collections = append(here.Collections, collection.Spec())
+	}
+
+	operations, err := s.Operations()
+	if err != nil {
+		return Catalogue{}, err
+	}
+	here.Operations = operations
+
+	if _, err := s.record(Change{
+		Kind: ChangeRead,
+		By:   Attribution{Operation: "catalogue", Actor: caller.Actor},
+	}); err != nil {
+		return Catalogue{}, err
+	}
+	if err := s.Commit(); err != nil {
+		return Catalogue{}, err
+	}
+
+	return here, nil
+}

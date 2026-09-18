@@ -34,6 +34,11 @@ type elevating struct {
 type exploring struct {
 	Access store.Access `json:"access"`
 
+	// Catalogue asks what the database holds instead of reading any of it.
+	// The shell needs it first: an operator who does not know the collection
+	// names cannot type an access at all.
+	Catalogue bool `json:"catalogue,omitempty"`
+
 	// DBName and Signature are how an account-wide connection says which
 	// database, exactly as a call does. Proving you can operate the server
 	// does not say which database you meant.
@@ -46,6 +51,8 @@ type exploring struct {
 type explored struct {
 	Result store.Result    `json:"result"`
 	Draft  store.Operation `json:"draft"`
+
+	Here *store.Catalogue `json:"here,omitempty"`
 }
 
 // elevate checks the proof and marks the connection.
@@ -89,6 +96,15 @@ func (s *Server) explore(live *session, payload []byte) ([]byte, error) {
 	// Named by the account, because that is the only identity this connection
 	// has proved. It is what goes in the log against everything the shell does.
 	caller := store.Caller{Actor: live.opening.Account + " (operator)"}
+
+	if asked.Catalogue {
+		here, err := db.store.WhatIsHere(caller)
+		if err != nil {
+			return nil, err
+		}
+		db.notify()
+		return json.Marshal(explored{Here: &here})
+	}
 
 	draft, result, err := db.store.Explore(caller, asked.Access)
 	if err != nil {

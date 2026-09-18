@@ -48,6 +48,7 @@ const usage = `rsql — set up and look inside a database
   rsql [options] restore           read a dump from stdin, into an empty database
   rsql [options] log [FROM]        print the change log from an entry onwards
   rsql [options] url               print a signed connection string
+  rsql [options] shell [HOST]      look inside a running server
 
 options
   -dir DIR       where databases live      (RSQL_DIR, default /var/lib/rsql)
@@ -131,6 +132,11 @@ func run(args []string, lookup func(string) (string, bool), stdin io.Reader, std
 	switch command {
 	case "url":
 		return url(opts, rest, stdin, stdout)
+	case "shell":
+		// Not opened here: the shell talks to a running server, and taking the
+		// directory lock is exactly what it must not do — the database an
+		// operator wants to look inside is the one that is serving.
+		return shell(opts, rest, stdin, stdout)
 	case "apply", "ls", "dump", "restore", "log":
 	default:
 		return fmt.Errorf("%w: no command called %q", ErrUsage, command)

@@ -419,3 +419,41 @@ func TestTheDraftIsWhatWasActuallyAsked(t *testing.T) {
 		t.Error("the draft lost the exclusive bound, so running it returns a row the exploring did not")
 	}
 }
+
+// TestAskingWhatIsHereIsAlsoLooking: finding out what a database holds is the
+// first thing anybody asks, welcome or not. A log that records the scan but
+// not the question that found the collection to scan tells half the story.
+func TestAskingWhatIsHereIsAlsoLooking(t *testing.T) {
+	_, store := fresh(t, 109)
+	shelf(t, store)
+
+	before, err := store.LatestLSN()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	here, err := store.WhatIsHere(Caller{Actor: "ops@acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(here.Collections) != 1 || here.Collections[0].Name != "books" {
+		t.Fatalf("what is here came back as %+v", here.Collections)
+	}
+	if len(here.Collections[0].Indexes) != 1 || here.Collections[0].Indexes[0].Name != "by_shelf" {
+		t.Errorf("the indexes did not come with it: %+v", here.Collections[0].Indexes)
+	}
+
+	var asked []Change
+	if err := store.Changes(before+1, func(change Change) bool {
+		asked = append(asked, change)
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0].Kind != ChangeRead || asked[0].By.Operation != "catalogue" {
+		t.Fatalf("asking what is here left %+v", asked)
+	}
+	if asked[0].By.Actor != "ops@acme" {
+		t.Errorf("the log says %q asked", asked[0].By.Actor)
+	}
+}

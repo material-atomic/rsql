@@ -93,8 +93,11 @@ type Operation struct {
 	// that declares a scope is refused to a caller that does not present it.
 	Scopes []string `json:"scopes,omitempty"`
 
-	// Version is assigned when the operation is declared.
-	Version int `json:"version"`
+	// Version is assigned when the operation is declared, so a declaration
+	// being written — a schema file, or the draft the shell prints — does not
+	// carry one. Omitted rather than zero, because a file saying version 0
+	// claims something nobody gave it.
+	Version int `json:"version,omitempty"`
 }
 
 // Parameter is one declared argument.
