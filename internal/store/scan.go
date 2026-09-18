@@ -112,6 +112,42 @@ func (c *Collection) Walk(visit func(key any, document map[string]any) bool) err
 	})
 }
 
+// walkRange is Walk over a stretch of the primary key rather than all of it.
+// The primary key is an index like any other — the clustered one — so a scan
+// along it takes the same bounds.
+func (c *Collection) walkRange(within Range, visit func(key any, document map[string]any) bool) error {
+	prefix := c.documents()
+	fields := []keys.Field{{}}
+
+	lower, err := c.bound(prefix, fields, within.From, false)
+	if err != nil {
+		return err
+	}
+	upper, err := c.bound(prefix, fields, within.To, true)
+	if err != nil {
+		return err
+	}
+
+	return c.store.tree.Ascend(lower, func(key, value []byte) bool {
+		if !bytes.HasPrefix(key, prefix) {
+			return false
+		}
+		if upper != nil && bytes.Compare(key, upper) >= 0 {
+			return false
+		}
+
+		primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
+		if err != nil || len(rest) != 0 {
+			return false
+		}
+		document := map[string]any{}
+		if err := json.Unmarshal(value, &document); err != nil {
+			return false
+		}
+		return visit(primary, document)
+	})
+}
+
 // bound turns one end of a range into the byte position to start or stop at.
 func (c *Collection) bound(prefix []byte, fields []keys.Field, at *Bound, upper bool) ([]byte, error) {
 	if at == nil {
