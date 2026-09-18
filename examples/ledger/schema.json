@@ -1,0 +1,137 @@
+{
+  "collections": [
+    {
+      "name": "orders",
+      "key": { "path": "id", "type": "string" },
+      "indexes": [
+        { "name": "by_status", "fields": [{ "path": "status", "type": "string", "missing": "skip" }] }
+      ]
+    },
+    {
+      "name": "payments",
+      "key": { "path": "id", "type": "string", "auto": "ulid" },
+      "indexes": [
+        { "name": "by_order", "fields": [{ "path": "order", "type": "string", "missing": "skip" }] }
+      ]
+    },
+    {
+      "name": "entries",
+      "key": { "path": "id", "type": "string", "auto": "ulid" },
+      "indexes": [
+        {
+          "name": "by_account",
+          "fields": [
+            { "path": "account", "type": "string", "missing": "skip" },
+            { "path": "at", "type": "number", "missing": "last" }
+          ]
+        }
+      ]
+    }
+  ],
+
+  "operations": [
+    {
+      "name": "orders.place",
+      "collection": "orders",
+      "action": "insert",
+      "input": [
+        { "name": "id", "type": "string", "required": true },
+        { "name": "customer", "type": "string", "required": true },
+        { "name": "total", "type": "number", "required": true }
+      ],
+      "document": {
+        "id": { "arg": "id" },
+        "customer": { "arg": "customer" },
+        "total": { "arg": "total" },
+        "status": { "value": "awaiting_payment" }
+      }
+    },
+
+    {
+      "name": "orders.pay",
+      "collection": "orders",
+      "action": "batch",
+      "input": [
+        { "name": "order", "type": "string", "required": true },
+        { "name": "amount", "type": "number", "required": true },
+        { "name": "at", "type": "number", "required": true },
+        { "name": "reference", "type": "string", "required": true }
+      ],
+      "steps": [
+        {
+          "name": "order",
+          "action": "update",
+          "collection": "orders",
+          "key": { "arg": "order" },
+          "exists": true,
+          "require": [
+            { "path": "status", "equals": { "value": "awaiting_payment" } },
+            { "path": "total", "equals": { "arg": "amount" } }
+          ],
+          "set": { "status": { "value": "paid" }, "paid_at": { "arg": "at" } }
+        },
+        {
+          "name": "payment",
+          "action": "insert",
+          "collection": "payments",
+          "document": {
+            "order": { "step": "order", "field": "key" },
+            "amount": { "arg": "amount" },
+            "at": { "arg": "at" },
+            "reference": { "arg": "reference" }
+          }
+        },
+        {
+          "action": "insert",
+          "collection": "entries",
+          "document": {
+            "account": { "value": "assets:cash" },
+            "side": { "value": "debit" },
+            "amount": { "arg": "amount" },
+            "at": { "arg": "at" },
+            "payment": { "step": "payment", "field": "key" }
+          }
+        },
+        {
+          "action": "insert",
+          "collection": "entries",
+          "document": {
+            "account": { "value": "income:sales" },
+            "side": { "value": "credit" },
+            "amount": { "arg": "amount" },
+            "at": { "arg": "at" },
+            "payment": { "step": "payment", "field": "key" }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "orders.get",
+      "collection": "orders",
+      "action": "get",
+      "input": [{ "name": "id", "type": "string", "required": true }],
+      "key": { "arg": "id" }
+    },
+    {
+      "name": "payments.of_order",
+      "collection": "payments",
+      "action": "scan",
+      "index": "by_order",
+      "limit": 50,
+      "input": [{ "name": "order", "type": "string", "required": true }],
+      "from": { "terms": [{ "arg": "order" }] },
+      "to": { "terms": [{ "arg": "order" }] }
+    },
+    {
+      "name": "entries.of_account",
+      "collection": "entries",
+      "action": "scan",
+      "index": "by_account",
+      "limit": 500,
+      "input": [{ "name": "account", "type": "string", "required": true }],
+      "from": { "terms": [{ "arg": "account" }] },
+      "to": { "terms": [{ "arg": "account" }] }
+    }
+  ]
+}

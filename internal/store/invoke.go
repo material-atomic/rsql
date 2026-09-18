@@ -57,6 +57,11 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 	}
 
 	switch operation.Action {
+	case ActionBatch:
+		if err := s.runBatch(caller, operation, values, &result); err != nil {
+			return Result{}, err
+		}
+
 	case ActionGet:
 		key, err := resolve(*operation.Key, values)
 		if err != nil {
@@ -144,6 +149,16 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 		return Result{}, fmt.Errorf("%w: %q", ErrDeclaration, operation.Action)
 	}
 
+	// An operation is a transaction, so this is where it ends. Leaving the
+	// commit to whoever called meant every caller had to remember, and the one
+	// that forgot would not find out until a batch refused to start on top of
+	// its half-written work — which is a long way from where the mistake was.
+	if result.Changed > 0 {
+		if err := s.Commit(); err != nil {
+			return Result{}, err
+		}
+	}
+
 	return result, nil
 }
 
@@ -195,7 +210,7 @@ func (s *Store) run(collection *Collection, operation Operation, within Range, r
 // write id means something for it.
 func writes(action string) bool {
 	switch action {
-	case ActionInsert, ActionPut, ActionUpdate, ActionDelete:
+	case ActionInsert, ActionPut, ActionUpdate, ActionDelete, ActionBatch:
 		return true
 	}
 	return false

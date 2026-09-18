@@ -40,6 +40,7 @@ const (
 	ActionPut    = "put"    // a document, replacing one under the same key
 	ActionUpdate = "update" // named fields of an existing document
 	ActionDelete = "delete" // one document by its primary key
+	ActionBatch  = "batch"  // several of the above, as one transaction
 )
 
 // ClusteredIndex is the name for walking documents in primary-key order, which
@@ -51,6 +52,9 @@ var (
 	ErrArgument    = errors.New("rsql/store: the arguments do not match what the operation declares")
 	ErrNotAllowed  = errors.New("rsql/store: the caller may not run this operation")
 	ErrExists      = errors.New("rsql/store: a document already has that primary key")
+	ErrMissing     = errors.New("rsql/store: the document this step needs is not there")
+	ErrCondition   = errors.New("rsql/store: the document is not in the state this operation requires")
+	ErrUncommitted = errors.New("rsql/store: a batch needs a database with nothing half-written in it")
 )
 
 // Operation is a declaration: everything about a call except its arguments.
@@ -75,6 +79,9 @@ type Operation struct {
 	Document map[string]Term `json:"document,omitempty"`
 	Set      map[string]Term `json:"set,omitempty"`
 
+	// Steps are what a batch does, in order and in one transaction.
+	Steps []Step `json:"steps,omitempty"`
+
 	// Projection is the fields a read returns. Empty returns the document.
 	Projection []string `json:"projection,omitempty"`
 
@@ -98,14 +105,56 @@ type Parameter struct {
 	Default  any    `json:"default,omitempty"`
 }
 
-// Term is where a value comes from: an argument of the call, or a constant
-// written into the declaration. Exactly one of the two.
+// Term is where a value comes from: an argument of the call, a constant
+// written into the declaration, or what an earlier step of a batch produced.
+// Exactly one of the three.
 type Term struct {
 	Arg   string `json:"arg,omitempty"`
 	Value any    `json:"value,omitempty"`
 	// Constant distinguishes a declared value of null from no value at all,
 	// which JSON alone cannot.
 	Constant bool `json:"constant,omitempty"`
+
+	// Step names an earlier step of the same batch, and Field says what of it
+	// — only "key" for now, which is what an order needs to give its payment.
+	//
+	// This is the whole of the dataflow between steps, and it is deliberately
+	// this small: anything richer is an expression language, which is the
+	// thing this store exists not to have.
+	Step  string `json:"step,omitempty"`
+	Field string `json:"field,omitempty"`
+}
+
+// Step is one part of a batch.
+type Step struct {
+	// Name lets a later step refer to what this one produced.
+	Name       string `json:"name,omitempty"`
+	Action     string `json:"action"`
+	Collection string `json:"collection"`
+
+	Key      *Term           `json:"key,omitempty"`
+	Document map[string]Term `json:"document,omitempty"`
+	Set      map[string]Term `json:"set,omitempty"`
+
+	// Exists says the document this step names must, or must not, already be
+	// there. Absent means it is not checked.
+	Exists *bool `json:"exists,omitempty"`
+
+	// Require are conditions the document must already satisfy. They are how a
+	// caller that read something a moment ago over the network says "only if
+	// it is still that way" — the whole of optimistic locking, and the reason
+	// this store needs no interactive transaction to do the classic
+	// order-payment-ledger flow safely.
+	Require []Condition `json:"require,omitempty"`
+}
+
+// Condition is one thing that must already be true of a document.
+type Condition struct {
+	Path string `json:"path"`
+	// Equals is the value the field must have. Absent says it must not be
+	// there at all. Exactly one of the two.
+	Equals *Term `json:"equals,omitempty"`
+	Absent bool  `json:"absent,omitempty"`
 }
 
 // Endpoint is one end of a scan: values for the first fields of the index, and
@@ -280,10 +329,35 @@ func (s *Store) validateOperation(operation *Operation) error {
 		parameters[parameter.Name] = parameter
 	}
 
+	// earlier is the steps already declared, so a reference forward or to
+	// itself is refused where it is written rather than found at call time.
+	earlier := map[string]bool{}
+
 	check := func(term Term, wanted string, where string) error {
-		if (term.Arg == "") == (term.Value == nil && !term.Constant) {
-			return fmt.Errorf("%w: %s must be either an argument or a value", ErrDeclaration, where)
+		sources := 0
+		if term.Arg != "" {
+			sources++
 		}
+		if term.Value != nil || term.Constant {
+			sources++
+		}
+		if term.Step != "" {
+			sources++
+		}
+		if sources != 1 {
+			return fmt.Errorf("%w: %s must be exactly one of an argument, a value, or an earlier step", ErrDeclaration, where)
+		}
+
+		if term.Step != "" {
+			if !earlier[term.Step] {
+				return fmt.Errorf("%w: %s uses step %q, which does not come before it", ErrDeclaration, where, term.Step)
+			}
+			if term.Field != "key" {
+				return fmt.Errorf("%w: %s asks a step for %q, and a step gives only its key", ErrDeclaration, where, term.Field)
+			}
+			return nil
+		}
+
 		if term.Arg == "" {
 			if !matches(wanted, term.Value) {
 				return fmt.Errorf("%w: %s is a %s, and the value is %T", ErrDeclaration, where, wanted, term.Value)
@@ -345,6 +419,23 @@ func (s *Store) validateOperation(operation *Operation) error {
 			return fmt.Errorf("%w: a limit of %d", ErrDeclaration, operation.Limit)
 		}
 
+	case ActionBatch:
+		if len(operation.Steps) == 0 {
+			return fmt.Errorf("%w: a batch does nothing", ErrDeclaration)
+		}
+		for i := range operation.Steps {
+			step := &operation.Steps[i]
+			if err := s.validateStep(step, i, earlier, check); err != nil {
+				return err
+			}
+			if step.Name != "" {
+				if earlier[step.Name] {
+					return fmt.Errorf("%w: two steps are called %q", ErrDeclaration, step.Name)
+				}
+				earlier[step.Name] = true
+			}
+		}
+
 	case ActionInsert, ActionPut:
 		if len(operation.Document) == 0 {
 			return fmt.Errorf("%w: an %s writes nothing", ErrDeclaration, operation.Action)
@@ -372,6 +463,76 @@ func (s *Store) validateOperation(operation *Operation) error {
 			return fmt.Errorf("%w: the projection names a field with no path", ErrDeclaration)
 		}
 	}
+	return nil
+}
+
+// validateStep checks one step of a batch against the collection it names.
+func (s *Store) validateStep(step *Step, at int, earlier map[string]bool,
+	check func(Term, string, string) error) error {
+
+	where := fmt.Sprintf("step %d", at+1)
+	if step.Name != "" {
+		where = fmt.Sprintf("step %q", step.Name)
+	}
+
+	collection, err := s.Collection(step.Collection)
+	if err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+
+	switch step.Action {
+	case ActionGet, ActionUpdate, ActionDelete:
+		if step.Key == nil {
+			return fmt.Errorf("%w: %s says which document by its key", ErrDeclaration, where)
+		}
+		if err := check(*step.Key, collection.spec.Key.Type, where+" key"); err != nil {
+			return err
+		}
+		if step.Action == ActionUpdate && len(step.Set) == 0 {
+			return fmt.Errorf("%w: %s changes nothing", ErrDeclaration, where)
+		}
+		for field, term := range step.Set {
+			if err := check(term, TypeAny, where+" field "+field); err != nil {
+				return err
+			}
+		}
+
+	case ActionInsert, ActionPut:
+		if len(step.Document) == 0 {
+			return fmt.Errorf("%w: %s writes nothing", ErrDeclaration, where)
+		}
+		for field, term := range step.Document {
+			wanted := TypeAny
+			if field == collection.spec.Key.Path {
+				wanted = collection.spec.Key.Type
+			}
+			if err := check(term, wanted, where+" field "+field); err != nil {
+				return err
+			}
+		}
+		if _, writes := step.Document[collection.spec.Key.Path]; !writes && collection.spec.Key.Auto == "" {
+			return fmt.Errorf("%w: %q does not generate keys, so %s must write %q",
+				ErrDeclaration, collection.spec.Name, where, collection.spec.Key.Path)
+		}
+
+	default:
+		return fmt.Errorf("%w: %s does %q, which a step cannot do", ErrDeclaration, where, step.Action)
+	}
+
+	for i, condition := range step.Require {
+		if condition.Path == "" {
+			return fmt.Errorf("%w: %s condition %d names no field", ErrDeclaration, where, i+1)
+		}
+		if (condition.Equals == nil) == !condition.Absent {
+			return fmt.Errorf("%w: %s condition %d must be either a value it equals or absent", ErrDeclaration, where, i+1)
+		}
+		if condition.Equals != nil {
+			if err := check(*condition.Equals, TypeAny, fmt.Sprintf("%s condition on %q", where, condition.Path)); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 

@@ -398,10 +398,10 @@ func (s *Server) invoke(live *session, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Invoke commits what it changed, so there is nothing to do here but tell
+	// whoever is watching. Committing again would cost two more syncs and
+	// change nothing.
 	if result.Changed > 0 || result.Repeated > 0 {
-		if err := db.store.Commit(); err != nil {
-			return nil, err
-		}
 		db.notify()
 	}
 	return json.Marshal(result)
@@ -604,6 +604,9 @@ func codeFor(err error) string {
 		{store.ErrArgument, "argument"},
 		{store.ErrNotAllowed, "not_allowed"},
 		{store.ErrExists, "exists"},
+		{store.ErrMissing, "missing"},
+		{store.ErrCondition, "condition"},
+		{store.ErrUncommitted, "uncommitted"},
 		{store.ErrDuplicate, "duplicate"},
 		{store.ErrType, "type"},
 		{store.ErrNoCollection, "no_collection"},

@@ -734,3 +734,28 @@ func TestTwoServersCannotShareADirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestEveryFailureAClientMustTellApartHasItsOwnCode: a client acts on the code
+// and never on the sentence, so a failure that arrives as the catch-all is one
+// the client can only treat as "something went wrong" — retry it forever or
+// give up on a database that is perfectly healthy.
+//
+// A batch brought three new ways to fail and none of them were mapped. It took
+// running the ledger example against a real server to see it: every unit test
+// on both sides passed, because neither side ever looked at the code.
+func TestEveryFailureAClientMustTellApartHasItsOwnCode(t *testing.T) {
+	for _, one := range []struct {
+		err  error
+		code string
+	}{
+		{fmt.Errorf("wrapped: %w", store.ErrMissing), "missing"},
+		{fmt.Errorf("step %q: %w", "order", store.ErrCondition), "condition"},
+		{fmt.Errorf("wrapped: %w", store.ErrUncommitted), "uncommitted"},
+		{fmt.Errorf("wrapped: %w", store.ErrNoOperation), "no_operation"},
+		{errors.New("something nobody named"), "failed"},
+	} {
+		if got := codeFor(one.err); got != one.code {
+			t.Errorf("%v came back as %q, want %q", one.err, got, one.code)
+		}
+	}
+}

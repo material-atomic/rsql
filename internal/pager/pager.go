@@ -315,6 +315,16 @@ func (p *Pager) Rollback() error {
 	return p.readFreelist(p.meta.Freelist)
 }
 
+// Pending reports whether anything has been written since the last commit.
+//
+// A caller that is about to do something it may have to abandon needs to know
+// whether abandoning would take somebody else's work with it. There is one
+// transaction at a time, so the answer is not "which part is mine" — it is
+// "is any of this not mine".
+func (p *Pager) Pending() bool {
+	return len(p.taken) > 0 || len(p.free.freeing) > 0
+}
+
 // Meta is the state of the last completed transaction.
 func (p *Pager) Meta() Meta { return p.meta }
 

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -12,6 +11,17 @@ import (
 	"github.com/material-atomic/rsql/internal/ulid"
 	"github.com/material-atomic/rsql/internal/vfs"
 )
+
+// endless is randomness that never runs out and never changes, which is what a
+// test wants from it.
+type endless struct{}
+
+func (endless) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(i*31 + 7)
+	}
+	return len(p), nil
+}
 
 func fresh(t *testing.T, seed int64) (*vfs.SimDisk, *Store) {
 	t.Helper()
@@ -27,11 +37,13 @@ func fresh(t *testing.T, seed int64) (*vfs.SimDisk, *Store) {
 	}
 
 	// A clock and randomness that do not move, so that generated keys are the
-	// same on every run.
+	// same on every run. The randomness repeats rather than running out: a
+	// test that fails at the four hundredth identifier is a test about its own
+	// fixture.
 	at := int64(1700000000000)
 	store.Identifiers(ulid.With(
 		func() time.Time { at++; return time.UnixMilli(at) },
-		bytes.NewReader(bytes.Repeat([]byte{0x42}, 4096)),
+		endless{},
 	))
 	return disk, store
 }
