@@ -2,7 +2,10 @@ package dbkey
 
 import (
 	"encoding/hex"
+	"errors"
 	"testing"
+
+	"github.com/sapedb/sapedb/internal/dbname"
 )
 
 // goldenSecret is the secret every vector below is computed against. Its
@@ -113,34 +116,42 @@ func TestKeyTable(t *testing.T) {
 	}
 }
 
-// TestKeyDoesNotDistinguishWhereTheSlashFallsInAccountOrDB is the finding the
-// task asked this file to make and report rather than fix: Key builds its
-// info string as account+"/"+name, and that concatenation cannot tell
+// TestKeyDoesNotDistinguishWhereTheSlashFallsInAccountOrDB used to be the
+// finding this file was asked to make and report rather than fix: Key builds
+// its info string as account+"/"+name, and that concatenation cannot tell
 // ("a/b", "c") apart from ("a", "b/c") — both produce the literal string
-// "a/b/c". This row exists so that fact is asserted, not just described.
+// "a/b/c", and (before this test was rewritten) both derived the same key,
+// 5c3d27f090a379ed14913c228b177608f14b03b4c5c943ac5ed0354a9eac21c2. The
+// comment on that old version said "whether that is reachable is a separate
+// question", left for the Result section of whatever task answered it.
 //
-// Whether that is reachable is a separate question, measured in the task's
-// Result section rather than assumed here: it turns on whether
-// SAPEDB_ACCOUNT/SAPEDB_DB (read by internal/cli with no shape check at all)
-// or a connection string's account/db (checked by internal/server's
-// usableComponent, which refuses any component containing "/") can ever
-// actually carry a "/". This test only pins the arithmetic; it does not
-// claim the ambiguity is exploitable.
+// Task 0053 answered it: reachable, through the CLI, which read
+// SAPEDB_ACCOUNT/SAPEDB_DB with no shape check of its own at all. The fix
+// is not in this file — Key now calls dbname.CheckPair before it derives
+// anything (see dbkey.go) — so this test now asserts the opposite of what
+// it used to: both colliding pairs are refused before the arithmetic that
+// used to produce their shared key ever runs. That arithmetic has not
+// changed; nothing reaches it with these two pairs any more. The old hex
+// above is kept in this comment, not in an assertion, so a future reader
+// knows the collision was real and measured, not merely theorized — and so
+// nobody "closes the gap" a second time by re-deriving a key that is no
+// longer derivable.
 func TestKeyDoesNotDistinguishWhereTheSlashFallsInAccountOrDB(t *testing.T) {
-	left, err := Key(goldenSecret, "a/b", "c")
+	if _, err := Key(goldenSecret, "a/b", "c"); !errors.Is(err, dbname.Err) {
+		t.Errorf("Key(%q, %q, %q) = _, %v, want a dbname.Err refusal", goldenSecret, "a/b", "c", err)
+	}
+	if _, err := Key(goldenSecret, "a", "b/c"); !errors.Is(err, dbname.Err) {
+		t.Errorf("Key(%q, %q, %q) = _, %v, want a dbname.Err refusal", goldenSecret, "a", "b/c", err)
+	}
+
+	// Control: a valid pair is entirely unaffected — same golden vector as
+	// TestKeyMatchesTheGoldenVectorFromBeforeTheRefactor pins on its own.
+	key, err := Key(goldenSecret, "acme", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := Key(goldenSecret, "a", "b/c")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hex.EncodeToString(left) != hex.EncodeToString(right) {
-		t.Fatalf("expected these to collide (both build the info string %q), but got different keys: %x vs %x",
-			"a/b/c", left, right)
-	}
-	const want = "5c3d27f090a379ed14913c228b177608f14b03b4c5c943ac5ed0354a9eac21c2"
-	if got := hex.EncodeToString(left); got != want {
-		t.Errorf("the colliding key = %s, want %s", got, want)
+	const want = "b2fbc36b64c7a4bb11e410d6e1e01d9d5aaed7d004e4df1237a4a7144d8f4004"
+	if got := hex.EncodeToString(key); got != want {
+		t.Errorf("Key(%q, %q, %q) = %s, want %s", goldenSecret, "acme", "main", got, want)
 	}
 }

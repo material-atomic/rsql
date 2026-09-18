@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/sapedb/sapedb/internal/dbkey"
+	"github.com/sapedb/sapedb/internal/dbname"
 	"github.com/sapedb/sapedb/internal/pager"
 	"github.com/sapedb/sapedb/internal/signing"
 	"github.com/sapedb/sapedb/internal/store"
@@ -177,6 +178,28 @@ func run(args []string, lookup func(string) (string, bool), stdin io.Reader, std
 		return fmt.Errorf("%w: -account and -db say which database", ErrUsage)
 	}
 
+	// Both names become a path component and, when -encrypt is set, half of
+	// a key-derivation input — see internal/dbname. This is the door that
+	// was missing before task 0053: internal/server has always refused a
+	// name shaped like a path, at its own door, but nothing here ever asked
+	// the same question, so SAPEDB_ACCOUNT='a/b' SAPEDB_DB='c' and
+	// SAPEDB_ACCOUNT='a' SAPEDB_DB='b/c' both wrote the same file with no
+	// error from either side. This does not make that check upstream
+	// unneeded — it is a conditional fact, not a guarantee: server has
+	// checked this shape at database() since before this package existed,
+	// so a name that gets past THIS call is a name both halves of the
+	// product agree on, not a name this tool has privately decided is safe.
+	//
+	// Placed before vfs.LockDir (see open, below), and before the command
+	// switch, on purpose: a refused name must not take the directory lock
+	// or create the account's directory (open() does both), and it must be
+	// refused the same way whether the command that follows opens a file at
+	// all — url and shell never call open(), and a name they would sign or
+	// connect with is exactly as wrong as one apply would write.
+	if err := dbname.CheckPair(opts.account, opts.db); err != nil {
+		return oldPathHint(opts, err)
+	}
+
 	command, rest := rest[0], rest[1:]
 
 	switch command {
@@ -297,6 +320,57 @@ func checkOldExtension(path string) error {
 	return nil
 }
 
+// dbPath is where an (account, db) pair's file lives under dir. This is the
+// one expression in the tree that turns those three things into a path for
+// this side of the product — internal/server has its own, independent one
+// (see task 0053's own text, "Không có tầng nào hôm nay MỌI đường đều đi
+// qua" — there was no single layer both sides went through before this
+// task), and this function is what keeps this file from growing a second
+// one of its own: both open() and oldPathHint(), below, call this instead
+// of writing filepath.Join again.
+func dbPath(opts options) string {
+	return filepath.Join(opts.dir, opts.account, opts.db+".sapedb")
+}
+
+// oldPathHint decides whether a name dbname.CheckPair just refused is one
+// that, before this check existed, had already been used to write a real
+// file — and if so, says exactly where it is and how to get the data out.
+//
+// Same discipline as checkOldExtension above, and the same reason: os.Stat,
+// not a promise. A name nobody ever wrote anything under gets the bare
+// refusal and nothing more — a migration lecture that does not apply teaches
+// people to stop reading migration lectures.
+//
+// The encrypted case is deliberately not offered mv. dbkey.Key derives a
+// database's encryption key from account+"/"+name (see that package), so
+// changing either half of a valid pair changes the key — there is no
+// rename that carries the old key forward, only a read-with-the-old-code,
+// then a restore into a name this version accepts. Task 0053's Result
+// section has the structural argument for why no pair CheckPair accepts can
+// ever collide with a pair it refused: their info strings cannot be equal.
+func oldPathHint(opts options, refusal error) error {
+	path := dbPath(opts)
+	if _, err := os.Stat(path); err != nil {
+		return refusal
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	parts := strings.TrimSuffix(abs, ".sapedb") + ".parts"
+
+	if opts.encrypt {
+		return fmt.Errorf("%w\n  a file already exists at %s (and %s, if there is one).\n"+
+			"  It is encrypted, so no rename carries its key forward: read it out with\n"+
+			"  the sapedb build from before this name was refused, then restore into a\n"+
+			"  valid account/db pair.", refusal, abs, parts)
+	}
+	return fmt.Errorf("%w\n  a file already exists at %s (and %s, if there is one).\n"+
+		"  mv it, and that .parts directory if there is one, to a valid account/db\n"+
+		"  pair.", refusal, abs, parts)
+}
+
 // open opens the database file, taking its lock.
 func open(opts options) (*store.Store, func(), error) {
 	// The directory first: a server holds this for its whole life, so being
@@ -310,7 +384,7 @@ func open(opts options) (*store.Store, func(), error) {
 		return nil, nil, err
 	}
 
-	path := filepath.Join(opts.dir, opts.account, opts.db+".sapedb")
+	path := dbPath(opts)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		held.Close()
 		return nil, nil, err

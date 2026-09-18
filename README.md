@@ -100,6 +100,12 @@ without the key or "not our file" and "wrong key" become one answer.
     sapedb apply schema.json
     sapedbd
 
+SAPEDB_ACCOUNT and SAPEDB_DB each become one path component under SAPEDB_DIR,
+and together they derive the encryption key when SAPEDB_ENCRYPT is set — so
+each must be 1 to 64 characters of letters, digits, dot, dash or underscore,
+and neither `.` nor `..` on its own. A name outside that is refused, not
+adjusted or normalized.
+
 The server refuses to start without TLS unless `SAPEDB_INSECURE=1` says you meant
 it. The Docker image ships the server binary and nothing else — no shell, no
 package manager, no libc.

@@ -14,6 +14,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 
+	"github.com/sapedb/sapedb/internal/dbname"
 	"github.com/sapedb/sapedb/internal/pager"
 )
 
@@ -32,6 +33,21 @@ const Label = "rsql/server:database:v1"
 // database. Both internal/cli (writing a file) and internal/server (opening
 // it) must call exactly this, or the two processes derive different keys for
 // the same file.
+//
+// It refuses an account or a name dbname.Check would refuse, before
+// deriving anything — the same rule internal/cli and internal/server check
+// on their own two doors. This is the sole reason task 0053 gives for
+// putting the check here too, not just at those two doors: this function's
+// info string is account+"/"+name, so ("a/b", "c") and ("a", "b/c") build
+// the identical string "a/b/c" and would derive the identical key
+// (dbkey_test.go's TestKeyDoesNotDistinguishWhereTheSlashFallsInAccountOrDB
+// still measures that arithmetic fact). -encrypt is the only caller that
+// ever reaches this function, so a caller that skips the check at its own
+// door — a third process embedding this package directly, say — would
+// otherwise derive a colliding key with no other check ever having run.
 func Key(secret, account, name string) ([]byte, error) {
+	if err := dbname.CheckPair(account, name); err != nil {
+		return nil, err
+	}
 	return hkdf.Key(sha256.New, []byte(secret), []byte(account+"/"+name), Label, pager.KeyBytes)
 }

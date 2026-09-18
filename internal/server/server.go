@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/sapedb/sapedb/internal/dbkey"
+	"github.com/sapedb/sapedb/internal/dbname"
 	"github.com/sapedb/sapedb/internal/pager"
 	"github.com/sapedb/sapedb/internal/protocol"
 	"github.com/sapedb/sapedb/internal/signing"
@@ -569,10 +570,16 @@ func checkOldExtension(path string) error {
 // database opens the file for an account and name, or returns the one already
 // open.
 func (s *Server) database(account, name string) (*database, error) {
-	if err := usableComponent(account); err != nil {
+	// The rule itself now lives in internal/dbname, not here — see that
+	// package's doc comment for why, and task 0053's Result section for the
+	// measurement that this changed nothing about what is accepted. The
+	// wrapping below is unchanged from before that move: ErrName and the
+	// wire code it maps to (codeFor, "name") are a contract with clients,
+	// and this task does not touch either.
+	if err := dbname.Check(account); err != nil {
 		return nil, fmt.Errorf("%w: account %q: %v", ErrName, account, err)
 	}
-	if err := usableComponent(name); err != nil {
+	if err := dbname.Check(name); err != nil {
 		return nil, fmt.Errorf("%w: database %q: %v", ErrName, name, err)
 	}
 
@@ -677,34 +684,6 @@ func (s *Server) Store(account, name string) (*store.Store, func(), error) {
 func (s *Server) Sign(account, password, name string) (string, error) {
 	return signing.Sign(signing.Parts{AccountID: account, Password: password, DBName: name},
 		s.options.Secret, s.options.Label)
-}
-
-// usableComponent keeps a name from being a path.
-//
-// An account or database name becomes a directory and a file name, so a name
-// holding a separator or a parent reference would put a database somewhere
-// nobody meant it to be — and a signed name is only as safe as what it is
-// allowed to mean.
-func usableComponent(name string) error {
-	switch {
-	case name == "":
-		return errors.New("it is empty")
-	case len(name) > 64:
-		return fmt.Errorf("%d characters is more than 64", len(name))
-	case name == "." || name == "..":
-		return errors.New("it names a directory")
-	case strings.ContainsAny(name, `/\:`+"\x00"):
-		return errors.New("it holds a path separator")
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '-', r == '_', r == '.':
-		default:
-			return fmt.Errorf("it holds %q, and names are letters, digits, dot, dash and underscore", r)
-		}
-	}
-	return nil
 }
 
 func write(conn io.Writer, frame protocol.Frame, payload []byte) error {
