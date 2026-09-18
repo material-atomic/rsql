@@ -104,19 +104,14 @@ func TestABoundThatFallsAwayUndoesWhatScanAcrossPromised(t *testing.T) {
 	}
 }
 
-// TestOneDeclarationReadBothWaysCoversTwoDifferentStretches shows the cost of
-// From and To swapping roles, with rows rather than with prose.
-//
-// The declaration is one operation with one end declared. The caller passes the
-// same value for that end both times and changes nothing but the direction, and
-// gets back two stretches of the index that share a single row. Neither call is
-// an error and neither result looks wrong on its own.
-//
-// This is the decision the task asked for, not a bug, but whoever reviews it
-// should see what it costs: "read this operation the other way round" is not
-// the same request as "read the same rows the other way round", and the
-// arguments have to be rewritten to get the second.
-func TestOneDeclarationReadBothWaysCoversTwoDifferentStretches(t *testing.T) {
+// TestOneDeclarationReadBothWaysCoversTheSameStretch is what round three's
+// TestOneDeclarationReadBothWaysCoversTwoDifferentStretches used to be named
+// for the opposite of. That test measured the cost of From and To trading
+// roles under Direction: the same argument, same value, direction flipped,
+// used to cover two different stretches of the index sharing a single row.
+// Round four removed the swap, so the sentence in its own name is now true:
+// one declaration, one stretch, read forward or backward.
+func TestOneDeclarationReadBothWaysCoversTheSameStretch(t *testing.T) {
 	store, collection := declared(t, 141)
 	fill(t, collection)
 
@@ -142,28 +137,15 @@ func TestOneDeclarationReadBothWaysCoversTwoDifferentStretches(t *testing.T) {
 		t.Fatalf("forward to s4 gave %v, want %v", forward, want)
 	}
 
-	// Same operation, same argument, direction flipped. "edge" was the end of
-	// the walk, and it still is — but the walk now starts at the far end of the
-	// index, so the end it stops at is a lower bound rather than an upper one.
+	// The SAME declaration, the SAME argument value, direction flipped. From
+	// is unwritten (the whole index below "edge") and To is still "edge" —
+	// neither end reads any differently for it, so this is the forward
+	// stretch, backwards.
 	reverse := fieldOf(invoke(t, store, "articles.up_to", map[string]any{
 		"edge": "s4", "direction": DirectionReverse,
 	}).Rows, "slug")
-	if want := []string{"s5", "s4"}; fmt.Sprint(reverse) != fmt.Sprint(want) {
+	if want := []string{"s4", "s3", "s2", "s1", "s0"}; fmt.Sprint(reverse) != fmt.Sprint(want) {
 		t.Fatalf("reverse to s4 gave %v, want %v", reverse, want)
-	}
-
-	// Spelled out: of the six rows, five come back one way and two the other,
-	// and only s4 is in both. Nothing was truncated and nothing was refused.
-	shared := 0
-	for _, slug := range forward {
-		for _, other := range reverse {
-			if slug == other {
-				shared++
-			}
-		}
-	}
-	if shared != 1 {
-		t.Errorf("the two stretches share %d rows: %v and %v", shared, forward, reverse)
 	}
 }
 
@@ -349,12 +331,14 @@ func TestAReversedClusteredWalkCrossesEveryPartitionBoundary(t *testing.T) {
 		t.Errorf("the reversed clustered walk gave %v, want %v", down, want)
 	}
 
-	// Bounded at both ends, on the clustered index, across partitions: the ends
-	// swap, and both of them land exactly on a stored key.
+	// Bounded at both ends, on the clustered index, across partitions: From
+	// is written[1] (the low end) and To is written[4] (the high end), same
+	// as a forward call over this stretch would be — reversing changes only
+	// the read order — and both of them land exactly on a stored key.
 	var middle []string
 	if err := entries.walkRange(Range{
-		From:      &Bound{Values: []any{written[4]}},
-		To:        &Bound{Values: []any{written[1]}},
+		From:      &Bound{Values: []any{written[1]}},
+		To:        &Bound{Values: []any{written[4]}},
 		Direction: Reverse,
 	}, func(key any, _ map[string]any) bool {
 		middle = append(middle, fmt.Sprint(key))

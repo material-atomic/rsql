@@ -1,28 +1,42 @@
 package store
 
 import (
-	"errors"
 	"fmt"
 	"testing"
 )
 
-// This file is round 3's front door: reach_test.go measures the shapes at the
-// Collection, below DeclareOperation, on purpose (half of them are refused
-// and still have to be measured). These tests go through DeclareOperation and
-// Invoke instead, because a bug at the boundary between the two — a check
-// that only ever ran in one of them — is exactly the kind of thing a
-// Collection-only measurement cannot see.
+// This file used to be round three's front door: three shapes — a constant
+// at one end only, the two ends disagreeing about Exclusive, and (round
+// three's own Reviewer finding, never captured here) the two ends written at
+// different widths — were refused because letting the caller pick the
+// direction let a call reach rows no forward call of the same declaration
+// could, once From and To swapped which one was the walk's upper end.
+//
+// Round four removed the swap instead of adding a fourth rule for a fourth
+// shape. So every test that used to assert ErrDeclaration for one of these
+// shapes now asserts the opposite: the shape declares, and forward and
+// reverse read one stretch, backwards on the second call. Nothing here
+// measures a refusal any more — reach_test.go's
+// TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays and
+// direction_v4_test.go's TestTheTwoBoundsNeverDependOnDirection already cover
+// the general case; what stays here is the concrete, front-door version of
+// exactly the shapes three rounds of review argued about, so a reader who
+// followed those rounds can see where each one landed.
 
-// TestAnExclusiveEndAloneIsRefusedAtDeclarationNotJustMeasured is QA's
-// original leak, declared through the real front door rather than measured
-// directly. Round 2 shipped "accepted iff the two reachable sets are equal"
-// without a test that ever declared this shape; QA measured it by hand and it
-// leaks — a row at the floor of by_slug (id "", slug "") never comes back on
-// a forward call and comes back on a single reverse one.
-func TestAnExclusiveEndAloneIsRefusedAtDeclarationNotJustMeasured(t *testing.T) {
-	store, _ := declared(t, 138)
+// TestAnExclusiveEndAloneDeclaresAndReadsOneStretchBothWays is QA's original
+// leak from round three, declared through the real front door. It used to be
+// refused: a row at the floor of by_slug (id "", slug "") never came back on
+// a forward call and came back on a single reverse one, because Exclusive
+// was checked against From and To as if they were fixed roles rather than
+// the low and high end reversing swapped. Neither end is fixed to a role by
+// Direction any more, so there is nothing left to leak and nothing left to
+// refuse: forward and reverse over the same From/To now read the same
+// stretch, in opposite order.
+func TestAnExclusiveEndAloneDeclaresAndReadsOneStretchBothWays(t *testing.T) {
+	store, collection := declared(t, 138)
+	fill(t, collection)
 
-	_, err := store.DeclareOperation(Operation{
+	declareOp(t, store, Operation{
 		Name:       "articles.leaky",
 		Collection: "articles",
 		Action:     ActionScan,
@@ -32,78 +46,40 @@ func TestAnExclusiveEndAloneIsRefusedAtDeclarationNotJustMeasured(t *testing.T) 
 			{Name: "hi", Type: TypeString, Required: true},
 			{Name: "direction", Type: TypeString, Required: true},
 		},
-		From:      &Endpoint{Terms: []Term{{Arg: "lo"}}, Exclusive: true},
-		To:        &Endpoint{Terms: []Term{{Arg: "hi"}}},
-		Direction: &Term{Arg: "direction"},
-		Limit:     50,
+		From:       &Endpoint{Terms: []Term{{Arg: "lo"}}, Exclusive: true},
+		To:         &Endpoint{Terms: []Term{{Arg: "hi"}}},
+		Direction:  &Term{Arg: "direction"},
+		Projection: []string{"slug"},
+		Limit:      50,
 	})
-	if !errors.Is(err, ErrDeclaration) {
-		t.Fatalf("QA's leak (exclusive From only, direction an argument): want ErrDeclaration, got %v", err)
-	}
-}
 
-// TestExclusivityMismatchRefusesOnlyTheOneLeakingShape hunts for the mistake
-// the house rules ask every "not allowed to..." to be tested against: a rule
-// that refuses more than it means to. Every shape below is one the new
-// mệnh đề 2 must NOT touch — it stays declarable — so if boundsSurviveReversal
-// over-reaches, this is where it shows up rather than in a QA round.
-func TestExclusivityMismatchRefusesOnlyTheOneLeakingShape(t *testing.T) {
-	store, _ := declared(t, 139)
-
-	accept := func(name string, from, to *Endpoint) {
-		t.Helper()
-		_, err := store.DeclareOperation(Operation{
-			Name:       name,
-			Collection: "articles",
-			Action:     ActionScan,
-			Index:      "by_slug",
-			Input: []Parameter{
-				{Name: "lo", Type: TypeString, Required: true},
-				{Name: "hi", Type: TypeString, Required: true},
-				{Name: "direction", Type: TypeString, Required: true},
-			},
-			From:      from,
-			To:        to,
-			Direction: &Term{Arg: "direction"},
-			Limit:     50,
-		})
-		if err != nil {
-			t.Errorf("%s: want accepted, got %v", name, err)
-		}
+	forward := invoke(t, store, "articles.leaky", map[string]any{
+		"lo": "s1", "hi": "s4", "direction": DirectionForward,
+	})
+	if got := slugsOf(forward.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s2", "s3", "s4"}) {
+		t.Errorf("forward, lo=s1 exclusive to hi=s4, gave %v", got)
 	}
 
-	accept("both ends arguments, both exclusive",
-		&Endpoint{Terms: []Term{{Arg: "lo"}}, Exclusive: true},
-		&Endpoint{Terms: []Term{{Arg: "hi"}}, Exclusive: true})
-	accept("both ends arguments, both inclusive",
-		&Endpoint{Terms: []Term{{Arg: "lo"}}},
-		&Endpoint{Terms: []Term{{Arg: "hi"}}})
-	accept("an argument inclusive at From, To left unwritten",
-		&Endpoint{Terms: []Term{{Arg: "lo"}}},
-		nil)
-	// The exception: two ends written as the very same terms are one point
-	// (or one prefix), open on at most one side of itself, which is empty
-	// from either direction regardless of which side that is. Both the
-	// argument-valued and the constant-valued version of this have to survive
-	// — an argument pair is what a keyset pager's cursor looks like.
-	accept("the same argument at both ends, mismatched exclusivity",
-		&Endpoint{Terms: []Term{{Arg: "lo"}}, Exclusive: true},
-		&Endpoint{Terms: []Term{{Arg: "lo"}}})
-	accept("the same constant at both ends, mismatched exclusivity",
-		&Endpoint{Terms: []Term{{Value: "s3"}}, Exclusive: true},
-		&Endpoint{Terms: []Term{{Value: "s3"}}})
-	accept("the same constant at both ends, both inclusive",
-		&Endpoint{Terms: []Term{{Value: "s3"}}},
-		&Endpoint{Terms: []Term{{Value: "s3"}}})
+	reverse := invoke(t, store, "articles.leaky", map[string]any{
+		"lo": "s1", "hi": "s4", "direction": DirectionReverse,
+	})
+	if got := slugsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s4", "s3", "s2"}) {
+		t.Errorf("reverse over the same declared stretch gave %v", got)
+	}
 }
 
 // TestATwoWayPagerWithBothEndsExclusiveDeclaresAndReadsBothWays is the shape
-// mục 1 says the tightened rule leaves fully available: a keyset pager whose
-// cursor and edge are both arguments and both exclusive (nobody re-sees the
-// row they last read, whichever way they are paging). It goes through
-// DeclareOperation and Invoke — the real front door — rather than
-// Collection.Scan, since that is the whole of what a caller of this store
-// actually has.
+// round three's mục 1 said the tightened rule had to leave available: a
+// keyset pager whose cursor and edge are both arguments and both exclusive,
+// so nobody re-sees the row they last read, whichever way they are paging.
+// It goes through DeclareOperation and Invoke — the real front door — rather
+// than Collection.Scan.
+//
+// Round three needed an exception for this exact shape ("the same argument
+// pair is one point, open on at most one side of itself") to keep it
+// declarable beside a rule that refused mismatched Exclusive everywhere
+// else. Round four needs no exception: reversing changes only the read
+// order, so the SAME from/to values work for both calls.
 func TestATwoWayPagerWithBothEndsExclusiveDeclaresAndReadsBothWays(t *testing.T) {
 	store, collection := declared(t, 137)
 	fill(t, collection)
@@ -132,25 +108,31 @@ func TestATwoWayPagerWithBothEndsExclusiveDeclaresAndReadsBothWays(t *testing.T)
 		t.Errorf("forward from s1 exclusive to s4 exclusive gave %v", got)
 	}
 
+	// The SAME from/to as the forward call — nothing to swap any more.
 	reverse := invoke(t, store, "articles.page", map[string]any{
-		"from": "s4", "to": "s1", "direction": DirectionReverse,
+		"from": "s1", "to": "s4", "direction": DirectionReverse,
 	})
 	if got := slugsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s3", "s2"}) {
-		t.Errorf("reverse from s4 exclusive to s1 exclusive gave %v", got)
+		t.Errorf("reverse over the same declared stretch gave %v", got)
 	}
 }
 
-// TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup is mục 1's test
-// #2: the leak in mệnh đề 2 is not a trick of the empty string. by_author is
-// (author ascending, published number, Descending, MissingLast). Descending
-// flips the byte order of published and MissingLast then sorts a document
-// with no published date after that flipped order — so within one author's
-// group, the row missing the field sits at the very floor, byte for byte the
-// same shape as "" at the floor of by_slug. This is measured directly through
-// Collection.Scan, over every published value a caller could plausibly pass,
-// because the declaration this measures is refused and Invoke can never
-// reach a shape that was never declared.
-func TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup(t *testing.T) {
+// TestByAuthorMissingPublishedReadsOneStretchBothWaysExclusiveIncluded is
+// round three's mục 1 test #2, re-measured: the leak was never a trick of
+// the empty string. by_author is (author ascending, published number,
+// Descending, MissingLast). Descending flips the byte order of published and
+// MissingLast then sorts a document with no published date after that
+// flipped order — so within one author's group, the row missing the field
+// sits at the very floor, byte for byte the same shape as "" at the floor of
+// by_slug.
+//
+// Round three refused this shape outright because forward could never reach
+// the floor row past an exclusive bound while reverse always could, once the
+// two ends swapped roles. With nothing swapping, an exclusive bound at
+// From — the low end, in both directions — excludes the floor row from BOTH
+// calls, which is what "a direction widens nothing" was supposed to mean in
+// the first place.
+func TestByAuthorMissingPublishedReadsOneStretchBothWaysExclusiveIncluded(t *testing.T) {
 	store, collection := declared(t, 140)
 	fill(t, collection)
 
@@ -159,40 +141,7 @@ func TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup(t *testing.T) {
 		"id": "aX", "author": "ann", "title": "Article X", "slug": "sX",
 	})
 
-	reachesRow := func(p float64, direction Direction) bool {
-		t.Helper()
-		within := Range{
-			From:      &Bound{Values: []any{"ann", p}, Exclusive: true},
-			To:        &Bound{Values: []any{"ann"}},
-			Direction: direction,
-		}
-		found := false
-		if err := collection.Scan("by_author", within, func(one Found) bool {
-			if fmt.Sprint(one.Key) == "aX" {
-				found = true
-			}
-			return true
-		}); err != nil {
-			t.Fatal(err)
-		}
-		return found
-	}
-
-	// fill() wrote published 0..5 for ann and bob; these straddle every real
-	// value and go far past them on both sides. Whatever a caller passes,
-	// forward never reaches the row missing published and reverse always does
-	// — in one call, with no need to try more than one direction's worth of
-	// values.
-	for _, p := range []float64{-1e9, -1, 0, 2.5, 5, 1e9} {
-		if reachesRow(p, Forward) {
-			t.Errorf("forward with the exclusive end at (ann, %v) reached the row missing published", p)
-		}
-		if !reachesRow(p, Reverse) {
-			t.Errorf("reverse with the exclusive end at (ann, %v) did not reach the row missing published", p)
-		}
-	}
-
-	_, err := store.DeclareOperation(Operation{
+	declareOp(t, store, Operation{
 		Name:       "articles.by_author_page",
 		Collection: "articles",
 		Action:     ActionScan,
@@ -201,12 +150,51 @@ func TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup(t *testing.T) {
 			{Name: "p", Type: TypeNumber, Required: true},
 			{Name: "direction", Type: TypeString, Required: true},
 		},
-		From:      &Endpoint{Terms: []Term{{Value: "ann"}, {Arg: "p"}}, Exclusive: true},
-		To:        &Endpoint{Terms: []Term{{Value: "ann"}}},
-		Direction: &Term{Arg: "direction"},
-		Limit:     50,
+		From:       &Endpoint{Terms: []Term{{Value: "ann"}, {Arg: "p"}}, Exclusive: true},
+		To:         &Endpoint{Terms: []Term{{Value: "ann"}}},
+		Direction:  &Term{Arg: "direction"},
+		Projection: []string{"id"},
+		Limit:      50,
 	})
-	if !errors.Is(err, ErrDeclaration) {
-		t.Errorf("the shape just measured to leak: want ErrDeclaration, got %v", err)
+
+	// fill() wrote published 0..5 for ann and bob; these straddle every real
+	// value and go far past them on both sides. Whatever a caller passes,
+	// the exclusive bound at the low end keeps the floor row (aX) out of
+	// EVERY call, forward or reverse — no direction ever reaches it through
+	// this declaration, which is the point.
+	for _, p := range []float64{-1e9, -1, 0, 2.5, 5, 1e9} {
+		forward := invoke(t, store, "articles.by_author_page", map[string]any{"p": p, "direction": DirectionForward})
+		if got := idsOf(forward.Rows); contains(got, "aX") {
+			t.Errorf("forward with p=%v reached the row missing published: %v", p, got)
+		}
+		reverse := invoke(t, store, "articles.by_author_page", map[string]any{"p": p, "direction": DirectionReverse})
+		if got := idsOf(reverse.Rows); contains(got, "aX") {
+			t.Errorf("reverse with p=%v reached the row missing published: %v", p, got)
+		}
 	}
+
+	// A value that DOES reach rows: p=1e9 reaches everything with a real
+	// published date, in both directions, backwards of each other.
+	forward := invoke(t, store, "articles.by_author_page", map[string]any{"p": 1e9, "direction": DirectionForward})
+	reverse := invoke(t, store, "articles.by_author_page", map[string]any{"p": 1e9, "direction": DirectionReverse})
+	if got := idsOf(forward.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a5", "a4", "a2", "a1"}) {
+		t.Errorf("forward with p=1e9 gave %v", got)
+	}
+	if got := idsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a1", "a2", "a4", "a5"}) {
+		t.Errorf("reverse over the same declared stretch gave %v", got)
+	}
+
+	// The unbounded pin (no Exclusive at all) is where the floor row DOES
+	// come back, consistently both ways — see
+	// TestByAuthorFloorRowReadsOneStretchBothWays in direction_v4_test.go.
+}
+
+// contains is a small helper local to this file: whether id is among ids.
+func contains(ids []string, id string) bool {
+	for _, one := range ids {
+		if one == id {
+			return true
+		}
+	}
+	return false
 }

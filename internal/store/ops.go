@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+
+	"github.com/material-atomic/rsql/internal/keys"
 )
 
 // Declared operations are the only way into a database.
@@ -93,27 +96,30 @@ type Operation struct {
 	// declaration, an argument term lets the caller choose per call — and both
 	// are already the vocabulary everything else here is written in.
 	//
-	// From is where the walk STARTS and To where it ends, so reversing swaps
-	// which of them is the upper end of the stretch. One declaration read both
-	// ways is therefore two different stretches, not one stretch read from two
-	// sides: a caller that flips the direction and leaves from and to alone
-	// gets a different set of rows, and has to swap the two values itself to
-	// get the same ones back. A declaration with both ends written as
-	// constants, read against its fixed direction, comes back empty.
+	// From is the low end of the stretch and To is the high end, in BOTH
+	// directions — Direction changes only the order rows come back in, never
+	// which rows they are. One declaration read both ways is therefore one
+	// stretch, read from either end: a caller that flips the direction and
+	// leaves From and To alone gets the same rows back, backwards.
 	//
 	// It is still the one thing about a scan an argument may decide, and it is
 	// safe for a reason that does not generalise to anything else: it widens
 	// nothing. The index is the declared one, the limit is the declared one,
-	// the work is the same walk over the same pages, and the set of rows the
-	// declaration can reach is the same from either end — which is why a
-	// constant bound written at one end only is refused beside a caller-chosen
-	// direction, since that one would widen, and why the two ends must be
-	// Exclusive the same way for the same reason: Exclusive marks the point the
-	// walk STARTS from, so reversing carries it to the opposite end, and a row
-	// sitting at the floor of the index's encoding — the empty string, false,
-	// a document missing the field the index is Descending + MissingLast on —
-	// comes back on the end that is inclusive and never on the one that is
-	// exclusive. See checkDirection.
+	// From and To are the declared ones — Direction is read nowhere while the
+	// two bounds are being worked out, so there is no declaration shaped in a
+	// way that lets a caller-chosen direction reach a row a forward call of
+	// the same declaration could not. Earlier rounds tried to get there by
+	// refusing every shape where that could go wrong instead — a constant at
+	// one end only, the two ends disagreeing about Exclusive, the two ends
+	// written at different widths — and each round's rule caught the leak it
+	// was aimed at and missed the next one. There is no such rule now, because
+	// there is nothing left for one to catch.
+	//
+	// Limit is the one place a caller-chosen direction still matters, and it is
+	// meant to: with a limit smaller than the stretch, the two directions hand
+	// back the two different ends of it — the ten most recent rows and the ten
+	// oldest are different sets on purpose. That is what this feature exists to
+	// do, not a widening of the declaration.
 	//
 	// "Reverse" reverses the order the index declared, as a whole. An index on
 	// (a ascending, b descending) read in reverse gives (a descending, b
@@ -211,13 +217,9 @@ type Condition struct {
 // Endpoint is one end of a scan: values for the first fields of the index, and
 // whether that point is included.
 //
-// Exclusive marks the point where a walk that ENTERS from this end starts (or,
-// for the end a walk leaves from, where it stops). Which end that is depends on
-// Direction: reversing a walk swaps which of From and To is where it starts.
-// So beside a direction the caller chooses, From.Exclusive and To.Exclusive
-// must agree — otherwise the same declaration is a floor from one side and a
-// ceiling from the other, and whichever end is left inclusive keeps whatever
-// sits at the floor of the index's own encoding. See checkDirection.
+// From is always the low end and To is always the high end, whichever way
+// Direction reads the stretch, so Exclusive means the same thing at both ends
+// in both directions: this point is not part of the stretch.
 type Endpoint struct {
 	Terms     []Term `json:"terms"`
 	Exclusive bool   `json:"exclusive,omitempty"`
@@ -471,6 +473,20 @@ func (s *Store) validateOperation(operation *Operation) error {
 				if err := check(term, fields[i].Type, fmt.Sprintf("the bound on %q", fields[i].Path)); err != nil {
 					return err
 				}
+				// A rollup's Group fields cannot be declared "any" —
+				// Rollup.validate() only accepts TypeString, TypeNumber and
+				// TypeBool for them — so matches() already refuses a slice
+				// or a map here before this line is reached: there is no
+				// declaration in this repo that makes this call return a
+				// non-nil error today. Kept anyway, deliberately, for the
+				// same reason sameTerm replaced == in totalsAcross below
+				// rather than only in scanAcross: symmetry with the scan
+				// branch, so a future field type that does allow "any" on a
+				// rollup group does not silently reopen the panic this
+				// closed on the scan side.
+				if err := constantIsEncodable(term, fields[i]); err != nil {
+					return err
+				}
 			}
 		}
 		if operation.Limit <= 0 {
@@ -494,6 +510,9 @@ func (s *Store) validateOperation(operation *Operation) error {
 			}
 			for i, term := range endpoint.Terms {
 				if err := check(term, fields[i].Type, fmt.Sprintf("the bound on %q", fields[i].Path)); err != nil {
+					return err
+				}
+				if err := constantIsEncodable(term, fields[i]); err != nil {
 					return err
 				}
 			}
@@ -615,126 +634,7 @@ func checkDirection(operation *Operation, parameters map[string]Parameter,
 			return fmt.Errorf("%w: the default for %q: %v", ErrDeclaration, term.Arg, err)
 		}
 	}
-	return boundsSurviveReversal(operation, term.Arg)
-}
-
-// boundsSurviveReversal refuses the two shapes in which letting the caller
-// pick the direction hands them rows the declaration was written to keep from
-// them: a constant written at one end only, and the two ends disagreeing about
-// Exclusive.
-//
-// A constant in a bound is the only part of a stretch a caller cannot move. It
-// is how a declaration pins a floor, or a tenant, and leaves the rest of the
-// range to the call. But From is where the walk starts, so reversing swaps
-// which end of the stretch is the floor — and a constant written at one end
-// only stops being a floor the moment the caller passes "reverse". Everything
-// underneath it comes back, and no forward call of the same declaration could
-// have reached any of it whatever it passed. Refused here, because "a direction
-// widens nothing" has to be true of the declaration rather than of the call.
-//
-// What survives is a constant that says the same thing from both ends: same
-// position, same value. Then it confines the stretch whichever way the walk
-// enters, which is what "one tenant, either way along time" needs — and it is
-// already the shape scanAcross forces on every partitioned scan.
-//
-// Arguments at both ends are safe without any of this: reversing only permutes
-// values the caller was choosing anyway. So is an end left unwritten, which is
-// the whole rest of the index in that direction and no narrower for being read
-// backwards. A direction fixed by a constant is safe too, and never reaches
-// here: there is only one order, and whoever wrote the bound chose it.
-//
-// Exclusive is the second, later way to make the same mistake, and it is not a
-// mistake in bound() — bound()'s four branches (successor on the exclusive
-// lower end, successor on the inclusive upper end) are exactly the mirror of
-// each other, there is no missing "predecessor". The mistake is upstream of
-// bound(): Exclusive is written against From and To, which are START and END
-// of the walk, not LOW and HIGH of the keyspace, and reversing swaps which one
-// starts. So `From{Arg, Exclusive}, To{Arg}` reads (lo, hi] forward and [hi,
-// lo) reversed — two different half-open intervals — and the row at the floor
-// of the type (the empty string; false, which is also half the value space of
-// a bool; any document the field's Missing rule sorts to that floor) is
-// outside every forward call and inside a reverse one. Making bound()
-// symmetric instead would mean From.Exclusive meaning "exclude the low end"
-// while From.Values still means "the point the walk starts from" — two
-// different rules read off one field, which nobody could tell apart from the
-// declaration alone. So this is fixed here, at declaration time, instead: the
-// two ends must be Exclusive the same way, with one exception below.
-//
-// The exception is an end written identically at both places — same terms,
-// term for term, Exclusive not compared. Two ends that say the same thing are
-// one point (or one prefix), and a point open on one side is empty from
-// either direction: From=To={s3}, From exclusive gives forward
-// (successor(s3), successor(s3)) and reversed (s3, s3), both empty. Losing
-// this exception would refuse three shapes that leak nothing — the pinned
-// half-open cursor of a keyset pager among them — for a rule that does not
-// need to reach them.
-func boundsSurviveReversal(operation *Operation, chosenBy string) error {
-	at := func(end *Endpoint, i int) *Term {
-		if end == nil || i >= len(end.Terms) {
-			return nil
-		}
-		return &end.Terms[i]
-	}
-	fixed := func(term *Term) bool { return term != nil && term.Arg == "" }
-
-	width := 0
-	for _, end := range []*Endpoint{operation.From, operation.To} {
-		if end != nil && len(end.Terms) > width {
-			width = len(end.Terms)
-		}
-	}
-
-	for i := 0; i < width; i++ {
-		from, to := at(operation.From, i), at(operation.To, i)
-		if !fixed(from) && !fixed(to) {
-			continue
-		}
-		// Comparing terms with == is what scanAcross does, and it is safe for
-		// the same reason: check has already said a constant bound holds a
-		// value of the index field's own type, so nothing uncomparable is in
-		// there.
-		if from == nil || to == nil || *from != *to {
-			return fmt.Errorf("%w: %q chooses the direction, so bound value %d must be written the same at both ends — a constant on one end only is a floor the reverse walk turns into a ceiling, and the rows under it are rows no forward call of this operation can reach",
-				ErrDeclaration, chosenBy, i+1)
-		}
-	}
-
-	// exclusiveOf treats an end nobody wrote as closed: there is nothing there
-	// to exclude, and the rest of the index in that direction is reached
-	// either way.
-	exclusiveOf := func(end *Endpoint) bool { return end != nil && end.Exclusive }
-
-	if exclusiveOf(operation.From) != exclusiveOf(operation.To) && !endsAreIdentical(operation.From, operation.To) {
-		return fmt.Errorf("%w: %q chooses the direction, so From and To must be exclusive the same way — exclusive marks the point the walk starts from, reversing carries that point to the other end, and a row at the floor of the index (the empty string, false, a document missing the field) would come back from one direction and never the other",
-			ErrDeclaration, chosenBy)
-	}
 	return nil
-}
-
-// endsAreIdentical is true when From and To were written down as exactly the
-// same terms — not whether they mean the same thing at runtime, which an
-// argument-valued end cannot know until it is called, but whether the
-// declaration itself repeats one description at both places. Exclusive is
-// deliberately not part of the comparison: it is the one thing allowed to
-// differ once the terms already agree, which is what makes the exception in
-// boundsSurviveReversal an exception rather than nothing.
-func endsAreIdentical(from, to *Endpoint) bool {
-	if from == nil || to == nil {
-		// Reachable only when both are nil, and then exclusiveOf already
-		// agreed (false, false) — boundsSurviveReversal never asks this
-		// question in that case. Written out anyway so the function is
-		// correct on its own, not just for the one caller it has today.
-		return from == nil && to == nil
-	}
-	if len(from.Terms) != len(to.Terms) {
-		return false
-	}
-	for i := range from.Terms {
-		if from.Terms[i] != to.Terms[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // validateStep checks one step of a batch against the collection it names.
@@ -825,6 +725,37 @@ func scanFields(collection *Collection, name string) ([]Field, error) {
 	return index.Fields, nil
 }
 
+// constantIsEncodable refuses a constant bound that keys cannot turn into
+// bytes, at the point it is written rather than at the point every call to
+// this operation panics trying to.
+//
+// An index field, or a rollup group field, may be declared "any", and matches
+// lets a constant of any type satisfy that — including a slice or a map read
+// off a JSON body, which keys.Encode refuses with ErrNotIndexable rather than
+// encoding. A constant is the one kind of term this can be checked for ahead
+// of time: an argument or a step reference has no value yet, and its value at
+// call time is whatever the caller or the earlier step produced, checked the
+// ordinary way when bound() tries to encode it.
+func constantIsEncodable(term Term, field Field) error {
+	if term.Arg != "" || term.Step != "" {
+		return nil
+	}
+	if _, err := keys.Encode(nil, term.Value, field.encoding()); err != nil {
+		return fmt.Errorf("%w: the bound on %q holds a constant keys cannot encode: %v", ErrDeclaration, field.Path, err)
+	}
+	return nil
+}
+
+// sameTerm compares two terms without the panic == risks. Term.Value is any,
+// and a term may hold a constant of a type an index field declared "any"
+// accepts — a slice or a map, which Go cannot compare with ==. reflect.
+// DeepEqual has no such limit, and every other field of Term compares safely
+// with == on its own.
+func sameTerm(a, b Term) bool {
+	return a.Arg == b.Arg && a.Constant == b.Constant && a.Step == b.Step && a.Field == b.Field &&
+		reflect.DeepEqual(a.Value, b.Value)
+}
+
 func operationPrefix(name string) []byte {
 	key := append([]byte{spaceOps}, name...)
 	return append(key, 0)
@@ -898,7 +829,10 @@ func scanAcross(collection *Collection, operation *Operation) error {
 			ErrDeclaration, where, index.Name, len(index.Fields))
 	}
 	for i := range index.Fields {
-		if operation.From.Terms[i] != operation.To.Terms[i] {
+		// Compared with sameTerm rather than ==: Term.Value is any, and an
+		// index field declared "any" lets a constant here be a slice or a map,
+		// which == panics on rather than compares.
+		if !sameTerm(operation.From.Terms[i], operation.To.Terms[i]) {
 			return fmt.Errorf("%w: %s, so a scan on %q must fix %q rather than range over it",
 				ErrDeclaration, where, index.Name, index.Fields[i].Path)
 		}
@@ -928,7 +862,10 @@ func totalsAcross(collection *Collection, rollup *Rollup, operation *Operation) 
 			ErrDeclaration, where, rollup.Name)
 	}
 	for i := range rollup.Group {
-		if operation.From.Terms[i] != operation.To.Terms[i] {
+		// Same reason as scanAcross: Term.Value is any and a group field
+		// declared "any" can carry a slice or a map as a constant, which ==
+		// panics on.
+		if !sameTerm(operation.From.Terms[i], operation.To.Terms[i]) {
 			return fmt.Errorf("%w: %s, so reading %q must fix %q rather than range over it",
 				ErrDeclaration, where, rollup.Name, rollup.Group[i].Path)
 		}

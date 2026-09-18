@@ -102,14 +102,19 @@ func TestReversingAnIndexFlipsTheWholeDeclaredOrderNotEachField(t *testing.T) {
 	}
 }
 
-// TestTheEndsOfARangeSwapWhenTheScanIsReversed: From is where a walk starts and
-// To is where it ends, whichever way it goes, so a reversed walk makes From the
-// upper end and To the lower.
+// TestReverseReadsTheSameStretchBackwardsNotADifferentOne: From is always the
+// low end of a stretch and To is always the high end, in both directions —
+// Direction changes only the order rows come back in, never which rows they
+// are. A caller who wants the read reversed changes Direction and nothing
+// else; From and To are not rewritten to swap which one is "the far end".
 //
-// The failure this guards is quiet: written the wrong way round a reversed scan
-// hands back nothing, or hands back everything, and both look like an answer.
-// So both the right way round and the wrong way round are asserted here.
-func TestTheEndsOfARangeSwapWhenTheScanIsReversed(t *testing.T) {
+// This replaces TestTheEndsOfARangeSwapWhenTheScanIsReversed, which asserted
+// the opposite: that reversing required From and To to trade places. Three
+// rounds of review each found a different declaration where that swap let a
+// caller-chosen direction reach rows no forward call of the same declaration
+// could, so round four removed the swap rather than refuse a fourth shape.
+// See scan.go's Range doc and task 0012, round 4, mục 1.
+func TestReverseReadsTheSameStretchBackwardsNotADifferentOne(t *testing.T) {
 	_, collection := declared(t, 122)
 	fill(t, collection)
 
@@ -121,37 +126,46 @@ func TestTheEndsOfARangeSwapWhenTheScanIsReversed(t *testing.T) {
 		t.Fatalf("forward from s1 to s4 gave %v", forward)
 	}
 
-	// The same stretch, entered from the other end: From is now s4.
+	// The SAME declaration — From is still s1, To is still s4 — read the
+	// other way. Nothing about the bounds changed, only the order.
 	reverse := keysOf(scan(t, collection, "by_slug", Range{
-		From:      &Bound{Values: []any{"s4"}},
-		To:        &Bound{Values: []any{"s1"}},
-		Direction: Reverse,
-	}))
-	if fmt.Sprint(reverse) != fmt.Sprint([]string{"a4", "a3", "a2", "a1"}) {
-		t.Errorf("reverse from s4 to s1 gave %v", reverse)
-	}
-
-	// Both ends excluded, walking down: s4 is where it starts from and is left
-	// out, s1 is where it ends and is left out.
-	trimmed := keysOf(scan(t, collection, "by_slug", Range{
-		From:      &Bound{Values: []any{"s4"}, Exclusive: true},
-		To:        &Bound{Values: []any{"s1"}, Exclusive: true},
-		Direction: Reverse,
-	}))
-	if fmt.Sprint(trimmed) != fmt.Sprint([]string{"a3", "a2"}) {
-		t.Errorf("reverse from s4 exclusive to s1 exclusive gave %v", trimmed)
-	}
-
-	// Written the wrong way round — the ends left as they were for a forward
-	// walk — the reversed scan is empty rather than quietly the whole index.
-	// This is the shape of the mistake, recorded so that it stays loud.
-	backwards := keysOf(scan(t, collection, "by_slug", Range{
 		From:      &Bound{Values: []any{"s1"}},
 		To:        &Bound{Values: []any{"s4"}},
 		Direction: Reverse,
 	}))
+	if fmt.Sprint(reverse) != fmt.Sprint([]string{"a4", "a3", "a2", "a1"}) {
+		t.Errorf("reverse over the same declared stretch gave %v", reverse)
+	}
+
+	// Both ends excluded: exclusivity does not depend on direction either.
+	trimmed := keysOf(scan(t, collection, "by_slug", Range{
+		From:      &Bound{Values: []any{"s1"}, Exclusive: true},
+		To:        &Bound{Values: []any{"s4"}, Exclusive: true},
+		Direction: Reverse,
+	}))
+	if fmt.Sprint(trimmed) != fmt.Sprint([]string{"a3", "a2"}) {
+		t.Errorf("reverse with both ends exclusive gave %v", trimmed)
+	}
+
+	// Writing the ends the OLD way round — the convention a swapped-ends
+	// design once required for a reversed read, high value in From, low
+	// value in To — is empty now, whichever direction is asked for: From is
+	// unconditionally the low end, and s4 sorts after s1, so there is nothing
+	// between them to walk.
+	backwards := keysOf(scan(t, collection, "by_slug", Range{
+		From:      &Bound{Values: []any{"s4"}},
+		To:        &Bound{Values: []any{"s1"}},
+		Direction: Reverse,
+	}))
 	if len(backwards) != 0 {
-		t.Errorf("a reversed scan with the ends the forward way round gave %v", backwards)
+		t.Errorf("From above To gave %v, want empty", backwards)
+	}
+	forwardBackwards := keysOf(scan(t, collection, "by_slug", Range{
+		From: &Bound{Values: []any{"s4"}},
+		To:   &Bound{Values: []any{"s1"}},
+	}))
+	if len(forwardBackwards) != 0 {
+		t.Errorf("From above To gave %v forward too, want empty", forwardBackwards)
 	}
 }
 
@@ -185,11 +199,14 @@ func TestReversingTheClusteredWalkGivesTheKeysBackwards(t *testing.T) {
 	// On the clustered index a bound can land exactly on a stored key, because
 	// the key of a document is the whole of its index entry and nothing is
 	// appended after it. So this is the one walk where the inclusive end being
-	// off by one entry is visible, and a1 is the entry it would lose.
+	// off by one entry is visible, and a1 is the entry it would lose. From is
+	// still the low end (a1) and To the high end (a4) even though the walk is
+	// reversed — it is the same declaration TestReverseReadsTheSameStretch...
+	// checks on by_slug, checked again here on the clustered index.
 	var bounded []string
 	if err := collection.walkRange(Range{
-		From:      &Bound{Values: []any{"a4"}},
-		To:        &Bound{Values: []any{"a1"}},
+		From:      &Bound{Values: []any{"a1"}},
+		To:        &Bound{Values: []any{"a4"}},
 		Direction: Reverse,
 	}, func(key any, _ map[string]any) bool {
 		bounded = append(bounded, fmt.Sprint(key))
@@ -198,7 +215,7 @@ func TestReversingTheClusteredWalkGivesTheKeysBackwards(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fmt.Sprint(bounded) != fmt.Sprint([]string{"a4", "a3", "a2", "a1"}) {
-		t.Errorf("reversed from a4 down to a1 gave %v", bounded)
+		t.Errorf("reversed over a1..a4 gave %v", bounded)
 	}
 }
 
@@ -221,7 +238,7 @@ func TestALimitStopsAScanFromEitherEnd(t *testing.T) {
 	}
 
 	reverse := invoke(t, store, "articles.slugs", map[string]any{
-		"from": "s5", "to": "s0", "direction": DirectionReverse,
+		"from": "s0", "to": "s5", "direction": DirectionReverse,
 	})
 	if got := slugsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s5", "s4", "s3"}) {
 		t.Errorf("reverse gave %v", got)
@@ -230,7 +247,9 @@ func TestALimitStopsAScanFromEitherEnd(t *testing.T) {
 		t.Error("the reversed scan stopped at its limit and did not say so")
 	}
 
-	// A stretch that fits says so, both ways round.
+	// A stretch that fits says so, both ways round. From is still the low
+	// end and To still the high end for the reverse call — nothing about
+	// the bounds changes, only the read order.
 	short := invoke(t, store, "articles.slugs", map[string]any{
 		"from": "s1", "to": "s3", "direction": DirectionForward,
 	})
@@ -238,18 +257,26 @@ func TestALimitStopsAScanFromEitherEnd(t *testing.T) {
 		t.Errorf("forward over three rows: %d rows, truncated=%v", short.Count, short.Truncated)
 	}
 	short = invoke(t, store, "articles.slugs", map[string]any{
-		"from": "s3", "to": "s1", "direction": DirectionReverse,
+		"from": "s1", "to": "s3", "direction": DirectionReverse,
 	})
 	if short.Count != 3 || short.Truncated {
 		t.Errorf("reverse over three rows: %d rows, truncated=%v", short.Count, short.Truncated)
 	}
 }
 
-// TestADirectionReachesNothingTheForwardScanCouldNot: the constraint the whole
-// design rests on. A direction is allowed to be an argument only because it
-// widens nothing — same index, same two declared ends, same limit — and an
-// argument that widened a scan would be the one thing declared operations exist
-// to make impossible.
+// TestADirectionReachesNothingTheForwardScanCouldNot: a direction is allowed
+// to be an argument only because it widens nothing — same index, same two
+// declared ends, same limit — and an argument that widened a scan would be
+// the one thing declared operations exist to make impossible.
+//
+// Rounds one through three called this "the constraint the whole design
+// rests on", and it was true only of this one shape — both ends arguments —
+// which is exactly the shape where the swap those rounds kept could never go
+// wrong. Round four makes the same claim of every shape a bound can be
+// written in, not by widening this test but by removing what made it narrow:
+// see TestTheTwoBoundsNeverDependOnDirection (direction_v4_test.go) for the
+// general proof, and reach_test.go for the row-level version of it. This test
+// stays as the smallest, most direct case.
 func TestADirectionReachesNothingTheForwardScanCouldNot(t *testing.T) {
 	store, collection := declared(t, 125)
 	fill(t, collection)
@@ -259,7 +286,7 @@ func TestADirectionReachesNothingTheForwardScanCouldNot(t *testing.T) {
 		"from": "s1", "to": "s3", "direction": DirectionForward,
 	})
 	reverse := invoke(t, store, "articles.slugs", map[string]any{
-		"from": "s3", "to": "s1", "direction": DirectionReverse,
+		"from": "s1", "to": "s3", "direction": DirectionReverse,
 	})
 
 	seen := map[string]int{}
@@ -305,14 +332,16 @@ func TestADirectionCanBeFixedInTheDeclaration(t *testing.T) {
 	fixed.Direction = &Term{Value: DirectionReverse}
 	declareOp(t, store, fixed)
 
-	result := invoke(t, store, "articles.newest", map[string]any{"from": "s5", "to": "s0"})
+	// From is still the low end and To the high end even though the
+	// declaration always reads backwards.
+	result := invoke(t, store, "articles.newest", map[string]any{"from": "s0", "to": "s5"})
 	if got := slugsOf(result.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s5", "s4", "s3"}) {
 		t.Errorf("a declaration fixed at reverse gave %v", got)
 	}
 
 	// And a caller cannot pass one, because the operation does not take one.
 	if _, err := store.Invoke(Caller{}, "articles.newest", 0, map[string]any{
-		"from": "s5", "to": "s0", "direction": DirectionForward,
+		"from": "s0", "to": "s5", "direction": DirectionForward,
 	}); !errors.Is(err, ErrArgument) {
 		t.Errorf("want ErrArgument, got %v", err)
 	}
@@ -545,26 +574,25 @@ func idsOf(rows []map[string]any) []string {
 	return out
 }
 
-// TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling: a constant
-// written into a bound is the one thing about a stretch a caller cannot move.
-// It is how a declaration pins a floor, or a tenant, and hands the rest of the
+// TestAConstantAtOneEndDeclaresAndReadsOneStretchBothWays: a constant written
+// into a bound is the one thing about a stretch a caller cannot move. It is
+// how a declaration pins a floor, or a tenant, and hands the rest of the
 // range over to the call.
 //
-// Reversing swaps which end of the stretch is the floor. So a constant written
-// at one end only stops being a floor the moment the caller says "reverse", and
-// the rows underneath it — rows no forward call of that same declaration can
-// reach, whatever it passes — come back. That is precisely the widening this
-// design claims not to do, so it is refused where it is written.
-//
-// What still passes is a constant that says the same thing from both ends:
-// pinned at the same position, with the same value. Then it confines the
-// stretch whichever way the walk enters it.
-func TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling(t *testing.T) {
+// Rounds one through three refused a constant written at one end only,
+// beside a caller-chosen direction — reasoning that reversing swapped which
+// end of the stretch was the floor, so the constant stopped being one the
+// moment the caller said "reverse". That reasoning does not apply any more:
+// nothing swaps. From is the low end and To is the high end regardless of
+// Direction, so a constant at either end is a floor (or a ceiling) no matter
+// which way the walk is read, exactly the way it already was for a fixed
+// direction. There is nothing left here to refuse.
+func TestAConstantAtOneEndDeclaresAndReadsOneStretchBothWays(t *testing.T) {
 	store, collection := declared(t, 128)
 	fill(t, collection)
 
-	// The shape that used to reach below its own floor: forward this can never
-	// go under s3, and reversed with to=s0 it came back s3 s2 s1 s0.
+	// The shape round one refused outright: a constant floor at From, an
+	// argument at To.
 	floored := eitherWay()
 	floored.Name = "articles.floored"
 	floored.Input = []Parameter{
@@ -573,49 +601,36 @@ func TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling(t *testing.T) 
 	}
 	floored.From = &Endpoint{Terms: []Term{{Value: "s3"}}}
 	floored.To = &Endpoint{Terms: []Term{{Arg: "to"}}}
-	if _, err := store.DeclareOperation(floored); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a constant floor under a caller-chosen direction: want ErrDeclaration, got %v", err)
+	declareOp(t, store, floored)
+
+	forward := invoke(t, store, "articles.floored", map[string]any{"to": "s5", "direction": DirectionForward})
+	if got := slugsOf(forward.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s3", "s4", "s5"}) {
+		t.Errorf("forward from the constant floor s3 up to s5 gave %v", got)
+	}
+	reverse := invoke(t, store, "articles.floored", map[string]any{"to": "s5", "direction": DirectionReverse})
+	if got := slugsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"s5", "s4", "s3"}) {
+		t.Errorf("reverse over the same declared stretch gave %v", got)
 	}
 
-	// The same thing the other way round, and the case where the other end is
-	// not written at all: an absent end is the whole rest of the index, so the
-	// constant is still the only limit and reversing still steps over it.
+	// The mirror, and the case where the other end is not written at all: an
+	// absent end is the whole rest of the index, same as it always was.
 	ceilinged := floored
 	ceilinged.Name = "articles.ceilinged"
 	ceilinged.From = &Endpoint{Terms: []Term{{Arg: "to"}}}
 	ceilinged.To = &Endpoint{Terms: []Term{{Value: "s3"}}}
-	if _, err := store.DeclareOperation(ceilinged); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a constant ceiling under a caller-chosen direction: want ErrDeclaration, got %v", err)
-	}
+	declareOp(t, store, ceilinged)
 
 	lonely := floored
 	lonely.Name = "articles.lonely"
 	lonely.From = nil
 	lonely.To = &Endpoint{Terms: []Term{{Value: "s3"}}}
-	if _, err := store.DeclareOperation(lonely); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a constant against an absent end: want ErrDeclaration, got %v", err)
-	}
+	declareOp(t, store, lonely)
 
 	// A constant does not have to be the FIRST value of a bound. by_author is
 	// (author ascending, published descending), so pinning the author as an
 	// argument and the published date as a constant leaves the constant at
-	// position two — and it is a floor there exactly as it would be at
-	// position one. Measured before it was refused: forward from (ann, 3)
-	// reaches a2 and a1, reversed it reaches a5 and a4, and no forward call
-	// can reach those two whatever it passes for the author.
-	forward := keysOf(scan(t, collection, "by_author", Range{
-		From: &Bound{Values: []any{"ann", 3.0}},
-		To:   &Bound{Values: []any{"ann"}},
-	}))
-	reverse := keysOf(scan(t, collection, "by_author", Range{
-		From:      &Bound{Values: []any{"ann", 3.0}},
-		To:        &Bound{Values: []any{"ann"}},
-		Direction: Reverse,
-	}))
-	if fmt.Sprint(forward) == fmt.Sprint(reverse) {
-		t.Fatalf("this case is supposed to differ by direction, and both gave %v", forward)
-	}
-
+	// position two — and it now reads one stretch both ways there exactly as
+	// it does at position one.
 	deep := Operation{
 		Name:       "articles.deep_floor",
 		Collection: "articles",
@@ -631,18 +646,30 @@ func TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling(t *testing.T) 
 		Projection: []string{"id"},
 		Limit:      10,
 	}
-	if _, err := store.DeclareOperation(deep); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a constant at the second bound value: want ErrDeclaration, got %v", err)
+	declareOp(t, store, deep)
+
+	// by_author is (author ascending, published descending); the constant
+	// 3.0 at the second position of From means "published <= 3", so ann's
+	// rows with published 1 and 2 (a1, a2) are the ones this reaches.
+	deepForward := invoke(t, store, "articles.deep_floor", map[string]any{"author": "ann", "direction": DirectionForward})
+	if got := idsOf(deepForward.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a2", "a1"}) {
+		t.Errorf("forward with a constant at the second bound value gave %v", got)
+	}
+	deepReverse := invoke(t, store, "articles.deep_floor", map[string]any{"author": "ann", "direction": DirectionReverse})
+	if got := idsOf(deepReverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a1", "a2"}) {
+		t.Errorf("reverse over the same declared stretch gave %v", got)
 	}
 
-	// And the same declaration with the constant matched at both ends is fine,
-	// because then it pins rather than floors.
+	// And the same declaration with the constant matched at both ends still
+	// pins rather than floors, as it did before this round — round two's
+	// mệnh đề 1, which this round keeps.
 	deep.Name = "articles.deep_pin"
 	deep.To = &Endpoint{Terms: []Term{{Arg: "author"}, {Value: 3.0}}}
 	declareOp(t, store, deep)
 
 	// A direction the declaration fixes is nobody's choice but the schema
-	// author's, so a constant bound beside it is theirs to write.
+	// author's, so a constant bound beside it is theirs to write — unchanged
+	// by this round.
 	fixed := floored
 	fixed.Name = "articles.fixed_floor"
 	fixed.Input = []Parameter{{Name: "to", Type: TypeString, Required: true}}
@@ -650,12 +677,13 @@ func TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling(t *testing.T) 
 	declareOp(t, store, fixed)
 }
 
-// TestAPinnedConstantSurvivesBeingReadFromEitherEnd: the case the refusal above
-// must not take with it. "One author, newest first or oldest first" pins the
-// author with a constant at BOTH ends, which is what scanAcross already makes
-// every partitioned scan do. The pin holds whichever way the walk enters, so
-// the two directions see one set of rows and the claim that a direction widens
-// nothing is true of this declaration.
+// TestAPinnedConstantSurvivesBeingReadFromEitherEnd: "one author, newest
+// first or oldest first" pins the author with a constant at BOTH ends, which
+// is what scanAcross already makes every partitioned scan do. The pin holds
+// whichever way the walk enters, so the two directions see one set of rows —
+// true of this declaration before round four as well as after, and kept here
+// as a fixed point while TestAConstantAtOneEndDeclaresAndReadsOneStretch...
+// above covers the shape that used to be refused beside it.
 func TestAPinnedConstantSurvivesBeingReadFromEitherEnd(t *testing.T) {
 	store, collection := declared(t, 129)
 	fill(t, collection)

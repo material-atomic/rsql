@@ -5,68 +5,79 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 )
 
 // This file exists to break one sentence: "a direction widens nothing" — the
 // set of rows a declaration can hand back is the same whichever direction the
 // caller picks.
 //
-// The round before this one had a test by that name. It declared both ends as
-// arguments, which is the one shape where the sentence is easy to keep, and the
-// name bought confidence for every other shape. A constant at one end walked
-// straight through it.
+// Rounds one through three tried to keep that sentence true while From and To
+// swapped which one was the walk's upper end depending on Direction, and
+// refused whichever shape of declaration that swap made unsafe: a constant at
+// one end (round one), the two ends disagreeing about Exclusive (round two),
+// the two ends written at different widths (round three, caught by the
+// Reviewer, not by this file — reachShapes writes one term per end and never
+// exercised width). Round four removed the swap instead of refusing a fourth
+// shape.
 //
-// So nothing here picks a shape. It enumerates the shapes a bound can be
-// written in, crossed with itself, and for each one enumerates every value a
-// caller could pass, and compares the two reachable sets row for row. Then it
-// asserts the sharper thing: a shape is accepted at declaration time IF AND
-// ONLY IF the two sets come out equal. A refusal that is not earned fails this
-// as loudly as a widening that is not refused.
+// So this file no longer has an accepted/refused axis. Every shape below
+// declares without error now, because there is no rule left in checkDirection
+// to refuse any of them for. What is left to check is sharper than "declared
+// or not": for every pair of argument values, the forward call and the
+// reverse call of the SAME declaration must (a) both match an oracle computed
+// straight off the fixture rows, by ordinary Go comparisons rather than
+// through bound() or walk(), and (b) be exactly each other's rows backwards —
+// not merely the same set, the same order reversed, which is the one thing
+// Direction is allowed to change.
 //
-// The measurement is at the Collection, not through Invoke, because half the
-// shapes are ones the store now refuses and they still have to be measured.
+// The list of shapes stayed, even with the rule gone that used to refuse some
+// of them: they are still a useful cross-section of ways a bound gets
+// written, and TestTheTwoBoundsNeverDependOnDirection (direction_v4_test.go)
+// reuses this exact list for a second, independent check at the byte level.
 //
 // This round found the enumeration itself had a hole: the DOMAIN a caller's
 // argument may range over had "" in it, but no actual ROW ever carried "".
 // Crossing an argument domain against itself only ever sees what a caller
-// could pass; it says nothing about what is stored, and the leak in mục 1 is
-// about a row sitting at the floor of the index's own byte encoding, not
-// about "" as a value somebody happened to type. So the fixture now carries a
-// row at that floor (fillWithFloor, below) and the assertions compare against
-// it directly, not through the domain. QA's mutate27.py measured this by
+// could pass; it says nothing about what is stored, and round three's leak
+// was about a row sitting at the floor of the index's own byte encoding, not
+// about "" as a value somebody happened to type. So the fixture carries a row
+// at that floor (fillWithFloor, below) and the assertions compare against it
+// directly, not through the domain. QA's mutate27.py measured this by
 // removing "" from the domain and watching the harness report MORE leaking
-// shapes, not fewer — "" in the domain, with no row there to find, was
-// quietly absorbing calls that would otherwise land past every row and come
-// back empty either way, which reads as "the two directions agree" even
-// though neither direction reached anything.
+// shapes, not fewer, back when there was still something to leak — "" in the
+// domain, with no row there to find, was quietly absorbing calls that would
+// otherwise land past every row and come back empty either way, which reads
+// as "the two directions agree" even though neither direction reached
+// anything.
 //
 // Two things this file measures and does NOT decide are written down here
 // once rather than at every place they would otherwise look unexamined:
 //
 //   - Optional arguments with no default are the one shape checkDirection
-//     already refuses outright (see TestADirectionThatCannotBeWorkedOutIs...
-//     in direction_test.go), so a bound that could fall away at call time
-//     never reaches boundsSurviveReversal. That is a real hole in what "a
-//     direction widens nothing" covers — the measurement here runs at the
-//     Collection, past every argument as Required — but it is task 0016's
-//     hole, not this one's: QA checked by hand that it does not leak on
-//     reachability (both directions' unions equal the whole index), and nothing
-//     in this round makes that hole any different.
-//   - Limit is not part of what "reaches" measures. declareReach writes
+//     still refuses outright (see TestADirectionThatCannotBeWorkedOutIs...
+//     in direction_test.go) — a bound whose argument is optional can fall
+//     away entirely at call time, which is task 0016's hole, not this file's.
+//     QA checked by hand that it does not leak on reachability even so (both
+//     directions' unions equal the whole index), and nothing in this round
+//     changes that.
+//   - Limit is not part of what this file measures. declareReach writes
 //     Limit: 50 because a scan must declare one to be valid at all, and
 //     TestALimitStopsAScanFromEitherEnd (direction_test.go) already measures
-//     that it cuts both directions the same way. It is decoration here, not a
-//     bound reaches() applies.
+//     that it cuts both directions the same way. TestALimitCanHandBack...
+//     (direction_v4_test.go) measures the one thing Limit is allowed to do
+//     that a bound is not: hand back different rows from either end of the
+//     SAME stretch. Neither is a bound this file's oracle applies.
 //
 // Composite bounds (more than one term at an end) and a Term{Step: ...} at a
-// bound are outside reachShapes on purpose: reachShapes writes exactly one
-// term per end, so the whole composite column of the shape table is measured
-// instead by TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup and
-// by direction_test.go's TestTheEndsOfARangeSwapWhenTheScanIsReversed, and a
-// Step term at a scan bound is refused by check() before boundsSurviveReversal
-// is ever called (QA measured this; see mục 1 of the round 3 task). Widening
-// reachShapes to write several terms per end is a task of its own if anyone
-// needs it measured this way instead.
+// bound are outside reachShapes on purpose: it writes exactly one term per
+// end, and its oracle only knows how to check a bound that shape against real
+// rows. The composite column is measured instead by
+// TestTheTwoBoundsNeverDependOnDirection and TestByAuthorFloorRowReadsOne...
+// (direction_v4_test.go), and a Step term at a scan bound is refused by
+// check() before it is ever compared to anything (QA measured this in round
+// three). Widening reachShapes to write several terms per end is a task of
+// its own if anyone needs it measured this way instead.
 
 // reachEnd is one end of a stretch as a declaration may write it: a constant
 // nobody can move, an argument the caller fills in, or nothing at all.
@@ -112,14 +123,13 @@ type reachShape struct {
 	what string
 	from reachEnd
 	to   reachEnd
-	why  string
 
 	// pairedArgument is true when From and To name the SAME argument. Invoke
 	// has exactly one slot for that name, so a real call can never give the
 	// two ends different values — crossing a domain against itself for both
 	// ends independently would manufacture a call nobody could make and
-	// measure a shape that does not exist. reaches() reads this to walk the
-	// domain once instead of crossing it with itself.
+	// measure a shape that does not exist. checkShape() reads this to walk
+	// the domain once instead of crossing it with itself.
 	pairedArgument bool
 }
 
@@ -173,21 +183,15 @@ func rowsOf(t *testing.T, collection *Collection, index string) []reachRow {
 // comparisons and never through bound() or walk() — so a bug shared between
 // the code and the check cannot cancel itself out. It is only asked to be
 // correct for a bound written as one term on a string field in ascending
-// order, which is exactly what reachShapes writes and reaches measures; see
-// the file comment above for what that leaves out and where that is measured
-// instead.
-func expectedReach(rows []reachRow, shape reachShape, argFrom, argTo string, direction Direction) map[string]bool {
-	// walk() treats From as where the walk starts and To as where it ends,
-	// and swaps that when the direction is reversed. "The low end" here means
-	// exactly that: whichever of shape.from/shape.to plays From in the
-	// direction being measured, and whichever argument value the caller gave
-	// that end.
-	lowEnd, lowValue := shape.from, argFrom
-	highEnd, highValue := shape.to, argTo
-	if direction == Reverse {
-		lowEnd, lowValue = shape.to, argTo
-		highEnd, highValue = shape.from, argFrom
-	}
+// order, which is exactly what reachShapes writes and checkShape measures;
+// see the file comment above for what that leaves out and where that is
+// measured instead.
+//
+// There is no Direction parameter any more. shape.from is always the low end
+// and shape.to is always the high end — that is round four's whole point,
+// and this oracle says so by construction rather than by asserting it: the
+// same two lines compute what forward and reverse both have to match.
+func expectedReach(rows []reachRow, shape reachShape, argFrom, argTo string) map[string]bool {
 	value := func(end reachEnd, argValue string) string {
 		if end.constant {
 			return end.fixed
@@ -197,9 +201,9 @@ func expectedReach(rows []reachRow, shape reachShape, argFrom, argTo string, dir
 
 	seen := map[string]bool{}
 	for _, row := range rows {
-		if lowEnd.written() {
-			v := value(lowEnd, lowValue)
-			if lowEnd.exclusive {
+		if shape.from.written() {
+			v := value(shape.from, argFrom)
+			if shape.from.exclusive {
 				if row.value <= v {
 					continue
 				}
@@ -207,9 +211,9 @@ func expectedReach(rows []reachRow, shape reachShape, argFrom, argTo string, dir
 				continue
 			}
 		}
-		if highEnd.written() {
-			v := value(highEnd, highValue)
-			if highEnd.exclusive {
+		if shape.to.written() {
+			v := value(shape.to, argTo)
+			if shape.to.exclusive {
 				if row.value >= v {
 					continue
 				}
@@ -222,18 +226,41 @@ func expectedReach(rows []reachRow, shape reachShape, argFrom, argTo string, dir
 	return seen
 }
 
-// reaches is every row this pair of ends can put in front of a caller walking
-// the index that way, over every pair of values the caller could pass. Each
-// individual call is also checked against expectedReach — the oracle — before
-// its rows are folded into the union this function returns, because the union
-// alone absorbs a single call's off-by-one into rows some other call already
-// contributed. See TestAnExclusiveEndIsOutsideTheStretchWhicheverWayTheWalkEnters
-// in direction_qa2_test.go for the mutation that survived exactly that hole.
-func reaches(t *testing.T, collection *Collection, index string, shape reachShape,
-	domain []string, rows []reachRow, direction Direction) map[string]bool {
+// reversedList is the list backwards, for comparing a reverse call's rows
+// against a forward call's rows exactly — not merely as sets, which would
+// miss the one thing Direction is allowed to change.
+func reversedList(list []string) []string {
+	out := make([]string, len(list))
+	for i, v := range list {
+		out[len(list)-1-i] = v
+	}
+	return out
+}
+
+// checkShape walks a shape's declaration over every pair of argument values
+// the domain allows, both directions, and checks three things per pair:
+//
+//   - the forward call's rows match expectedReach, the oracle computed
+//     straight off the fixture;
+//   - the reverse call's rows match the SAME oracle — not a swapped one,
+//     because From and To no longer swap;
+//   - the reverse call's rows are exactly the forward call's rows backwards,
+//     which is the one thing Direction is allowed to change and the thing
+//     the two bullets above do not, on their own, pin down (they would both
+//     hold if a mutation reordered rows within a call without touching which
+//     rows there were).
+//
+// It replaces round three's reaches(), which unioned every call's rows
+// across the whole domain before comparing directions — a union that
+// absorbed a single call's off-by-one into rows some other call already
+// contributed. See TestAnExclusiveEndIsOutsideTheStretchWhicheverWayTheWalk
+// Enters in direction_qa2_test.go for the mutation that survived exactly that
+// hole; checking every call on its own, forward and reverse both, is why this
+// version does not need that test's help to catch it.
+func checkShape(t *testing.T, collection *Collection, index string, shape reachShape,
+	domain []string, rows []reachRow) {
 
 	t.Helper()
-	seen := map[string]bool{}
 
 	type argPair struct{ low, high string }
 	var pairs []argPair
@@ -256,49 +283,62 @@ func reaches(t *testing.T, collection *Collection, index string, shape reachShap
 		}
 	}
 
-	for _, p := range pairs {
-		within := Range{
-			From:      shape.from.bound(p.low),
-			To:        shape.to.bound(p.high),
-			Direction: direction,
-		}
-		call := map[string]bool{}
+	walk := func(direction Direction, low, high string) []string {
+		within := Range{From: shape.from.bound(low), To: shape.to.bound(high), Direction: direction}
+		var got []string
 		var err error
 		if index == ClusteredIndex {
 			// The clustered walk is the documents themselves, and it is a
 			// different call: walkRange rather than Scan. It is in here
-			// because it is the only walk whose bounds can land exactly on
-			// a stored key.
+			// because it is the only walk whose bounds can land exactly on a
+			// stored key.
 			err = collection.walkRange(within, func(key any, _ map[string]any) bool {
-				call[fmt.Sprint(key)] = true
+				got = append(got, fmt.Sprint(key))
 				return true
 			})
 		} else {
 			err = collection.Scan(index, within, func(one Found) bool {
-				// Grouped by the row (its primary key), not by the value the
-				// index stores for it. Two documents sharing an indexed value
-				// are two rows; grouping by the value would let a widened
-				// scan that only picks up a second document with a value
-				// already in the set read as "reached nothing new".
-				call[fmt.Sprint(one.Key)] = true
+				// Identified by the row (its primary key), not by the value
+				// the index stores for it. Two documents sharing an indexed
+				// value are two rows; grouping by the value would let a
+				// widened scan that only picks up a second document with a
+				// value already seen read as "reached nothing new".
+				got = append(got, fmt.Sprint(one.Key))
 				return true
 			})
 		}
 		if err != nil {
-			t.Fatalf("%s at %q/%q: %v", shape.what, p.low, p.high, err)
+			t.Fatalf("%s %v at %q/%q: %v", shape.what, direction, low, high, err)
 		}
+		return got
+	}
 
-		want := expectedReach(rows, shape, p.low, p.high, direction)
-		if sorted(call) != sorted(want) {
-			t.Errorf("%s %v at %q/%q: the walk gave %v, the oracle says %v",
-				shape.what, direction, p.low, p.high, sorted(call), sorted(want))
+	asSet := func(list []string) map[string]bool {
+		set := make(map[string]bool, len(list))
+		for _, k := range list {
+			set[k] = true
 		}
+		return set
+	}
 
-		for key := range call {
-			seen[key] = true
+	for _, p := range pairs {
+		forward := walk(Forward, p.low, p.high)
+		reverse := walk(Reverse, p.low, p.high)
+		want := expectedReach(rows, shape, p.low, p.high)
+
+		if sorted(asSet(forward)) != sorted(want) {
+			t.Errorf("%s forward at %q/%q: the walk gave %v, the oracle says %v",
+				shape.what, p.low, p.high, sorted(asSet(forward)), sorted(want))
+		}
+		if sorted(asSet(reverse)) != sorted(want) {
+			t.Errorf("%s reverse at %q/%q: the walk gave %v, the oracle says %v",
+				shape.what, p.low, p.high, sorted(asSet(reverse)), sorted(want))
+		}
+		if fmt.Sprint(reverse) != fmt.Sprint(reversedList(forward)) {
+			t.Errorf("%s at %q/%q: reverse %v is not forward %v backwards",
+				shape.what, p.low, p.high, reverse, forward)
 		}
 	}
-	return seen
 }
 
 // declareReach writes the shape down as a real operation with the direction as
@@ -329,71 +369,59 @@ func declareReach(store *Store, name, index string, shape reachShape) error {
 }
 
 // reachShapes is every way a bound can be written, crossed with itself. The
-// list is the point: leaving a shape out is how the last round's hole
+// list is the point: leaving a shape out is how earlier rounds' holes
 // survived, and the count is asserted where this is used so that trimming the
 // list is itself a failure.
 //
-// The first 13 are the round-two list, unchanged. The last 7 close the gaps
-// round two's own QA found: both ends exclusive, an exclusive argument against
-// an unwritten end (and its mirror), the same argument named at both ends, and
-// the same-terms exception applied to an argument pair as well as a constant
-// pair with Exclusive on the other side and on both sides.
+// None of these are refused any more — that is round four's change — so the
+// list is no longer split between shapes that leaked and shapes that did
+// not. It stays as a cross-section of ways a bound gets written (an
+// argument, a constant, absent, exclusive, paired with itself) because
+// checkShape still has to be right for all of them, and because
+// TestTheTwoBoundsNeverDependOnDirection (direction_v4_test.go) reuses this
+// exact list for the byte-level version of the same check.
 func reachShapes(pin string) []reachShape {
 	lo, hi := anArgument("lo"), anArgument("hi")
 	return []reachShape{
-		{what: "both ends arguments", from: lo, to: hi,
-			why: "reversing only swaps which end each value the caller passes is"},
-		{what: "both ends arguments, From exclusive", from: butExclusive(lo), to: hi,
-			why: "an exclusive end the caller controls can always be stepped past from the other side"},
-		{what: "both ends arguments, To exclusive", from: lo, to: butExclusive(hi),
-			why: "the mirror of the one above"},
-		{what: "an argument at From, nothing at To", from: lo, to: nothing(),
-			why: "an absent end is the rest of the index, so each direction covers what the other leaves"},
-		{what: "nothing at From, an argument at To", from: nothing(), to: hi,
-			why: "the mirror of the one above"},
-		{what: "neither end written", from: nothing(), to: nothing(),
-			why: "the whole index either way"},
-		{what: "the same constant at both ends", from: aConstant(pin), to: aConstant(pin),
-			why: "a pin confines the stretch whichever way the walk enters it"},
-		{what: "the same constant at both ends, From exclusive", from: butExclusive(aConstant(pin)), to: aConstant(pin),
-			why: "still a pin, and an empty one in both directions"},
-		{what: "a constant at From, an argument at To", from: aConstant(pin), to: hi,
-			why: "the floor the constant pins becomes a ceiling, and everything under it comes back"},
-		{what: "an argument at From, a constant at To", from: lo, to: aConstant(pin),
-			why: "the mirror: the ceiling becomes a floor"},
-		{what: "a constant at From, nothing at To", from: aConstant(pin), to: nothing(),
-			why: "forward runs from the constant to the end of the index, reverse from it to the start"},
-		{what: "nothing at From, a constant at To", from: nothing(), to: aConstant(pin),
-			why: "the mirror of the one above"},
-		{what: "constants at both ends, different values", from: aConstant(pin), to: aConstant(pin + "x"),
-			why: "one direction is the whole stretch and the other is empty"},
+		{what: "both ends arguments", from: lo, to: hi},
+		{what: "both ends arguments, From exclusive", from: butExclusive(lo), to: hi},
+		{what: "both ends arguments, To exclusive", from: lo, to: butExclusive(hi)},
+		{what: "an argument at From, nothing at To", from: lo, to: nothing()},
+		{what: "nothing at From, an argument at To", from: nothing(), to: hi},
+		{what: "neither end written", from: nothing(), to: nothing()},
+		{what: "the same constant at both ends", from: aConstant(pin), to: aConstant(pin)},
+		{what: "the same constant at both ends, From exclusive", from: butExclusive(aConstant(pin)), to: aConstant(pin)},
+		{what: "a constant at From, an argument at To", from: aConstant(pin), to: hi},
+		{what: "an argument at From, a constant at To", from: lo, to: aConstant(pin)},
+		{what: "a constant at From, nothing at To", from: aConstant(pin), to: nothing()},
+		{what: "nothing at From, a constant at To", from: nothing(), to: aConstant(pin)},
+		{what: "constants at both ends, different values", from: aConstant(pin), to: aConstant(pin + "x")},
 
 		// Round 3's additions.
-		{what: "both ends arguments, both exclusive", from: butExclusive(lo), to: butExclusive(hi),
-			why: "each end is still something the caller chose, whichever end it lands on after a reversal"},
-		{what: "an argument at From exclusive, nothing at To", from: butExclusive(lo), to: nothing(),
-			why: "forward can never step past the floor from below it; reversed, the same declaration starts AT the floor and includes it — the two directions disagree about the one row furthest down"},
-		{what: "nothing at From, an argument at To exclusive", from: nothing(), to: butExclusive(hi),
-			why: "the mirror of the one above"},
+		{what: "both ends arguments, both exclusive", from: butExclusive(lo), to: butExclusive(hi)},
+		{what: "an argument at From exclusive, nothing at To", from: butExclusive(lo), to: nothing()},
+		{what: "nothing at From, an argument at To exclusive", from: nothing(), to: butExclusive(hi)},
 		{what: "the same argument at both ends", from: anArgument("lo"), to: anArgument("lo"),
-			why:            "one value, asked for once, is the same stretch from either end",
 			pairedArgument: true},
 		{what: "the same argument at both ends, From exclusive", from: butExclusive(anArgument("lo")), to: anArgument("lo"),
-			why:            "an open point is empty from either side, which is the exception that keeps a half-open keyset cursor declarable",
 			pairedArgument: true},
-		{what: "the same constant at both ends, To exclusive", from: aConstant(pin), to: butExclusive(aConstant(pin)),
-			why: "still a pin, empty in both directions — the mirror of the From-exclusive pin above"},
-		{what: "the same constant at both ends, both exclusive", from: butExclusive(aConstant(pin)), to: butExclusive(aConstant(pin)),
-			why: "a pin open on both sides of itself is still empty either way"},
+		{what: "the same constant at both ends, To exclusive", from: aConstant(pin), to: butExclusive(aConstant(pin))},
+		{what: "the same constant at both ends, both exclusive", from: butExclusive(aConstant(pin)), to: butExclusive(aConstant(pin))},
 	}
 }
 
-// TestNoShapeOfDeclarationLetsADirectionWidenWhatAScanCanReach runs the whole
-// cross-product against a secondary index and against the clustered one, which
-// is the only index where a bound can land exactly on a real key: every entry
-// of a secondary index carries the primary key on its tail, so a bound on the
-// declared fields alone never equals one.
-func TestNoShapeOfDeclarationLetsADirectionWidenWhatAScanCanReach(t *testing.T) {
+// TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays runs the
+// whole list of shapes against a secondary index and against the clustered
+// one, which is the only index where a bound can land exactly on a real key:
+// every entry of a secondary index carries the primary key on its tail, so a
+// bound on the declared fields alone never equals one.
+//
+// Round three's version of this test had an accepted/refused axis: a shape
+// was right to declare exactly when its forward and reverse reachable sets
+// came out equal, and wrong otherwise. There is no such axis now — nothing
+// here is refused for its direction — so what is left is checkShape's three
+// per-call checks (see its doc comment), run for every shape on the list.
+func TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays(t *testing.T) {
 	for _, over := range []struct {
 		index  string
 		pin    string
@@ -427,25 +455,12 @@ func TestNoShapeOfDeclarationLetsADirectionWidenWhatAScanCanReach(t *testing.T) 
 			rows := rowsOf(t, collection, over.index)
 
 			for i, shape := range shapes {
-				forward := reaches(t, collection, over.index, shape, over.domain, rows, Forward)
-				reverse := reaches(t, collection, over.index, shape, over.domain, rows, Reverse)
-				same := sorted(forward) == sorted(reverse)
-
 				name := fmt.Sprintf("reach.%s.%d", over.index, i)
-				err := declareReach(store, name, over.index, shape)
-				accepted := err == nil
-				if !accepted && !errors.Is(err, ErrDeclaration) {
-					t.Fatalf("%s: %q was refused for the wrong reason: %v", over.index, shape.what, err)
+				if err := declareReach(store, name, over.index, shape); err != nil {
+					t.Errorf("%s: %q was refused: %v — no shape of declaration is refused for its direction any more",
+						over.index, shape.what, err)
 				}
-
-				// The whole assertion, both ways round. A shape that widens and
-				// is allowed is the regression this round fixed. A shape that
-				// does not widen and is refused is a feature taken away for
-				// nothing, which is just as wrong and much quieter.
-				if accepted != same {
-					t.Errorf("%s: %q — reachable forward %v, reachable reversed %v, declaration accepted=%v (%s)",
-						over.index, shape.what, sorted(forward), sorted(reverse), accepted, shape.why)
-				}
+				checkShape(t, collection, over.index, shape, over.domain, rows)
 			}
 		})
 	}
@@ -471,26 +486,29 @@ func fillWithFloor(t *testing.T, collection *Collection) {
 }
 
 // A mutation that deletes the `put` call above and leaves fill() alone is not
-// caught by TestNoShapeOfDeclarationLetsADirectionWidenWhatAScanCanReach on
-// its own: measured mutate3.py, disabling mệnh đề 2 with that call removed
-// reports zero leaking shapes from this test — this file's own harness goes
-// back to exactly round 2's blind spot. It is caught at the package level,
-// by TestAnExclusiveEndAloneIsRefusedAtDeclarationNotJustMeasured and
-// TestByAuthorMissingPublishedSitsAtTheFloorOfItsAuthorsGroup in
-// direction_v3_test.go, which build their own fixtures and do not call this
-// function — so the redundancy is real, not assumed. Documented here rather
-// than "fixed" further because the fix IS this function; the failure mode is
-// "someone deletes the one line that matters", and the next paragraph of
-// defence against that is a second, independently-fixtured test, which
-// already exists.
+// caught by this file's own tests: checkShape's oracle is computed from
+// whichever rows actually exist, so removing the floor row from the fixture
+// removes it from the oracle too, and every assertion stays consistent with
+// itself. That was round two's blind spot, measured by round three's QA, and
+// it still exists here on purpose — this fixture is not the only place the
+// floor row is exercised. TestByAuthorFloorRowReadsOneStretchBothWays and
+// TestTheTwoBoundsNeverDependOnDirection (direction_v4_test.go) build their
+// own fixtures, and the second does not depend on any row existing at all —
+// it compares stretch()'s byte output directly. So the redundancy is real,
+// not assumed, and this comment is where that gets checked: a mutation that
+// removes the floor row from THIS fixture is one of round four's harness
+// mutants (see the task), and it is expected to leave this file blind while
+// the package as a whole still catches the underlying regression.
 
-// TestAConstantIsRefusedEvenWhereScanAcrossWouldHaveCaughtIt: a partitioned
-// collection is where the constant shape looks like somebody else's problem,
-// because scanAcross already insists the two ends carry the same terms. It does
-// — for the fields a SECONDARY index declares. The clustered walk of a
-// partitioned collection goes through neither that check nor an index, so the
-// direction has to refuse the constant shape on its own account.
-func TestAConstantIsRefusedEvenWhereScanAcrossWouldHaveCaughtIt(t *testing.T) {
+// TestAHalfPinnedPartitionedIndexScanIsStillRefusedByScanAcrossItself checks
+// that removing checkDirection's rule (round four) did not accidentally widen
+// scanAcross's, which is a different rule with a different reason: a scan on
+// a partitioned SECONDARY index must fix every declared field so the
+// partitions concatenate in key order, and a constant at one end with an
+// argument at the other never fixes anything. That refusal has nothing to do
+// with Direction — it fires the same with no Direction at all — so it is
+// unaffected by this round and is here to say so.
+func TestAHalfPinnedPartitionedIndexScanIsStillRefusedByScanAcrossItself(t *testing.T) {
 	_, _, store := partitioned(t, 132)
 	entriesByMonth(t, store, 0)
 
@@ -511,21 +529,54 @@ func TestAConstantIsRefusedEvenWhereScanAcrossWouldHaveCaughtIt(t *testing.T) {
 		t.Fatalf("one account read either way should still be declarable: %v", err)
 	}
 
-	// The same pin at one end only. scanAcross would refuse this for its own
-	// reason, so it proves nothing about the direction on its own — it is here
-	// so that the partitioned column of the table has no blank in it.
+	// The same pin at one end only. scanAcross refuses this for its own
+	// reason — a partitioned secondary index scan must fix every field — not
+	// because of anything to do with direction; a fixed direction is refused
+	// exactly the same way.
 	half := pinned
 	half.Name = "entries.half"
 	half.To = &Endpoint{Terms: []Term{{Arg: "edge"}}}
 	half.Input = append([]Parameter{{Name: "edge", Type: TypeString, Required: true}}, half.Input...)
 	if _, err := store.DeclareOperation(half); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a half-pinned partitioned scan: want ErrDeclaration, got %v", err)
+		t.Errorf("a half-pinned partitioned scan, direction an argument: want ErrDeclaration, got %v", err)
+	}
+	half.Direction = &Term{Value: DirectionForward}
+	half.Name = "entries.half_fixed"
+	if _, err := store.DeclareOperation(half); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a half-pinned partitioned scan, direction fixed: want ErrDeclaration, got %v", err)
+	}
+}
+
+// TestAConstantAtOneEndOfAPartitionedClusteredWalkDeclaresAndReadsBothWays is
+// the shape TestAConstantIsRefusedEvenWhereScanAcrossWouldHaveCaughtIt used to
+// be named for: the clustered walk of a partitioned collection goes through
+// neither scanAcross nor an index at all, so whatever a constant at one end
+// only does here is entirely up to checkDirection. Rounds one through three
+// refused it — a constant at one end was exactly the shape
+// boundsSurviveReversal existed to catch. Round four removed that rule along
+// with the reason for it, so this shape now declares, and forward and
+// reverse read the same stretch, backwards on the second call, same as every
+// other shape in this file.
+func TestAConstantAtOneEndOfAPartitionedClusteredWalkDeclaresAndReadsBothWays(t *testing.T) {
+	_, _, store := partitioned(t, 132)
+	entries := entriesByMonth(t, store, 0)
+
+	var written []string
+	for _, when := range []time.Time{
+		time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC),
+	} {
+		atMonth(t, store, when)
+		for i := 0; i < 2; i++ {
+			written = append(written, fmt.Sprint(put(t, entries, map[string]any{"account": "cash"})))
+		}
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
 	}
 
-	// The clustered walk of the same collection is the one scanAcross waves
-	// straight through, and it is where the direction check stands alone.
 	clustered := Operation{
-		Name:       "entries.by_key",
+		Name:       "entries.from_floor",
 		Collection: "entries",
 		Action:     ActionScan,
 		Index:      ClusteredIndex,
@@ -533,12 +584,25 @@ func TestAConstantIsRefusedEvenWhereScanAcrossWouldHaveCaughtIt(t *testing.T) {
 			{Name: "edge", Type: TypeString, Required: true},
 			{Name: "direction", Type: TypeString, Required: true},
 		},
-		From:      &Endpoint{Terms: []Term{{Value: "01"}}},
-		To:        &Endpoint{Terms: []Term{{Arg: "edge"}}},
-		Direction: &Term{Arg: "direction"},
-		Limit:     10,
+		From:       &Endpoint{Terms: []Term{{Value: ""}}},
+		To:         &Endpoint{Terms: []Term{{Arg: "edge"}}},
+		Direction:  &Term{Arg: "direction"},
+		Projection: []string{"id"},
+		Limit:      10,
 	}
-	if _, err := store.DeclareOperation(clustered); !errors.Is(err, ErrDeclaration) {
-		t.Errorf("a constant floor on a partitioned clustered walk: want ErrDeclaration, got %v", err)
+	declareOp(t, store, clustered)
+
+	// Keys are ulids and partition names sort in the order the periods
+	// happened, so written is already forward key order: the floor of the
+	// string type up to written[2] is written[0], written[1], written[2].
+	forward := invoke(t, store, "entries.from_floor", map[string]any{"edge": written[2], "direction": DirectionForward})
+	if got := idsOf(forward.Rows); fmt.Sprint(got) != fmt.Sprint(written[:3]) {
+		t.Errorf("forward from the floor to the third key gave %v, want %v", got, written[:3])
+	}
+
+	reverse := invoke(t, store, "entries.from_floor", map[string]any{"edge": written[2], "direction": DirectionReverse})
+	want := []string{written[2], written[1], written[0]}
+	if got := idsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("reverse over the same declared stretch gave %v, want %v", got, want)
 	}
 }

@@ -60,14 +60,21 @@ func directionOf(value any) (Direction, error) {
 
 // Range is what part of an index to walk. A nil end is unbounded.
 //
-// The order is the index's own: a field declared descending runs from large to
-// small, and "from" is where the walk starts rather than the smaller value.
+// From is the low end of the stretch and To is the high end, in both
+// directions. Direction changes only the order entries come back in, not
+// which entries they are: a reversed walk is the same stretch read from its
+// high end down to its low end, never a different stretch.
 //
-// That is what makes Direction work without a second set of fields: From is
-// where the walk starts and To is where it ends, whichever way it is going. So
-// a reversed walk makes From the upper end of the stretch and To the lower —
-// the two ends swap which is the larger key, because they were never defined
-// as larger and smaller in the first place.
+// It was not always this way. From and To used to swap which one was the
+// upper end depending on Direction — "From is where the walk starts" — and
+// three rounds of review each found a different declaration where that swap
+// let a caller-chosen direction reach rows no forward call of the same
+// declaration could: a constant written at one end only, the two ends
+// disagreeing about Exclusive, and the two ends written at different widths.
+// All three were the same defect wearing different clothes — a declaration
+// whose meaning depended on an argument the person who wrote it never sees —
+// so the swap was removed rather than patched a fourth time. See task 0012,
+// round 4.
 type Range struct {
 	From      *Bound
 	To        *Bound
@@ -145,31 +152,32 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 	})
 }
 
+// stretch turns a Range into the two byte positions that bound the walk:
+// lower always comes from From, upper always comes from To, and neither reads
+// within.Direction. That is the whole of what this round changed and the
+// whole of why it is pulled out of walk into a function of its own — it is
+// the one thing that has to be true for "a direction widens nothing" to hold,
+// and it has to be provable by calling it twice with Direction flipped and
+// comparing the two byte strings, not by reading rows through a fixture.
+func (c *Collection) stretch(within Range, prefix []byte, fields []keys.Field) (lower, upper []byte, err error) {
+	lower, err = c.bound(prefix, fields, within.From, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	upper, err = c.bound(prefix, fields, within.To, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return lower, upper, nil
+}
+
 // walk is the one walk both Scan and walkRange are: a stretch of one keyspace,
 // across every partition, in whichever direction was asked for. Only what to
 // do with each entry differs, so only that is passed in.
 func (c *Collection) walk(within Range, prefix []byte, fields []keys.Field,
 	visit func(key, value []byte) bool) error {
 
-	// From is where the walk starts and To where it ends, so reading in
-	// reverse makes From the upper end of the stretch and To the lower. This
-	// swap is the whole of the direction's effect on access: the same two
-	// declared points, still on the same index, still bounding the same
-	// stretch — only entered from the other side.
-	//
-	// Getting it backwards does not fail loudly. The scan comes back empty, or
-	// comes back with the whole index, and both look plausible to anyone who
-	// was not watching for it, which is why it is written down here.
-	low, high := within.From, within.To
-	if within.Direction == Reverse {
-		low, high = within.To, within.From
-	}
-
-	lower, err := c.bound(prefix, fields, low, false)
-	if err != nil {
-		return err
-	}
-	upper, err := c.bound(prefix, fields, high, true)
+	lower, upper, err := c.stretch(within, prefix, fields)
 	if err != nil {
 		return err
 	}

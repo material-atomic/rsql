@@ -17,6 +17,16 @@ import (
 // repo stayed green. The reversed half was already covered; it is here beside
 // its mirror so the next person changing bound() breaks both at once.
 //
+// Round four removed the swap that used to put To in the "far end, entered
+// first" position when reversed: From and To no longer trade places, so the
+// reversed cases below read the SAME declared stretch as the forward ones,
+// direction flipped, rather than a mirrored one written with the ends
+// exchanged. A5 was s4 exclusive under the old convention (the walk's far
+// end being where it starts, which used to be the lower one); under this one
+// it stays To, the high end, in both directions — the far end for a reversed
+// walk is now From, the low end, which is why the exclusive bound moves
+// there below.
+//
 // reach_test does not see this. It compares the union of what every argument
 // value reaches, and a row excluded by one call is reached by another, so the
 // union saturates and an off-by-one in a single call leaves it unchanged.
@@ -42,30 +52,31 @@ func TestAnExclusiveEndIsOutsideTheStretchWhicheverWayTheWalkEnters(t *testing.T
 		want   []string
 	}{
 		{
-			// Forward: To is the far end, and a3 is a document that exists.
-			what: "forward, the far end exclusive",
+			// Forward: To is the far end, and a4 is a document that exists.
+			what: "forward, the far end (To) exclusive",
 			within: Range{From: &Bound{Values: []any{"a1"}},
 				To: &Bound{Values: []any{"a4"}, Exclusive: true}},
 			want: []string{"a1", "a2", "a3"},
 		},
 		{
-			what: "forward, the far end inclusive",
+			what: "forward, the far end (To) inclusive",
 			within: Range{From: &Bound{Values: []any{"a1"}},
 				To: &Bound{Values: []any{"a4"}}},
 			want: []string{"a1", "a2", "a3", "a4"},
 		},
 		{
-			// Reversed the ends swap roles: From is where the walk starts, so
-			// To is the far end and the lower one.
-			what: "reversed, the far end exclusive",
-			within: Range{From: &Bound{Values: []any{"a4"}},
-				To: &Bound{Values: []any{"a1"}, Exclusive: true}, Direction: Reverse},
+			// Reversed, the SAME declared stretch, entered from the other
+			// side: From is now the far end — the one the walk starts below
+			// and stops just short of — and a1 is a document that exists.
+			what: "reversed, the far end (From) exclusive",
+			within: Range{From: &Bound{Values: []any{"a1"}, Exclusive: true},
+				To: &Bound{Values: []any{"a4"}}, Direction: Reverse},
 			want: []string{"a4", "a3", "a2"},
 		},
 		{
-			what: "reversed, the far end inclusive",
-			within: Range{From: &Bound{Values: []any{"a4"}},
-				To: &Bound{Values: []any{"a1"}}, Direction: Reverse},
+			what: "reversed, the far end (From) inclusive",
+			within: Range{From: &Bound{Values: []any{"a1"}},
+				To: &Bound{Values: []any{"a4"}}, Direction: Reverse},
 			want: []string{"a4", "a3", "a2", "a1"},
 		},
 	} {
