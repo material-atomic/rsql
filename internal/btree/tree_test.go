@@ -1275,3 +1275,138 @@ func TestTheSpaceDeletionFreesComesBack(t *testing.T) {
 		t.Errorf("refilling the same data grew the file from %d to %d pages", full, grown)
 	}
 }
+
+// collectDown is every key and value the tree hands back walking downward.
+func collectDown(t *testing.T, tree *Tree, from []byte) ([]string, []string) {
+	t.Helper()
+	var keys, values []string
+	if err := tree.Descend(from, func(key, value []byte) bool {
+		keys = append(keys, string(key))
+		values = append(values, string(value))
+		return true
+	}); err != nil {
+		t.Fatalf("descend: %v", err)
+	}
+	return keys, values
+}
+
+func reversed(in []string) []string {
+	out := make([]string, len(in))
+	for i, one := range in {
+		out[len(in)-1-i] = one
+	}
+	return out
+}
+
+// TestDescendHandsBackWhatAscendDoesBackwards: the two walks see the same tree,
+// so they must see the same entries — every key, with its own value still
+// attached, in the opposite order. A walk that quietly dropped the first or the
+// last entry would still look sorted, which is why this compares the whole list
+// rather than the ends of it.
+func TestDescendHandsBackWhatAscendDoesBackwards(t *testing.T) {
+	_, tree := freshTree(t, 11)
+
+	for i := 0; i < 700; i++ {
+		put(t, tree, fmt.Sprintf("k%04d", i), fmt.Sprintf("v%04d", i))
+	}
+	if height := check(t, tree); height < 2 {
+		t.Fatalf("the tree is %d levels deep, so this says nothing about branches", height)
+	}
+
+	up, upValues := collect(t, tree, nil)
+	down, downValues := collectDown(t, tree, nil)
+
+	if fmt.Sprint(down) != fmt.Sprint(reversed(up)) {
+		t.Errorf("walking down gave %d keys that are not the %d from walking up, reversed", len(down), len(up))
+	}
+	if fmt.Sprint(downValues) != fmt.Sprint(reversed(upValues)) {
+		t.Error("the values did not come back attached to the same keys")
+	}
+	for i := 1; i < len(down); i++ {
+		if down[i-1] <= down[i] {
+			t.Fatalf("walking down, %q came before %q", down[i-1], down[i])
+		}
+	}
+}
+
+// TestDescendStopsJustBelowWhereItIsTold: Descend's bound is exclusive where
+// Ascend's is inclusive, so that Ascend(lo) and Descend(hi) cover exactly the
+// same half-open stretch [lo, hi). The key sitting exactly on the bound is the
+// only one that can tell the two conventions apart, so it is what this checks.
+func TestDescendStopsJustBelowWhereItIsTold(t *testing.T) {
+	_, tree := freshTree(t, 12)
+
+	for i := 0; i < 500; i++ {
+		put(t, tree, fmt.Sprintf("k%04d", i*2), fmt.Sprint(i))
+	}
+
+	for _, want := range []struct {
+		from  string
+		first string
+		count int
+	}{
+		// k0500 exists, and is left out: the walk starts below it.
+		{from: "k0500", first: "k0498", count: 250},
+		// k0501 does not exist, so the largest key below it is k0500.
+		{from: "k0501", first: "k0500", count: 251},
+		{from: "zzz", first: "k0998", count: 500},
+	} {
+		keys, _ := collectDown(t, tree, []byte(want.from))
+		if len(keys) == 0 {
+			t.Fatalf("from %q: nothing", want.from)
+		}
+		if keys[0] != want.first {
+			t.Errorf("from %q the walk starts at %q, want %q", want.from, keys[0], want.first)
+		}
+		if len(keys) != want.count {
+			t.Errorf("from %q the walk has %d keys, want %d", want.from, len(keys), want.count)
+		}
+	}
+
+	// The smallest key in the tree is k0000, and nothing is below it.
+	if keys, _ := collectDown(t, tree, []byte("k0000")); len(keys) != 0 {
+		t.Errorf("a walk down from the smallest key returned %d keys", len(keys))
+	}
+	if keys, _ := collectDown(t, tree, []byte("a")); len(keys) != 0 {
+		t.Errorf("a walk down from before the beginning returned %d keys", len(keys))
+	}
+}
+
+// TestDescendStopsWhenTheCallbackSaysSo: stopping early has to be honoured at
+// every level, not only within one leaf, or a limited read would keep paying
+// for pages after it had all it asked for.
+func TestDescendStopsWhenTheCallbackSaysSo(t *testing.T) {
+	_, tree := freshTree(t, 13)
+
+	for i := 0; i < 700; i++ {
+		put(t, tree, fmt.Sprintf("k%04d", i), fmt.Sprint(i))
+	}
+	if height := check(t, tree); height < 2 {
+		t.Fatalf("the tree is %d levels deep, so this says nothing about branches", height)
+	}
+
+	var seen []string
+	if err := tree.Descend(nil, func(key, _ []byte) bool {
+		seen = append(seen, string(key))
+		return len(seen) < 5
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 5 {
+		t.Fatalf("the walk visited %d keys after being stopped at 5", len(seen))
+	}
+	if seen[0] != "k0699" || seen[4] != "k0695" {
+		t.Errorf("the first five keys walking down are %v", seen)
+	}
+}
+
+func TestDescendOnAnEmptyTreeAnswersNothing(t *testing.T) {
+	_, tree := freshTree(t, 14)
+
+	if keys, _ := collectDown(t, tree, nil); len(keys) != 0 {
+		t.Errorf("an empty tree handed back %d keys", len(keys))
+	}
+	if keys, _ := collectDown(t, tree, []byte("k")); len(keys) != 0 {
+		t.Errorf("an empty tree handed back %d keys from a bound", len(keys))
+	}
+}

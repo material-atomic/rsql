@@ -536,6 +536,91 @@ func (t *Tree) ascend(id uint64, from []byte, visit func(key, value []byte) bool
 	}
 }
 
+// Descend walks the tree in reverse key order, starting just below `from` (nil
+// for the end), stopping early if the callback says so.
+//
+// `from` is exclusive where Ascend's is inclusive, and the asymmetry is the
+// point rather than an oversight: a stretch of the tree is half-open, [lo, hi),
+// and Ascend(lo) walks it upward while Descend(hi) walks that same stretch
+// downward. Were both ends inclusive the two walks would disagree about the
+// endpoints, and a range read forward would hold one more entry than the same
+// range read backward — which is the kind of difference that only shows up on
+// the one key that sits exactly on the bound.
+func (t *Tree) Descend(from []byte, visit func(key, value []byte) bool) error {
+	if t.root == 0 {
+		return nil
+	}
+	_, err := t.descend(t.root, from, visit)
+	return err
+}
+
+func (t *Tree) descend(id uint64, from []byte, visit func(key, value []byte) bool) (bool, error) {
+	page, err := t.pages.Read(id)
+	if err != nil {
+		return false, err
+	}
+
+	switch page.Kind {
+	case pager.KindLeaf:
+		entries, err := decodeLeaf(page)
+		if err != nil {
+			return false, err
+		}
+		end := len(entries)
+		if from != nil {
+			// findKey is the first entry at or above `from`, so everything
+			// strictly below it is exactly what is left to walk.
+			end, _ = findKey(entries, from)
+		}
+		for i := end - 1; i >= 0; i-- {
+			value, err := t.load(entries[i])
+			if err != nil {
+				return false, err
+			}
+			if !visit(entries[i].key, value) {
+				return false, nil
+			}
+		}
+		return true, nil
+
+	case pager.KindNode:
+		node, err := decodeBranch(page)
+		if err != nil {
+			return false, err
+		}
+		start := len(node.children) - 1
+		if from != nil {
+			// Every key below `from` lives in this child or to the left of it,
+			// so the subtrees after it hold nothing this walk wants.
+			start = childFor(node.keys, from)
+		}
+		for i := start; i >= 0; i-- {
+			// Only the first subtree needs to stop anywhere: everything after
+			// it is entirely below `from` and is walked whole.
+			//
+			// Dropping the cursor here is an economy, not a correctness
+			// condition, and no test can see it: a subtree left of `start`
+			// holds only keys below the separator, which is at or below
+			// `from`, so handing it `from` would make it search for a place it
+			// would reach anyway. A mutant that keeps the cursor survives on
+			// purpose — it costs a binary search per page and changes no
+			// answer.
+			cursor := from
+			if i < start {
+				cursor = nil
+			}
+			more, err := t.descend(node.children[i], cursor, visit)
+			if err != nil || !more {
+				return more, err
+			}
+		}
+		return true, nil
+
+	default:
+		return false, fmt.Errorf("%w: page %d is kind %d", ErrNotANode, id, page.Kind)
+	}
+}
+
 // writeLeaf stores entries, reusing `at` when that page belongs to the
 // transaction in progress and allocating a new one otherwise. Pass zero to
 // always allocate.

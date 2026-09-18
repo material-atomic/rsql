@@ -48,6 +48,12 @@ const (
 // is the order they are stored in.
 const ClusteredIndex = "_key"
 
+// Which way a scan runs along its index, as an operation writes it down.
+const (
+	DirectionForward = "forward" // the order the index declared
+	DirectionReverse = "reverse" // that order, read back to front
+)
+
 var (
 	ErrNoOperation = errors.New("rsql/store: no such operation")
 	ErrArgument    = errors.New("rsql/store: the arguments do not match what the operation declares")
@@ -77,6 +83,29 @@ type Operation struct {
 	Index string    `json:"index,omitempty"`
 	From  *Endpoint `json:"from,omitempty"`
 	To    *Endpoint `json:"to,omitempty"`
+
+	// Direction is which way along that index the scan runs: "forward", the
+	// index's own order, or "reverse", that order read back to front. Absent
+	// is forward.
+	//
+	// It is a Term rather than a plain string so that one mechanism covers
+	// both ways of deciding it — a constant term fixes the direction in the
+	// declaration, an argument term lets the caller choose per call — and both
+	// are already the vocabulary everything else here is written in.
+	//
+	// It is the one thing about a scan an argument may decide, and it is safe
+	// for a reason that does not generalise to anything else: it widens
+	// nothing. The index is the declared one, the two ends are the declared
+	// ones bounding the same stretch, the limit is the declared one, and the
+	// work is the same walk over the same pages. All that changes is which end
+	// the rows come out of.
+	//
+	// "Reverse" reverses the order the index declared, as a whole. An index on
+	// (a ascending, b descending) read in reverse gives (a descending, b
+	// ascending), not (a descending, b descending) — that last one is a third
+	// order and still needs an index of its own. The word is deliberately not
+	// "descending", which is what a single field is.
+	Direction *Term `json:"direction,omitempty"`
 
 	// Document is what an insert or a put writes; Set is what an update
 	// changes. Both are built from arguments and constants and nothing else.
@@ -446,6 +475,9 @@ func (s *Store) validateOperation(operation *Operation) error {
 				}
 			}
 		}
+		if err := checkDirection(operation.Direction, parameters, check); err != nil {
+			return err
+		}
 		if operation.Action == ActionScan && operation.Limit <= 0 {
 			return fmt.Errorf("%w: a scan must declare how many rows it may return", ErrDeclaration)
 		}
@@ -495,9 +527,57 @@ func (s *Store) validateOperation(operation *Operation) error {
 		return fmt.Errorf("%w: %q is not something an operation can do", ErrDeclaration, operation.Action)
 	}
 
+	// A direction is a thing you have along an index, and only a scan and a
+	// count walk one. Saying it anywhere else would be a word in a declaration
+	// that nothing reads, which is how a caller ends up believing a promise
+	// nobody made.
+	if operation.Direction != nil && operation.Action != ActionScan && operation.Action != ActionCount {
+		return fmt.Errorf("%w: a %s does not walk an index, so it has no direction",
+			ErrDeclaration, operation.Action)
+	}
+
 	for _, path := range operation.Projection {
 		if path == "" {
 			return fmt.Errorf("%w: the projection names a field with no path", ErrDeclaration)
+		}
+	}
+	return nil
+}
+
+// checkDirection refuses a direction that could not be worked out, at the point
+// where it is written rather than at the point where somebody reads rows in an
+// order they did not expect.
+func checkDirection(term *Term, parameters map[string]Parameter,
+	check func(Term, string, string) error) error {
+
+	if term == nil {
+		return nil
+	}
+	if err := check(*term, TypeString, "the direction"); err != nil {
+		return err
+	}
+
+	if term.Arg == "" {
+		if _, err := directionOf(term.Value); err != nil {
+			return fmt.Errorf("%w: the direction: %v", ErrDeclaration, err)
+		}
+		return nil
+	}
+
+	// check has already said the argument is declared and is a string.
+	parameter := parameters[term.Arg]
+
+	// A direction that depends on whether an argument turned up is two orders
+	// wearing one name, and the caller who leaves it out cannot tell which one
+	// it got. Refused here rather than defaulted at call time, for the same
+	// reason a scan must declare a limit.
+	if !parameter.Required && parameter.Default == nil {
+		return fmt.Errorf("%w: %q chooses the direction, so it must be required or carry a default — a scan whose order is optional has two orders",
+			ErrDeclaration, term.Arg)
+	}
+	if parameter.Default != nil {
+		if _, err := directionOf(parameter.Default); err != nil {
+			return fmt.Errorf("%w: the default for %q: %v", ErrDeclaration, term.Arg, err)
 		}
 	}
 	return nil
@@ -621,6 +701,12 @@ func operationKey(name string, version int) []byte {
 //
 // Hash: partition order is hash order, which is no order at all. Nothing that
 // crosses partitions can be ordered, so nothing may.
+//
+// A direction changes none of this. What this function guarantees is that the
+// partitions concatenated in partition order are in key order; the reverse of
+// something in key order is still something this function has vouched for, and
+// a scan that may not run forward may not run backward either. So there is
+// nothing extra to refuse here, and nothing extra to allow.
 func scanAcross(collection *Collection, operation *Operation) error {
 	divided := collection.spec.Partition
 	if divided == nil {

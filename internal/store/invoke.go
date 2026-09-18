@@ -346,7 +346,35 @@ func bounds(operation Operation, values map[string]any) (Range, error) {
 		}
 		*end.into = bound
 	}
+
+	// The direction does not fall away when it is missing the way an endpoint
+	// does: a missing bound is a wider stretch, which is a thing an operation
+	// can mean, but a missing direction is no order at all. The declaration is
+	// checked so that this cannot happen — the argument is required or has a
+	// default — so if it does happen it is an error rather than a guess.
+	direction, err := directionFor(operation.Direction, values)
+	if err != nil {
+		return Range{}, err
+	}
+	within.Direction = direction
+
 	return within, nil
+}
+
+// directionFor is which way this call runs along the index.
+func directionFor(term *Term, values map[string]any) (Direction, error) {
+	if term == nil {
+		return Forward, nil
+	}
+	value, err := resolve(*term, values)
+	if err != nil {
+		return Forward, err
+	}
+	direction, err := directionOf(value)
+	if err != nil {
+		return Forward, fmt.Errorf("%w: the direction: %v", ErrArgument, err)
+	}
+	return direction, nil
 }
 
 // build makes a document, or the changes to one, out of terms.

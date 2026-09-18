@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/material-atomic/rsql/internal/keys"
 )
@@ -19,15 +20,58 @@ type Bound struct {
 	Exclusive bool
 }
 
+// Direction is which way along an index a walk runs.
+//
+// Reverse is the declared order read back to front, and that is the whole of
+// what it means. An index declared (a ascending, b descending) read in reverse
+// comes back (a descending, b ascending) — it is not "every field descending",
+// which is a third order again and still needs an index of its own. The word
+// is "reverse" rather than "descending" for exactly that reason: a field is
+// descending, a walk is reversed, and the two are not the same thing.
+//
+// Ordering still comes from the index, so this buys no order nobody paid for:
+// the reverse of a stored order costs the same walk over the same pages.
+type Direction uint8
+
+const (
+	// Forward is the index's own order, the one its fields declared.
+	Forward Direction = iota
+	// Reverse is that same order, walked from the far end.
+	Reverse
+)
+
+// directionOf turns what an operation wrote down, or what a caller passed, into
+// a direction.
+//
+// Anything that is not one of the two words is refused rather than read as
+// forward. A caller that misspells "reverse" is asking for an order, and
+// quietly handing back the other one is the worst of the three answers
+// available: it is wrong, it looks right, and nothing says so.
+func directionOf(value any) (Direction, error) {
+	switch value {
+	case DirectionForward:
+		return Forward, nil
+	case DirectionReverse:
+		return Reverse, nil
+	}
+	return Forward, fmt.Errorf("a scan runs %q or %q, and this is %v",
+		DirectionForward, DirectionReverse, value)
+}
+
 // Range is what part of an index to walk. A nil end is unbounded.
 //
 // The order is the index's own: a field declared descending runs from large to
 // small, and "from" is where the walk starts rather than the smaller value.
-// There is no reverse walk on purpose — ordering comes from the index, so an
-// order nothing declared is an order nobody paid for.
+//
+// That is what makes Direction work without a second set of fields: From is
+// where the walk starts and To is where it ends, whichever way it is going. So
+// a reversed walk makes From the upper end of the stretch and To the lower —
+// the two ends swap which is the larger key, because they were never defined
+// as larger and smaller in the first place.
 type Range struct {
-	From *Bound
-	To   *Bound
+	From      *Bound
+	To        *Bound
+	Direction Direction
 }
 
 // Found is one index entry.
@@ -41,8 +85,9 @@ type Found struct {
 	Include map[string]any
 }
 
-// Scan walks an index and hands back the entries in it, in index order,
-// stopping early if the callback says so.
+// Scan walks an index and hands back the entries in it, in index order — or in
+// the reverse of it when the range says so — stopping early if the callback
+// says so.
 func (c *Collection) Scan(name string, within Range, visit func(Found) bool) error {
 	index, found := c.index(name)
 	if !found {
@@ -52,67 +97,26 @@ func (c *Collection) Scan(name string, within Range, visit func(Found) bool) err
 	prefix := c.entries(*index)
 	fields := encodings(index.Fields)
 
-	lower, err := c.bound(prefix, fields, within.From, false)
-	if err != nil {
-		return err
-	}
-	upper, err := c.bound(prefix, fields, within.To, true)
-	if err != nil {
-		return err
-	}
-
-	// Every partition, oldest first. An index is local to its partition, so
-	// this is the only way to see all of them — and the order is right because
-	// what an operation may declare on a partitioned collection is checked
-	// where it is declared. See ops.go.
-	trees, err := c.across()
-	if err != nil {
-		return err
-	}
-
-	for _, tree := range trees {
-		stop := false
-		err := tree.Ascend(lower, func(key, value []byte) bool {
-			if !bytes.HasPrefix(key, prefix) {
-				return false
-			}
-			if upper != nil && bytes.Compare(key, upper) >= 0 {
-				return false
-			}
-
-			rest := key[len(prefix):]
-			values, rest, err := keys.DecodeKey(rest, fields)
-			if err != nil {
-				return false
-			}
-			primary, rest, err := keys.Decode(rest, keys.Field{})
-			if err != nil || len(rest) != 0 {
-				return false
-			}
-
-			entry := Found{Values: values, Key: primary}
-			if len(value) > 0 {
-				entry.Include = map[string]any{}
-				if err := json.Unmarshal(value, &entry.Include); err != nil {
-					return false
-				}
-			}
-			if !visit(entry) {
-				// The caller has had enough, and it has had enough of the
-				// whole scan rather than of this partition.
-				stop = true
-				return false
-			}
-			return true
-		})
+	return c.walk(within, prefix, fields, func(key, value []byte) bool {
+		rest := key[len(prefix):]
+		values, rest, err := keys.DecodeKey(rest, fields)
 		if err != nil {
-			return err
+			return false
 		}
-		if stop {
-			return nil
+		primary, rest, err := keys.Decode(rest, keys.Field{})
+		if err != nil || len(rest) != 0 {
+			return false
 		}
-	}
-	return nil
+
+		entry := Found{Values: values, Key: primary}
+		if len(value) > 0 {
+			entry.Include = map[string]any{}
+			if err := json.Unmarshal(value, &entry.Include); err != nil {
+				return false
+			}
+		}
+		return visit(entry)
+	})
 }
 
 // Walk hands back every document in primary-key order, which is the order they
@@ -128,44 +132,100 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 	prefix := c.documents()
 	fields := []keys.Field{{}}
 
-	lower, err := c.bound(prefix, fields, within.From, false)
+	return c.walk(within, prefix, fields, func(key, value []byte) bool {
+		primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
+		if err != nil || len(rest) != 0 {
+			return false
+		}
+		document := map[string]any{}
+		if err := json.Unmarshal(value, &document); err != nil {
+			return false
+		}
+		return visit(primary, document)
+	})
+}
+
+// walk is the one walk both Scan and walkRange are: a stretch of one keyspace,
+// across every partition, in whichever direction was asked for. Only what to
+// do with each entry differs, so only that is passed in.
+func (c *Collection) walk(within Range, prefix []byte, fields []keys.Field,
+	visit func(key, value []byte) bool) error {
+
+	// From is where the walk starts and To where it ends, so reading in
+	// reverse makes From the upper end of the stretch and To the lower. This
+	// swap is the whole of the direction's effect on access: the same two
+	// declared points, still on the same index, still bounding the same
+	// stretch — only entered from the other side.
+	//
+	// Getting it backwards does not fail loudly. The scan comes back empty, or
+	// comes back with the whole index, and both look plausible to anyone who
+	// was not watching for it, which is why it is written down here.
+	low, high := within.From, within.To
+	if within.Direction == Reverse {
+		low, high = within.To, within.From
+	}
+
+	lower, err := c.bound(prefix, fields, low, false)
 	if err != nil {
 		return err
 	}
-	upper, err := c.bound(prefix, fields, within.To, true)
+	upper, err := c.bound(prefix, fields, high, true)
 	if err != nil {
 		return err
 	}
 
+	// Every partition, oldest first. An index is local to its partition, so
+	// this is the only way to see all of them — and the order is right because
+	// what an operation may declare on a partitioned collection is checked
+	// where it is declared. See ops.go.
 	trees, err := c.across()
 	if err != nil {
 		return err
 	}
 
+	// A reversed walk reverses the list of partitions as well as each tree in
+	// it. The concatenation of the partitions in partition order is in key
+	// order — that is what scanAcross exists to guarantee — and the reverse of
+	// a sorted concatenation is each piece reversed, last piece first.
+	// Reversing only the trees, or only the list, gives an order that is
+	// locally right and globally wrong, which no single-partition test sees.
+	if within.Direction == Reverse {
+		slices.Reverse(trees)
+	}
+
 	for _, tree := range trees {
 		stop := false
-		err := tree.Ascend(lower, func(key, value []byte) bool {
+		bounded := func(key, value []byte) bool {
 			if !bytes.HasPrefix(key, prefix) {
 				return false
 			}
-			if upper != nil && bytes.Compare(key, upper) >= 0 {
+			if within.Direction == Reverse {
+				// Descend already started below `upper`; `lower` is where it ends.
+				if bytes.Compare(key, lower) < 0 {
+					return false
+				}
+			} else if upper != nil && bytes.Compare(key, upper) >= 0 {
 				return false
 			}
-
-			primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
-			if err != nil || len(rest) != 0 {
-				return false
-			}
-			document := map[string]any{}
-			if err := json.Unmarshal(value, &document); err != nil {
-				return false
-			}
-			if !visit(primary, document) {
+			if !visit(key, value) {
+				// The caller has had enough, and it has had enough of the
+				// whole scan rather than of this partition.
 				stop = true
 				return false
 			}
 			return true
-		})
+		}
+
+		if within.Direction == Reverse {
+			// A nil upper means the stretch runs to the very end of the
+			// keyspace, and Descend takes nil for the end of the tree. That
+			// only happens when the prefix is every byte 0xff, and then every
+			// key above the prefix begins with it, so nothing outside the
+			// stretch is walked on the way in.
+			err = tree.Descend(upper, bounded)
+		} else {
+			err = tree.Ascend(lower, bounded)
+		}
 		if err != nil {
 			return err
 		}
