@@ -185,9 +185,13 @@ func (c *Collection) contribute(tree *btree.Tree, document map[string]any, sign 
 			continue
 		}
 
-		// Read before the write, because a value that cannot be added must
-		// stop the whole thing rather than leave some rollups moved and others
-		// not. Which is why the sums are worked out first.
+		// The sums are worked out before anything is written, so that a value
+		// that cannot be added stops this rollup before it has been half
+		// moved. It does not stop an earlier rollup of the same collection
+		// from having been moved already — what makes that safe is that an
+		// error here means the caller does not commit, and nothing uncommitted
+		// is part of the database. The same is true of the index entries a few
+		// lines away, and has been all along.
 		added := map[string]float64{}
 		for _, path := range rollup.Sum {
 			value, found := at(document, path)
@@ -273,36 +277,34 @@ func (c *Collection) Totals(name string, within Range, visit func(Totals) bool) 
 		return err
 	}
 
-	// Added up as they are found, because the same group can appear in every
-	// partition. Ordered by the key they were found under, so the answer comes
-	// out in group order however many partitions it came from.
+	// One tree is the ordinary case, and it is already in order: hand the rows
+	// straight out. Collecting them first would hold every group in the range
+	// in memory before returning one — memory bounded by the data rather than
+	// by the operation, which is exactly what this store refuses elsewhere and
+	// what the check in ops.go refuses for a partitioned collection. Doing it
+	// here anyway would be that rule not applying to its own implementation.
+	if len(trees) == 1 {
+		return c.totalsIn(trees[0], prefix, fields, lower, upper, visit)
+	}
+
+	// Several partitions, and each holds part of every total, so they have to
+	// be added up before any of them is an answer. That is why reading a
+	// rollup of a partitioned collection must name one group — checked where
+	// the operation is declared, so this only ever merges a handful of rows.
 	order := [][]byte{}
 	sums := map[string]*Totals{}
 
 	for _, tree := range trees {
-		err := tree.Ascend(lower, func(key, value []byte) bool {
-			if len(key) < len(prefix) || string(key[:len(prefix)]) != string(prefix) {
+		err := c.totalsIn(tree, prefix, fields, lower, upper, func(row Totals) bool {
+			at, err := keys.EncodeKey(prefix, row.Group, fields)
+			if err != nil {
 				return false
 			}
-			if upper != nil && string(key) >= string(upper) {
-				return false
-			}
-
-			row := Totals{}
-			if err := json.Unmarshal(value, &row); err != nil {
-				return false
-			}
-			values, rest, err := keys.DecodeKey(key[len(prefix):], fields)
-			if err != nil || len(rest) != 0 {
-				return false
-			}
-			row.Group = values
-
-			at := string(key)
-			running, seen := sums[at]
+			running, seen := sums[string(at)]
 			if !seen {
-				order = append(order, append([]byte(nil), key...))
-				sums[at] = &row
+				order = append(order, at)
+				kept := row
+				sums[string(at)] = &kept
 				return true
 			}
 			running.Count += row.Count
@@ -326,6 +328,43 @@ func (c *Collection) Totals(name string, within Range, visit func(Totals) bool) 
 		}
 	}
 	return nil
+}
+
+// totalsIn hands out the rows of one tree, in order.
+func (c *Collection) totalsIn(tree *btree.Tree, prefix []byte, fields []keys.Field,
+	lower, upper []byte, visit func(Totals) bool) error {
+
+	return tree.Ascend(lower, func(key, value []byte) bool {
+		// No test reaches this line and none can: bound never hands back an
+		// unbounded end for a rollup, because the prefix begins with 0x08 and
+		// every such prefix has a successor. So the walk already begins at or
+		// after this rollup's rows and ends before the next one's. It stays
+		// because it is what keeps the slice below in range if that ever stops
+		// being true, and because a rollup read that wandered into another
+		// rollup's rows would decode them perfectly happily and hand back
+		// numbers that answer a different question.
+		if len(key) < len(prefix) || string(key[:len(prefix)]) != string(prefix) {
+			return false
+		}
+		if upper != nil && string(key) >= string(upper) {
+			return false
+		}
+
+		row := Totals{}
+		if err := json.Unmarshal(value, &row); err != nil {
+			return false
+		}
+		values, rest, err := keys.DecodeKey(key[len(prefix):], fields)
+		if err != nil || len(rest) != 0 {
+			return false
+		}
+		row.Group = values
+
+		// There is one tree here, so saying the caller stopped and saying this
+		// walk ran out come to the same thing — unlike the scan in scan.go,
+		// which has partitions left to visit and has to tell them apart.
+		return visit(row)
+	})
 }
 
 // sortKeys puts byte strings in order, which is the order the tree had them
@@ -360,7 +399,7 @@ func (c *Collection) buildRollup(tree *btree.Tree, rollup Rollup) error {
 
 	// Built through the same function that keeps it, so a rollup that was
 	// declared after the data cannot differ from one that was declared before.
-	only := &Collection{store: c.store, spec: Spec{ID: c.spec.ID, Rollups: []Rollup{rollup}}}
+	only := &Collection{store: c.store, spec: Spec{Name: c.spec.Name, ID: c.spec.ID, Rollups: []Rollup{rollup}}}
 	for _, document := range documents {
 		if err := only.contribute(tree, document, 1); err != nil {
 			return err

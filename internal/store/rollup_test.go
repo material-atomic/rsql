@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -335,5 +337,409 @@ func TestARollupOfAPartitionedCollectionNamesOneGroup(t *testing.T) {
 	}
 	if answer.Count != 1 || answer.Rows[0]["count"] != 2.0 || answer.Rows[0]["amount"] != 10.0 {
 		t.Errorf("the declared read came back as %+v", answer.Rows)
+	}
+}
+
+// allTotals is every row a rollup returns over a stretch, in the order it
+// returned them.
+func allTotals(t *testing.T, collection *Collection, name string, within Range) []Totals {
+	t.Helper()
+
+	rows := []Totals{}
+	if err := collection.Totals(name, within, func(one Totals) bool {
+		rows = append(rows, one)
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+// TestARollupHoldsOnlyWhatItCanDescribe: the two ways a document can fail to
+// belong, and neither of them may end with it counted somewhere vague.
+func TestARollupHoldsOnlyWhatItCanDescribe(t *testing.T) {
+	_, store := fresh(t, 406)
+	lines := takings(t, store)
+
+	if _, err := lines.Put(map[string]any{"account": "cash", "amount": 1.0}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rollup was told to skip a document with no account, so there is no
+	// group for it to be in. Counting it under an absent-value group instead
+	// would put it in a row somebody later reads as if it meant something.
+	if _, err := lines.Put(map[string]any{"amount": 99.0}); err != nil {
+		t.Fatal(err)
+	}
+	rows := allTotals(t, lines, "per_account", Range{})
+	if len(rows) != 1 || rows[0].Count != 1 || rows[0].Sum["amount"] != 1 {
+		t.Errorf("a line with no account got into the totals: %+v", rows)
+	}
+
+	// An account that is a number is not a group this rollup can hold, and
+	// putting it in one anyway would mean a row whose group value is not the
+	// type every reader of that rollup was told to expect.
+	if _, err := lines.Put(map[string]any{"account": 7.0, "amount": 1.0}); !errors.Is(err, ErrType) {
+		t.Errorf("a line whose account is a number: %v", err)
+	}
+	if rows := allTotals(t, lines, "per_account", Range{}); len(rows) != 1 {
+		t.Errorf("the refused line left groups behind: %+v", rows)
+	}
+}
+
+// TestADocumentTheTotalsRefuseIsNotStored: the total and the document go in
+// together, so a document that stops the totals must not be sitting there
+// afterwards with nothing counting it.
+func TestADocumentTheTotalsRefuseIsNotStored(t *testing.T) {
+	_, store := fresh(t, 407)
+	lines := takings(t, store)
+
+	if _, err := lines.Put(map[string]any{"id": "line-1", "account": "cash", "amount": "ten"}); !errors.Is(err, ErrType) {
+		t.Fatalf("a line whose amount is a word: %v", err)
+	}
+	if _, found, err := lines.Get("line-1"); err != nil || found {
+		t.Errorf("the refused line is stored anyway: found=%v err=%v", found, err)
+	}
+}
+
+// TestATotalReadStaysInsideWhatItWasAskedFor: a rollup is a stretch of the
+// same tree as every other rollup, and only the bounds say where the answer
+// ends.
+func TestATotalReadStaysInsideWhatItWasAskedFor(t *testing.T) {
+	_, store := fresh(t, 408)
+
+	lines, err := store.Declare(Spec{
+		Name: "lines",
+		Key:  Key{Path: "id", Type: TypeString, Auto: "ulid"},
+		Rollups: []Rollup{
+			{
+				Name:  "per_account",
+				Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+				Count: true, Sum: []string{"amount"},
+			},
+			{
+				Name:  "per_kind",
+				Group: []Field{{Path: "kind", Type: TypeString, Missing: MissingSkip}},
+				Count: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []map[string]any{
+		{"account": "cash", "kind": "sale", "amount": 1.0},
+		{"account": "zebra", "kind": "refund", "amount": 2.0},
+	} {
+		if _, err := lines.Put(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// One named group. The account that sorts after it is a row the read walks
+	// straight into unless the upper bound stops it.
+	rows := allTotals(t, lines, "per_account", Range{
+		From: &Bound{Values: []any{"cash"}}, To: &Bound{Values: []any{"cash"}},
+	})
+	if len(rows) != 1 || rows[0].Count != 1 || rows[0].Sum["amount"] != 1 {
+		t.Errorf("one named group came back as %+v", rows)
+	}
+
+	// Every group of this rollup and none of the next one's, which sit
+	// immediately after them and decode just as well.
+	rows = allTotals(t, lines, "per_account", Range{})
+	if len(rows) != 2 {
+		t.Errorf("all the accounts came back as %+v", rows)
+	}
+}
+
+// TestTotalsMergedFromPartitionsComeOutInGroupOrder: each partition is walked
+// in its own order, so a merge that just put one list after another would hand
+// back groups in whatever order the partitions happened to be opened.
+func TestTotalsMergedFromPartitionsComeOutInGroupOrder(t *testing.T) {
+	_, _, store := partitioned(t, 409)
+
+	lines, err := store.Declare(Spec{
+		Name:      "lines",
+		Key:       Key{Path: "id", Type: TypeString, Auto: "ulid"},
+		Partition: &Partition{By: ByTime, Every: EveryMonth},
+		Rollups: []Rollup{{
+			Name:  "per_account",
+			Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+			Count: true, Sum: []string{"amount"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The earlier partition holds the account that sorts last, so walking the
+	// partitions in order gives the groups in the wrong one.
+	atMonth(t, store, time.Date(2026, time.January, 10, 0, 0, 0, 0, time.UTC))
+	if _, err := lines.Put(map[string]any{"account": "zebra", "amount": 1.0}); err != nil {
+		t.Fatal(err)
+	}
+	atMonth(t, store, time.Date(2026, time.February, 10, 0, 0, 0, 0, time.UTC))
+	if _, err := lines.Put(map[string]any{"account": "apple", "amount": 2.0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := allTotals(t, lines, "per_account", Range{})
+	if len(rows) != 2 {
+		t.Fatalf("two accounts in two months came back as %+v", rows)
+	}
+	if rows[0].Group[0] != "apple" || rows[1].Group[0] != "zebra" {
+		t.Errorf("the merged rows came out as %v then %v", rows[0].Group, rows[1].Group)
+	}
+}
+
+// TestARollupDeclaredLateIsFilledFromThisCollectionOnlyAndOnlyOnce: filling a
+// new rollup walks documents, and both ways of walking too many of them end
+// with a total that is simply wrong from the moment it is created.
+func TestARollupDeclaredLateIsFilledFromThisCollectionOnlyAndOnlyOnce(t *testing.T) {
+	_, store := fresh(t, 410)
+	lines := takings(t, store)
+
+	notes, err := store.Declare(Spec{Name: "notes", Key: Key{Path: "id", Type: TypeString, Auto: "ulid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := notes.Put(map[string]any{"account": "cash", "amount": 5.0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := lines.Put(map[string]any{"account": "cash", "amount": 1.0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	both, err := store.Declare(Spec{
+		Name: "lines",
+		Key:  Key{Path: "id", Type: TypeString, Auto: "ulid"},
+		Rollups: []Rollup{
+			{
+				Name:  "per_account",
+				Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+				Count: true, Sum: []string{"amount"},
+			},
+			{Name: "everything", Count: true, Sum: []string{"amount"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The rollup that was already being kept is not run over the documents a
+	// second time: it was right before the new one was asked for.
+	if count, sum, _ := totalsOf(t, both, "cash"); count != 2 || sum != 2 {
+		t.Errorf("declaring a second rollup moved the first: %d lines and %v, want 2 and 2", count, sum)
+	}
+
+	// And the new one counts this collection, not every document in the file.
+	rows := allTotals(t, both, "everything", Range{})
+	if len(rows) != 1 || rows[0].Count != 2 || rows[0].Sum["amount"] != 2 {
+		t.Errorf("the new rollup came back as %+v, want one row of 2 and 2", rows)
+	}
+}
+
+// TestARollupThatChangesShapeIsNotTheSameRollup: keeping the name and changing
+// what it holds would leave every reader of the old one reading a number that
+// answers a different question.
+func TestARollupThatChangesShapeIsNotTheSameRollup(t *testing.T) {
+	_, store := fresh(t, 411)
+	takings(t, store)
+
+	for what, changed := range map[string]Rollup{
+		"sums something else": {
+			Name:  "per_account",
+			Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+			Count: true, Sum: []string{"fee"},
+		},
+		"groups by something else": {
+			Name:  "per_account",
+			Group: []Field{{Path: "kind", Type: TypeString, Missing: MissingSkip}},
+			Count: true, Sum: []string{"amount"},
+		},
+		"stops counting": {
+			Name:  "per_account",
+			Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+			Sum:   []string{"amount"},
+		},
+		"treats a missing account differently": {
+			Name:  "per_account",
+			Group: []Field{{Path: "account", Type: TypeString, Missing: MissingFirst}},
+			Count: true, Sum: []string{"amount"},
+		},
+	} {
+		if _, err := store.Declare(Spec{
+			Name: "lines", Key: Key{Path: "id", Type: TypeString, Auto: "ulid"},
+			Rollups: []Rollup{changed},
+		}); !errors.Is(err, ErrIncompatible) {
+			t.Errorf("a rollup that %s was accepted: %v", what, err)
+		}
+	}
+}
+
+// TestARollupReadSaysHowManyRowsItMayReturn: a rollup has a row per group and
+// nobody knows how many groups there will be, so the read says its own bound
+// and says when it hit it.
+func TestARollupReadSaysHowManyRowsItMayReturn(t *testing.T) {
+	_, store := fresh(t, 412)
+	lines := takings(t, store)
+
+	for _, account := range []string{"bank", "cash", "petty"} {
+		if _, err := lines.Put(map[string]any{"account": account, "amount": 1.0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.DeclareOperation(Operation{
+		Name: "lines.all", Collection: "lines", Action: ActionTotals, Rollup: "per_account",
+	}); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a rollup read with no limit: %v", err)
+	}
+
+	if _, err := store.DeclareOperation(Operation{
+		Name: "lines.first_two", Collection: "lines", Action: ActionTotals, Rollup: "per_account", Limit: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	answer, err := store.Invoke(Caller{}, "lines.first_two", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Count != 2 || len(answer.Rows) != 2 {
+		t.Errorf("a read limited to two rows returned %d", answer.Count)
+	}
+	if !answer.Truncated {
+		t.Error("the read stopped short and did not say so")
+	}
+}
+
+// TestATotalReadStopsWhenTheCallerDoes, on one tree and on several. A read
+// that keeps going after the answer has been refused is work nobody asked for,
+// and on a rollup it is work proportional to how many groups exist.
+func TestATotalReadStopsWhenTheCallerDoes(t *testing.T) {
+	_, store := fresh(t, 413)
+	lines := takings(t, store)
+
+	for _, account := range []string{"bank", "cash", "petty"} {
+		if _, err := lines.Put(map[string]any{"account": account, "amount": 1.0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := 0
+	if err := lines.Totals("per_account", Range{}, func(Totals) bool {
+		seen++
+		return false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 1 {
+		t.Errorf("a read refused after one row went on to %d", seen)
+	}
+
+	// And again where the rows had to be merged out of several partitions,
+	// which is a different loop handing them over.
+	_, _, split := partitioned(t, 414)
+	months, err := split.Declare(Spec{
+		Name:      "lines",
+		Key:       Key{Path: "id", Type: TypeString, Auto: "ulid"},
+		Partition: &Partition{By: ByTime, Every: EveryMonth},
+		Rollups: []Rollup{{
+			Name:  "per_account",
+			Group: []Field{{Path: "account", Type: TypeString, Missing: MissingSkip}},
+			Count: true, Sum: []string{"amount"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := split.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for i, month := range []time.Month{time.January, time.February} {
+		atMonth(t, split, time.Date(2026, month, 10, 0, 0, 0, 0, time.UTC))
+		for _, account := range []string{"bank", "cash", "petty"} {
+			if _, err := months.Put(map[string]any{"account": account, "amount": float64(i + 1)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := split.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	seen = 0
+	if err := months.Totals("per_account", Range{}, func(Totals) bool {
+		seen++
+		return false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 1 {
+		t.Errorf("a merged read refused after one row went on to %d", seen)
+	}
+}
+
+// TestTheFirstRowOfATotalReadDoesNotCostTheWholeRange: the check in ops.go
+// refuses a partitioned rollup read over a range because holding every group
+// in it is memory bounded by the data rather than by the operation. The same
+// rule has to hold for the ordinary unpartitioned read, or the rule does not
+// apply to its own implementation — so a read that wants one row must not pay
+// for the thousand behind it.
+//
+// Measured rather than asserted about, because "streams" is not something a
+// return value can say. Two reads of the same data, one that stops at the
+// first row and one that takes all of them, and what is compared is how much
+// each had to allocate.
+func TestTheFirstRowOfATotalReadDoesNotCostTheWholeRange(t *testing.T) {
+	_, store := fresh(t, 415)
+	lines := takings(t, store)
+
+	for i := 0; i < 600; i++ {
+		if _, err := lines.Put(map[string]any{"account": fmt.Sprintf("a%04d", i), "amount": 1.0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	cost := func(stopEarly bool) uint64 {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if err := lines.Totals("per_account", Range{}, func(Totals) bool {
+			return !stopEarly
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	everything := cost(false)
+	justOne := cost(true)
+	if justOne*4 > everything {
+		t.Errorf("one row of six hundred cost %d bytes where all of them cost %d", justOne, everything)
 	}
 }
