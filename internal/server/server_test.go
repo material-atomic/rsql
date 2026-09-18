@@ -164,7 +164,7 @@ func (c *client) open(server *Server, account, name string) protocol.Frame {
 
 func (c *client) invoke(name string, arguments map[string]any) protocol.Frame {
 	c.t.Helper()
-	c.send(protocol.Invoke, call{Operation: name, Arguments: arguments})
+	c.send(protocol.Invoke, call{Command: name, Arguments: arguments})
 	return c.read()
 }
 
@@ -226,10 +226,10 @@ func TestTheAnswerIsTaggedWithTheCallThatAskedForIt(t *testing.T) {
 
 	// Three calls before reading any answer: the ids are the only thing tying
 	// them together.
-	first := client.send(protocol.Invoke, call{Operation: "articles.add",
+	first := client.send(protocol.Invoke, call{Command: "articles.add",
 		Arguments: map[string]any{"title": "One", "author": "ann"}})
 	second := client.send(protocol.Ping, nil)
-	third := client.send(protocol.Invoke, call{Operation: "articles.by_author",
+	third := client.send(protocol.Invoke, call{Command: "articles.by_author",
 		Arguments: map[string]any{"author": "ann"}})
 
 	for _, want := range []struct {
@@ -331,7 +331,8 @@ func TestAnOperationThatNeedsAScopeIsRefusedOverTheWire(t *testing.T) {
 	if frame.Type != protocol.Failure {
 		t.Fatalf("an operation needing a scope ran anyway: %s", frame.Payload)
 	}
-	if !strings.Contains(string(frame.Payload), "may not run") {
+	// The code is what a driver acts on; the message is for whoever reads it.
+	if !strings.Contains(string(frame.Payload), `"code":"not_allowed"`) {
 		t.Errorf("the failure reads %s", frame.Payload)
 	}
 }
@@ -498,7 +499,7 @@ func TestAConnectionThatSaysNothingUsefulIsRefused(t *testing.T) {
 	for name, opening := range map[string]func(*client){
 		"a ping before the handshake": func(c *client) { c.send(protocol.Ping, nil) },
 		"an invoke before the handshake": func(c *client) {
-			c.send(protocol.Invoke, call{Operation: "articles.add"})
+			c.send(protocol.Invoke, call{Command: "articles.add"})
 		},
 		"a hello that is not json": func(c *client) {
 			frame, _ := protocol.Encode(protocol.Frame{
@@ -586,13 +587,14 @@ func TestTheHandshakeSaysWhatWasWrongWithIt(t *testing.T) {
 
 	client := dial(t, address)
 	// A well-formed Invoke, which happens to parse as an empty hello.
-	client.send(protocol.Invoke, call{Operation: "articles.add"})
+	client.send(protocol.Invoke, call{Command: "articles.add"})
 
 	frame := client.read()
 	if frame.Type != protocol.Failure {
 		t.Fatalf("it was answered with a %s", frame.Type)
 	}
-	if !strings.Contains(string(frame.Payload), "began with a invoke frame") {
+	if !strings.Contains(string(frame.Payload), `"code":"handshake"`) ||
+		!strings.Contains(string(frame.Payload), "began with a invoke frame") {
 		t.Errorf("the failure blames something else: %s", frame.Payload)
 	}
 	_ = server
@@ -651,7 +653,7 @@ func TestManyConnectionsToOneDatabase(t *testing.T) {
 
 			for i := 0; i < each; i++ {
 				if err := send(uint32(i+2), protocol.Invoke, call{
-					Operation: "articles.add",
+					Command:   "articles.add",
 					Arguments: map[string]any{"title": fmt.Sprintf("c%d-%d", c, i), "author": "ann"},
 				}); err != nil {
 					done <- err

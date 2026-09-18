@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/material-atomic/rsql/internal/server"
+	"github.com/material-atomic/rsql/internal/signing"
 )
 
 // DefaultAddress is the port a connection string assumes when it names none.
@@ -68,11 +69,18 @@ func FromEnv(lookup func(string) (string, bool)) (Config, error) {
 		return value == "1" || value == "true" || value == "yes"
 	}
 
+	label := get("RSQL_LABEL", "")
+	if strings.EqualFold(label, "direct") {
+		// The plainer form, which has to be asked for by name: its sentinel is
+		// deliberately not something a blank field can produce.
+		label = signing.Direct
+	}
+
 	config := Config{
 		Address:  get("RSQL_ADDR", DefaultAddress),
 		Dir:      get("RSQL_DIR", DefaultDir),
 		Secret:   get("RSQL_SECRET", ""),
-		Label:    get("RSQL_LABEL", ""),
+		Label:    label,
 		CertFile: get("RSQL_TLS_CERT", ""),
 		KeyFile:  get("RSQL_TLS_KEY", ""),
 		Insecure: flag("RSQL_INSECURE"),

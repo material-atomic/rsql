@@ -39,9 +39,10 @@ import (
 const dbKeyLabel = "rsql/server:database:v1"
 
 var (
-	ErrHandshake = errors.New("rsql/server: the connection did not open properly")
-	ErrName      = errors.New("rsql/server: that is not a usable account or database name")
-	ErrClosed    = errors.New("rsql/server: the server is closed")
+	ErrHandshake  = errors.New("rsql/server: the connection did not open properly")
+	ErrName       = errors.New("rsql/server: that is not a usable account or database name")
+	ErrClosed     = errors.New("rsql/server: the server is closed")
+	ErrNotAllowed = errors.New("rsql/server: this connection may not reach that database")
 )
 
 // Options are what a server needs to run.
@@ -141,7 +142,7 @@ func (s *Server) Close() error {
 func (s *Server) Handle(conn io.ReadWriter) error {
 	reader := protocol.NewReader(conn).Accept(protocol.Version)
 
-	db, opened, err := s.handshake(reader, conn)
+	live, err := s.handshake(reader, conn)
 	if err != nil {
 		// The client is told why, then the connection ends: a handshake that
 		// failed must not leave a socket that looks usable.
@@ -168,7 +169,7 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 			return nil
 
 		case protocol.Invoke:
-			result, err := s.invoke(db, opened, frame.Payload)
+			result, err := s.invoke(live, frame.Payload)
 			if err != nil {
 				if err := write(conn, protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
 					return err
@@ -192,85 +193,146 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 }
 
 // hello is what a client opens with.
+//
+// In "bound" mode the database is named here and fixed for the connection. In
+// "account" mode it is not: one connection serves every database of an
+// account, and each call names its own and carries its own signature.
+//
+// That means an account-mode handshake proves nothing, and is not treated as
+// if it did. The connection grants no access at all; every call is verified on
+// its way through. Anything else would make the handshake a credential for
+// databases it never named.
 type hello struct {
 	Account   string `json:"account"`
 	Password  string `json:"password"`
 	DBName    string `json:"dbname"`
 	Signature string `json:"sig"`
+	Mode      string `json:"mode"`
+}
+
+// session is what one connection knows.
+type session struct {
+	opening hello
+	// bound is the database of a bound connection, and nil for an account one.
+	bound *database
+	// verified is the databases this connection has already shown a signature
+	// for. Checking a signature is an HMAC, which is cheap, but doing it per
+	// call on a hot connection is work nobody asked for — and the answer cannot
+	// change while the connection lives.
+	verified map[string]*database
 }
 
 // welcome is what it gets back.
 type welcome struct {
 	Version   uint8  `json:"version"`
 	Account   string `json:"account"`
-	DBName    string `json:"dbname"`
-	LSN       uint64 `json:"lsn"`
+	DBName    string `json:"dbname,omitempty"`
+	Mode      string `json:"mode"`
+	LSN       uint64 `json:"lsn,omitempty"`
 	Encrypted bool   `json:"encrypted"`
 }
 
-func (s *Server) handshake(reader *protocol.Reader, conn io.Writer) (*database, hello, error) {
+// How a connection is scoped.
+const (
+	ModeBound   = "bound"
+	ModeAccount = "account"
+)
+
+func (s *Server) handshake(reader *protocol.Reader, conn io.Writer) (*session, error) {
 	frame, err := reader.Read()
 	if err != nil {
-		return nil, hello{}, fmt.Errorf("%w: %v", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: %v", ErrHandshake, err)
 	}
 	if frame.Type != protocol.Hello {
-		return nil, hello{}, fmt.Errorf("%w: it began with a %s frame", ErrHandshake, frame.Type)
+		return nil, fmt.Errorf("%w: it began with a %s frame", ErrHandshake, frame.Type)
 	}
 
 	opening := hello{}
 	if err := json.Unmarshal(frame.Payload, &opening); err != nil {
-		return nil, hello{}, fmt.Errorf("%w: %v", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: %v", ErrHandshake, err)
+	}
+	if opening.Mode == "" {
+		opening.Mode = ModeBound
 	}
 
-	// The signature is checked before anything is opened or created. A name
-	// nobody signed for must not so much as cause a file to appear.
-	parts := signing.Parts{
-		AccountID: opening.Account,
-		Password:  opening.Password,
-		DBName:    opening.DBName,
-	}
-	if !signing.Verify(opening.Signature, parts, s.options.Secret, s.options.Label) {
-		return nil, hello{}, fmt.Errorf("%w: %v", ErrHandshake, signing.ErrBadSignature)
+	live := &session{opening: opening, verified: map[string]*database{}}
+	greeting := welcome{Version: protocol.Version, Account: opening.Account, Mode: opening.Mode, Encrypted: s.options.Encrypt}
+
+	switch opening.Mode {
+	case ModeBound:
+		// The signature is checked before anything is opened or created. A name
+		// nobody signed for must not so much as cause a file to appear.
+		db, err := s.verify(opening.Account, opening.DBName, opening.Password, opening.Signature)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrHandshake, err)
+		}
+		live.bound = db
+		live.verified[opening.DBName] = db
+
+		db.mutex.Lock()
+		lsn, err := db.store.LatestLSN()
+		db.mutex.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		greeting.DBName, greeting.LSN = opening.DBName, lsn
+
+	case ModeAccount:
+		// Nothing is opened and nothing is verified here, because there is
+		// nothing yet to verify against: the signature a client holds is for a
+		// database this handshake does not name. Every call brings its own.
+
+	default:
+		return nil, fmt.Errorf("%w: no mode called %q", ErrHandshake, opening.Mode)
 	}
 
-	db, err := s.database(opening.Account, opening.DBName)
+	body, err := json.Marshal(greeting)
 	if err != nil {
-		return nil, hello{}, err
-	}
-
-	db.mutex.Lock()
-	lsn, err := db.store.LatestLSN()
-	db.mutex.Unlock()
-	if err != nil {
-		return nil, hello{}, err
-	}
-
-	body, err := json.Marshal(welcome{
-		Version: protocol.Version, Account: opening.Account, DBName: opening.DBName,
-		LSN: lsn, Encrypted: s.options.Encrypt,
-	})
-	if err != nil {
-		return nil, hello{}, err
+		return nil, err
 	}
 	if err := write(conn, protocol.Frame{Type: protocol.Welcome, ID: frame.ID}, body); err != nil {
-		return nil, hello{}, err
+		return nil, err
 	}
-	return db, opening, nil
+	return live, nil
+}
+
+// verify checks a signature and opens the database it is for.
+func (s *Server) verify(account, name, password, signature string) (*database, error) {
+	parts := signing.Parts{AccountID: account, Password: password, DBName: name}
+	if !signing.Verify(signature, parts, s.options.Secret, s.options.Label) {
+		return nil, signing.ErrBadSignature
+	}
+	return s.database(account, name)
 }
 
 // call is one invocation on the wire.
+//
+// The field names are the client's, not this server's preference. They are the
+// contract, and a server that renames them is a server the published driver
+// cannot talk to — which is worth rather more than a tidier spelling.
 type call struct {
-	Operation string         `json:"op"`
+	Command   string         `json:"command"`
 	Version   int            `json:"version,omitempty"`
 	Arguments map[string]any `json:"args,omitempty"`
-	WriteID   string         `json:"write_id,omitempty"`
+	WriteID   string         `json:"writeId,omitempty"`
+
+	// DBName and Signature are how an account-wide connection says which
+	// database this call is for, and proves it may.
+	DBName    string `json:"dbname,omitempty"`
+	Signature string `json:"sig,omitempty"`
 }
 
-func (s *Server) invoke(db *database, opened hello, payload []byte) ([]byte, error) {
+func (s *Server) invoke(live *session, payload []byte) ([]byte, error) {
 	asked := call{}
 	if err := json.Unmarshal(payload, &asked); err != nil {
 		return nil, fmt.Errorf("rsql/server: the call does not read as one: %w", err)
 	}
+
+	db, err := s.reach(live, asked)
+	if err != nil {
+		return nil, err
+	}
+	opened := live.opening
 
 	// One writer at a time per database, which is what the engine underneath
 	// allows. Connections to one database queue here rather than racing.
@@ -283,7 +345,7 @@ func (s *Server) invoke(db *database, opened hello, payload []byte) ([]byte, err
 	// safe direction to be incomplete in.
 	caller := store.Caller{Actor: opened.Account, WriteID: asked.WriteID}
 
-	result, err := db.store.Invoke(caller, asked.Operation, asked.Version, asked.Arguments)
+	result, err := db.store.Invoke(caller, asked.Command, asked.Version, asked.Arguments)
 	if err != nil {
 		return nil, err
 	}
@@ -293,6 +355,35 @@ func (s *Server) invoke(db *database, opened hello, payload []byte) ([]byte, err
 		}
 	}
 	return json.Marshal(result)
+}
+
+// reach is the database a call is for, and the check that it may be.
+//
+// A bound connection has one and calls name none. An account connection names
+// one per call and signs for it — and the answer is remembered, because an
+// HMAC per call on a hot connection is work nobody asked for and the answer
+// cannot change while the connection lives.
+func (s *Server) reach(live *session, asked call) (*database, error) {
+	if live.bound != nil {
+		if asked.DBName != "" && asked.DBName != live.opening.DBName {
+			return nil, fmt.Errorf("%w: this connection is bound to %q", ErrNotAllowed, live.opening.DBName)
+		}
+		return live.bound, nil
+	}
+
+	if asked.DBName == "" {
+		return nil, fmt.Errorf("%w: an account-wide connection needs the database on every call", ErrNotAllowed)
+	}
+	if db, found := live.verified[asked.DBName]; found {
+		return db, nil
+	}
+
+	db, err := s.verify(live.opening.Account, asked.DBName, live.opening.Password, asked.Signature)
+	if err != nil {
+		return nil, err
+	}
+	live.verified[asked.DBName] = db
+	return db, nil
 }
 
 // database opens the file for an account and name, or returns the one already
@@ -431,13 +522,48 @@ func write(conn io.Writer, frame protocol.Frame, payload []byte) error {
 }
 
 // failure is what a client is told when something did not work.
+//
+// A message and a code, because a client that only receives prose cannot act
+// on it: retry, ask for credentials again, or give up are different answers,
+// and telling them apart by matching strings is how a driver breaks when a
+// server improves its wording.
 func failure(err error) []byte {
 	body, marshalled := json.Marshal(struct {
-		Error string `json:"error"`
-		At    int64  `json:"at"`
-	}{Error: err.Error(), At: time.Now().UnixMilli()})
+		Message string `json:"message"`
+		Code    string `json:"code"`
+		At      int64  `json:"at"`
+	}{Message: err.Error(), Code: codeFor(err), At: time.Now().UnixMilli()})
 	if marshalled != nil {
-		return []byte(`{"error":"rsql/server: the failure could not be described"}`)
+		return []byte(`{"message":"rsql/server: the failure could not be described","code":"failed"}`)
 	}
 	return body
+}
+
+// codeFor names what kind of failure this is, in a word a client can switch on.
+func codeFor(err error) string {
+	for _, known := range []struct {
+		err  error
+		code string
+	}{
+		{signing.ErrBadSignature, "signature"},
+		{ErrHandshake, "handshake"},
+		{ErrName, "name"},
+		{ErrClosed, "closed"},
+		{store.ErrNoOperation, "no_operation"},
+		{store.ErrArgument, "argument"},
+		{store.ErrNotAllowed, "not_allowed"},
+		{store.ErrExists, "exists"},
+		{store.ErrDuplicate, "duplicate"},
+		{store.ErrType, "type"},
+		{store.ErrNoCollection, "no_collection"},
+		{store.ErrNoIndex, "no_index"},
+		{store.ErrNoKey, "no_key"},
+		{store.ErrDeclaration, "declaration"},
+		{store.ErrDamaged, "damaged"},
+	} {
+		if errors.Is(err, known.err) {
+			return known.code
+		}
+	}
+	return "failed"
 }

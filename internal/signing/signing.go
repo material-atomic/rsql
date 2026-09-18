@@ -22,7 +22,14 @@ const DefaultLabel = "ecosy/rsql:connection:v1"
 
 // Direct signs with the secret itself, the plainer form — the app passes
 // label: null for it.
-const Direct = ""
+//
+// Its value is deliberately not the empty string. A blank configuration field
+// must never select this: the two forms produce different signatures, so a
+// server that fell back to it would refuse every string a client signed the
+// ordinary way, and every test on one side would still pass because both sides
+// of that side agree. That is exactly what happened here before this was a
+// sentinel.
+const Direct = "\x00rsql:direct"
 
 // PasswordPattern is what a password may be.
 //
@@ -81,9 +88,15 @@ func Message(parts Parts) (string, error) {
 // key is what the signature is made with: derived under a label, or the secret
 // itself when label is Direct.
 func key(secret, label string) []byte {
-	if label == Direct {
+	switch label {
+	case Direct:
 		return []byte(secret)
+	case "":
+		// Nothing said means the ordinary form, which is what every client
+		// does by default. The dangerous answer is never the silent one.
+		label = DefaultLabel
 	}
+
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(label))
 	return mac.Sum(nil)

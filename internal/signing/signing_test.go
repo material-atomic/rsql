@@ -151,3 +151,42 @@ func TestVerifyIsFalseNotFatal(t *testing.T) {
 		t.Error("hex case is not part of the contract")
 	}
 }
+
+// A label nobody set must be the ordinary derived one, not the plainer form.
+//
+// The two produce different signatures, so a server that quietly chose the
+// plain form would refuse every connection string a client signed normally —
+// and every test in this repository would still pass, because both sides of
+// this repository would agree with each other. That is what happened, and it
+// was found by running a TypeScript client against the Go server rather than
+// by any test here.
+func TestAnUnsetLabelIsTheDefaultOneAndNotTheDirectForm(t *testing.T) {
+	parts := Parts{AccountID: "acme", Password: "a-password-of-the-right-shape", DBName: "main"}
+	const secret = "the secret only the control plane has"
+
+	blank, err := Sign(parts, secret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived, err := Sign(parts, secret, DefaultLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := Sign(parts, secret, Direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if blank != derived {
+		t.Errorf("an unset label signs differently from the default one:\n %s\n %s", blank, derived)
+	}
+	if blank == direct {
+		t.Error("an unset label selected the direct form")
+	}
+	if !Verify(blank, parts, secret, "") || !Verify(blank, parts, secret, DefaultLabel) {
+		t.Error("a signature made with no label does not verify with the default one")
+	}
+	if Verify(direct, parts, secret, "") {
+		t.Error("a direct signature verified against an unset label")
+	}
+}

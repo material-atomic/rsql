@@ -87,6 +87,7 @@ type options struct {
 	db      string
 	encrypt bool
 	secret  string
+	label   string
 }
 
 func run(args []string, lookup func(string) (string, bool), stdin io.Reader, stdout io.Writer) error {
@@ -97,12 +98,18 @@ func run(args []string, lookup func(string) (string, bool), stdin io.Reader, std
 		return fallback
 	}
 
+	label := get("RSQL_LABEL", "")
+	if strings.EqualFold(label, "direct") {
+		label = signing.Direct
+	}
+
 	opts := options{
 		dir:     get("RSQL_DIR", "/var/lib/rsql"),
 		account: get("RSQL_ACCOUNT", ""),
 		db:      get("RSQL_DB", ""),
 		secret:  get("RSQL_SECRET", ""),
 		encrypt: strings.EqualFold(get("RSQL_ENCRYPT", ""), "1") || strings.EqualFold(get("RSQL_ENCRYPT", ""), "true"),
+		label:   label,
 	}
 
 	rest, err := parse(args, &opts)
@@ -476,7 +483,7 @@ func url(opts options, args []string, stdin io.Reader, out io.Writer) error {
 	// the rule changes.
 	signature, err := signing.Sign(
 		signing.Parts{AccountID: opts.account, Password: password, DBName: opts.db},
-		opts.secret, "",
+		opts.secret, opts.label,
 	)
 	if err != nil {
 		return err

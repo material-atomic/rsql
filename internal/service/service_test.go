@@ -249,7 +249,7 @@ func TestItServesOverTLSAndStopsWhenTold(t *testing.T) {
 		t.Fatalf("handshake: %s %v", frame.Type, err)
 	}
 
-	send(2, protocol.Invoke, map[string]any{"op": "notes.add", "args": map[string]any{"body": "over tls"}})
+	send(2, protocol.Invoke, map[string]any{"command": "notes.add", "args": map[string]any{"body": "over tls"}})
 	frame, err := reader.Read()
 	if err != nil || frame.Type != protocol.Result {
 		t.Fatalf("invoke: %s %v %s", frame.Type, err, frame.Payload)
