@@ -215,6 +215,27 @@ func (s *Store) OldestLSN() (uint64, error) {
 	return oldest, err
 }
 
+// CanFollow says whether a consumer that has seen everything up to `from`-1
+// can carry on from the log, or has fallen so far behind that the entries it
+// needs have been trimmed and it must be rebuilt from a dump.
+//
+// This is a question worth one call rather than a comparison everyone repeats:
+// to follow from an entry, that entry must still be there, and getting the
+// off-by-one wrong means a replica that silently skips a change.
+func (s *Store) CanFollow(from uint64) (bool, error) {
+	oldest, err := s.OldestLSN()
+	if err != nil {
+		return false, err
+	}
+	if oldest == 0 {
+		// Nothing is kept, so there is nothing to miss: a consumer is up to
+		// date exactly when it has seen everything written.
+		latest, err := s.latestLSN()
+		return from > latest, err
+	}
+	return from >= oldest, nil
+}
+
 // Wrote reports what a write id already did, for a caller retrying a write it
 // is not sure landed.
 func (s *Store) Wrote(id string) (uint64, any, bool, error) {

@@ -31,6 +31,7 @@ var nextCollection = []byte{spaceMeta, 'c', 'o', 'l', 'l'}
 // One writer at a time, which is what the tree underneath allows. Readers take
 // a snapshot and are unaffected by anything written afterwards.
 type Store struct {
+	pages       *pager.Pager
 	tree        *btree.Tree
 	collections map[string]*Collection
 	ids         *ulid.Source
@@ -42,6 +43,7 @@ type Store struct {
 // Open reads the catalogue of an existing database, or starts an empty one.
 func Open(pages *pager.Pager) (*Store, error) {
 	store := &Store{
+		pages:       pages,
 		tree:        btree.New(pages),
 		collections: map[string]*Collection{},
 		ids:         ulid.New(),
