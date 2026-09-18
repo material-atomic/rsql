@@ -367,6 +367,12 @@ func sameOperation(stored, wanted store.Operation) bool {
 }
 
 func list(db *store.Store, out io.Writer) error {
+	// First, because how the database was last left decides whether anything
+	// below is the whole story.
+	if state := db.HowItWasLeft(); state != "" {
+		fmt.Fprintln(out, state)
+	}
+
 	for _, name := range db.Collections() {
 		collection, err := db.Collection(name)
 		if err != nil {

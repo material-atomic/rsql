@@ -423,3 +423,32 @@ func TestOpeningALedStoreReadsTheFreeListItWasToldAbout(t *testing.T) {
 		t.Errorf("the next page is %d; the free one was %d", again, spare)
 	}
 }
+
+// TestClosingALedStoreLeavesItsLabelAlone: a led file has no meta pages, so
+// page 0 is its label. A close that wrote a mark there would overwrite the one
+// page saying what the file is — and the partition would come back as not an
+// rsql file at all.
+func TestClosingALedStoreLeavesItsLabelAlone(t *testing.T) {
+	disk := vfs.NewSim(14, vfs.Faults{})
+	pages, err := CreateLed(disk, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := filled(t, pages, 0x77)
+	at, err := pages.Flush(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pages.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	back := vfs.NewSim(14, vfs.Faults{})
+	back.Restore(disk.Durable())
+	reopened, err := OpenLed(back, at, Options{})
+	if err != nil {
+		t.Fatalf("after closing, the partition is not readable: %v", err)
+	}
+	holds(t, reopened, id, 0x77)
+}

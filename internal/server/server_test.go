@@ -759,3 +759,117 @@ func TestEveryFailureAClientMustTellApartHasItsOwnCode(t *testing.T) {
 		}
 	}
 }
+
+// TestTheServerSaysWhenADatabaseWasNotShutDown: surviving a power cut quietly
+// is most of the job and not all of it. The operator asking "why is that write
+// missing" needs something to read, and the answer is bounded in a way worth
+// saying: one operation at most, and one nobody was told had succeeded.
+func TestTheServerSaysWhenADatabaseWasNotShutDown(t *testing.T) {
+	dir := t.TempDir()
+
+	// A database written to and then left, the way a killed process leaves one.
+	first, err := New(Options{Dir: dir, Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	declare(t, first, "acme", "main")
+	db, release, err := first.Store("acme", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Invoke(store.Caller{}, "articles.add", 0, map[string]any{
+		"title": "written", "author": "ann",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	// The disk as a power cut would leave it: everything that was committed is
+	// on it, and nothing was closed. Copying it is the honest way to produce
+	// that — the alternative is a way to close a file without marking it,
+	// which would be production code existing only for a test.
+	crashed := t.TempDir()
+	copyTree(t, dir, crashed)
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir = crashed
+
+	said := []string{}
+	second, err := New(Options{Dir: dir, Secret: secret, Notice: func(line string) {
+		said = append(said, line)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	_, letGo, err := second.Store("acme", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	letGo()
+	if len(said) != 1 {
+		t.Fatalf("opening a database that was left said %v", said)
+	}
+	if !strings.Contains(said[0], "acme/main") || !strings.Contains(said[0], "not closed cleanly") {
+		t.Errorf("it said: %s", said[0])
+	}
+
+	// And a database closed properly says nothing, because there is nothing to
+	// say and a notice that appears every time is one nobody reads.
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	said = nil
+	third, err := New(Options{Dir: dir, Secret: secret, Notice: func(line string) {
+		said = append(said, line)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = third.Close() })
+
+	_, done, err := third.Store("acme", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done()
+	if len(said) != 0 {
+		t.Errorf("opening a database that was closed properly said %v", said)
+	}
+}
+
+// copyTree copies a directory, which is what a disk looks like after a crash:
+// everything that was made durable, and no shutdown.
+func copyTree(t *testing.T, from, to string) {
+	t.Helper()
+
+	err := filepath.WalkDir(from, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(from, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(to, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		// The lock file is the running process, not the database.
+		if entry.Name() == ".lock" {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

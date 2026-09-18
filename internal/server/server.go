@@ -60,6 +60,11 @@ type Options struct {
 	// secret. It protects a stolen disk, not a compromised server — the server
 	// can read every database it serves, by construction.
 	Encrypt bool
+
+	// Notice is where the server says things that are nobody's request and
+	// somebody's business — a database that was not closed cleanly, most of
+	// all. Nil says them nowhere.
+	Notice func(string)
 }
 
 // Server holds the open databases and serves connections.
@@ -565,6 +570,10 @@ func (s *Server) openFile(path, account, name string) (*database, error) {
 		return nil, err
 	}
 	opened.Keep(folder, options.Key)
+
+	// Said once, when the file is opened, because that is when it is known and
+	// because saying it on every call would train people to stop reading it.
+	s.sayHowItWasLeft(account, name, pages)
 	return &database{pages: pages, store: opened, file: file, changed: make(chan struct{})}, nil
 }
 
@@ -676,4 +685,44 @@ func codeFor(err error) string {
 		}
 	}
 	return "failed"
+}
+
+// sayHowItWasLeft reports a database that was not shut down.
+//
+// rsql survives losing power — two meta pages and an order of writes that has
+// no recovery path to get wrong — but until this it survived it silently. The
+// database came back at its last committed transaction and nothing anywhere
+// said the machine had gone down, so the operator asking "why is that write
+// missing" had nothing to read.
+//
+// What it says is bounded, and the bound is worth saying too. Every operation
+// here is a transaction and the server answers only after committing, so the
+// most that a power cut can discard is one operation — and one whose caller
+// was never told it had succeeded. A database with interactive transactions
+// can lose half an hour of somebody's work. This cannot, because there is no
+// begin to hold half an hour in.
+func (s *Server) sayHowItWasLeft(account, name string, pages *pager.Pager) {
+	if s.options.Notice == nil || pages.Meta().Clean {
+		return
+	}
+
+	where := account + "/" + name
+	left, err := pages.Interrupted()
+	if err != nil || left == 0 {
+		s.options.Notice(fmt.Sprintf(
+			"%s was not closed cleanly; it is at transaction %d, which is the last one that was committed",
+			where, pages.Meta().TxID))
+		return
+	}
+
+	s.options.Notice(fmt.Sprintf(
+		"%s was not closed cleanly; it is at transaction %d, and %d pages of an operation that never committed have been discarded — no client was ever told that operation succeeded",
+		where, pages.Meta().TxID, left))
+}
+
+// Say sets where the server reports things nobody asked for.
+func (s *Server) Say(notice func(string)) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.options.Notice = notice
 }

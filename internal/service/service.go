@@ -175,6 +175,12 @@ func (s *Service) Server() *server.Server { return s.server }
 // nothing is lost either way — but cutting a client off mid-answer for no
 // reason is rudeness with no benefit.
 func (s *Service) Serve(ctx context.Context, announce io.Writer) error {
+	// Databases are opened on demand, so what a database has to say about how
+	// it was last left is said while the server is running, not before.
+	if announce != nil {
+		s.server.Say(func(line string) { fmt.Fprintf(announce, "rsql: %s\n", line) })
+	}
+
 	if announce != nil {
 		scheme := "rsql+tls"
 		if s.config.CertFile == "" {

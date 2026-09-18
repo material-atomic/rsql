@@ -446,3 +446,166 @@ func crashDuringWork(t *testing.T, seed int64, faults vfs.Faults) (*vfs.SimDisk,
 }
 
 func isOneOfOurs(fill byte) bool { return fill >= 'a' && fill <= 'd' }
+
+// TestADatabaseKnowsWhetherItWasClosedOrLeft: rsql survives losing power, but
+// until now it survived it silently — the database came back at the last
+// committed transaction and nothing anywhere said the machine had gone down.
+// The operator reading "why is that write missing" had nothing to read.
+func TestADatabaseKnowsWhetherItWasClosedOrLeft(t *testing.T) {
+	disk := vfs.NewSim(70, vfs.Faults{})
+	pages, err := Create(disk, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := filled(t, pages, 0x51)
+	if err := pages.Commit(id); err != nil {
+		t.Fatal(err)
+	}
+
+	// The power goes: no close, so no mark.
+	crashed := vfs.NewSim(70, vfs.Faults{})
+	crashed.Restore(disk.Durable())
+	after, err := Open(crashed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Meta().Clean {
+		t.Error("a database that was never closed says it was")
+	}
+	if after.Meta().Root != id {
+		t.Errorf("the last committed transaction came back as root %d, want %d", after.Meta().Root, id)
+	}
+
+	// And a proper close leaves the mark, without disturbing the transaction.
+	if err := after.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := vfs.NewSim(70, vfs.Faults{})
+	closed.Restore(crashed.Durable())
+	reopened, err := Open(closed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.Meta().Clean {
+		t.Error("a database that was closed says it was not")
+	}
+	if reopened.Meta().Root != id || reopened.Meta().TxID != after.Meta().TxID {
+		t.Errorf("closing moved the database: %+v", reopened.Meta())
+	}
+
+	// Writing again clears it, so the next crash is reported as one rather
+	// than inheriting the last clean close.
+	next := filled(t, reopened, 0x52)
+	if err := reopened.Commit(next); err != nil {
+		t.Fatal(err)
+	}
+	working := vfs.NewSim(70, vfs.Faults{})
+	working.Restore(closed.Durable())
+	busy, err := Open(working, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if busy.Meta().Clean {
+		t.Error("a database that was being written to when the power went says it was closed")
+	}
+	if busy.Meta().Root != next {
+		t.Errorf("the committed transaction is not the one that came back: %+v", busy.Meta())
+	}
+}
+
+// TestHowMuchWasInFlightWhenThePowerWent: pages past what the last commit
+// counted are what a transaction that never finished had written. Harmless,
+// and evidence — the difference between "we lost power" and "we lost power in
+// the middle of something".
+func TestHowMuchWasInFlightWhenThePowerWent(t *testing.T) {
+	disk := vfs.NewSim(71, vfs.Faults{})
+	pages, err := Create(disk, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := filled(t, pages, 0x61)
+	if err := pages.Commit(id); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := pages.Interrupted(); err != nil || left != 0 {
+		t.Fatalf("a committed database reports %d pages in flight, %v", left, err)
+	}
+
+	// A transaction that wrote three pages and was never committed, with the
+	// writes reaching the disk.
+	for i := 0; i < 3; i++ {
+		filled(t, pages, byte(0x70+i))
+	}
+	if err := disk.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	crashed := vfs.NewSim(71, vfs.Faults{})
+	crashed.Restore(disk.Durable())
+	after, err := Open(crashed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	left, err := after.Interrupted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != 3 {
+		t.Errorf("three pages were written and %d are reported", left)
+	}
+	if after.Meta().Root != id {
+		t.Errorf("the abandoned transaction came back: %+v", after.Meta())
+	}
+}
+
+// TestClosingDoesNotTouchThePageHoldingTheLastCommit: the mark goes in the
+// meta slot the last commit did not use. Written over the live one, a torn
+// write during shutdown would take the last committed transaction with it —
+// which would make closing the database the most dangerous thing you can do
+// to it.
+func TestClosingDoesNotTouchThePageHoldingTheLastCommit(t *testing.T) {
+	disk := vfs.NewSim(72, vfs.Faults{})
+	pages, err := Create(disk, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := filled(t, pages, 0x81)
+	if err := pages.Commit(id); err != nil {
+		t.Fatal(err)
+	}
+	live := 1 - pages.nextMeta
+
+	if err := pages.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	back := vfs.NewSim(72, vfs.Faults{})
+	back.Restore(disk.Durable())
+	reader, err := Open(back, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	committed, err := reader.readMeta(live)
+	if err != nil {
+		t.Fatalf("the page holding the last commit is no longer readable: %v", err)
+	}
+	if committed.Clean {
+		t.Error("closing wrote its mark over the page holding the last commit")
+	}
+	if committed.Root != id {
+		t.Errorf("that page now says root %d, want %d", committed.Root, id)
+	}
+
+	marked, err := reader.readMeta(1 - live)
+	if err != nil {
+		t.Fatalf("the mark is not readable: %v", err)
+	}
+	if !marked.Clean || marked.Root != id || marked.TxID != committed.TxID {
+		t.Errorf("the mark says %+v, and the commit says %+v", marked, committed)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/material-atomic/rsql/internal/pager"
 	"github.com/material-atomic/rsql/internal/ulid"
 	"github.com/material-atomic/rsql/internal/vfs"
+	"strings"
 )
 
 // endless is randomness that never runs out and never changes, which is what a
@@ -828,5 +829,56 @@ func TestAHandleToADroppedCollectionRefusesToWrite(t *testing.T) {
 	}
 	if _, err := held.Delete("a"); !errors.Is(err, ErrNoCollection) {
 		t.Errorf("delete: want ErrNoCollection, got %v", err)
+	}
+}
+
+// TestADatabaseSaysHowItWasLeft is what a tool prints before anything else,
+// because how the database was last left decides whether the rest is the whole
+// story.
+func TestADatabaseSaysHowItWasLeft(t *testing.T) {
+	disk, store := fresh(t, 95)
+	if _, err := store.Declare(articles()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Never closed: the state a killed process leaves.
+	crashed := vfs.NewSim(95, vfs.Faults{})
+	crashed.Restore(disk.Durable())
+	pages, err := pager.Open(crashed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, err := Open(pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	said := left.HowItWasLeft()
+	if !strings.Contains(said, "not closed cleanly") {
+		t.Errorf("a database that was killed says %q", said)
+	}
+	if !strings.Contains(said, "no client was ever told") && !strings.Contains(said, "last one committed") {
+		t.Errorf("it does not say what that means: %q", said)
+	}
+
+	// Closed properly: nothing to say, and a notice that appears every time is
+	// one nobody reads.
+	if err := pages.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := vfs.NewSim(95, vfs.Faults{})
+	closed.Restore(crashed.Durable())
+	again, err := pager.Open(closed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shut, err := Open(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if said := shut.HowItWasLeft(); said != "" {
+		t.Errorf("a database that was closed properly says %q", said)
 	}
 }

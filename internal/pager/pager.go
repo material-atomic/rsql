@@ -89,6 +89,7 @@ const (
 	offFreelist  = HeaderBytes + 32 // u64
 	offPageCount = HeaderBytes + 40 // u64
 	offEncrypted = HeaderBytes + 48 // u8
+	offClean     = HeaderBytes + 49 // u8
 	offSalt      = HeaderBytes + 56 // SaltBytes
 	offCheck     = HeaderBytes + 72 // NonceBytes + TagBytes
 	metaEnd      = HeaderBytes + 72 + NonceBytes + TagBytes
@@ -117,6 +118,16 @@ type Meta struct {
 	Root      uint64
 	Freelist  uint64
 	PageCount uint64
+
+	// Clean says this meta page was written by a proper close rather than by a
+	// commit. Its absence is how a database knows, when it opens, that the
+	// last thing to happen to it was not somebody shutting it down.
+	//
+	// It lives in a byte the old format left as zero, so a database made
+	// before this existed opens once reporting that it was not closed cleanly.
+	// Wrong, and wrong in the direction that tells somebody to look rather
+	// than the direction that says nothing.
+	Clean bool
 
 	// Encrypted, Salt and Check describe the key. They do not change after the
 	// database is created, and are copied into every meta page so that either
@@ -287,6 +298,13 @@ func (p *Pager) loadMeta() error {
 	case second.TxID > first.TxID:
 		p.meta, p.nextMeta = second, 0
 
+	// Same transaction in both means one of them was written by a close, which
+	// copies the current meta into the other slot with the clean mark on it.
+	// That copy is the later of the two, and it is the one to open at — the
+	// mark is the whole point of having written it.
+	case second.TxID == first.TxID && second.Clean && !first.Clean:
+		p.meta, p.nextMeta = second, 0
+
 	default:
 		p.meta, p.nextMeta = first, 1
 	}
@@ -448,6 +466,12 @@ func (p *Pager) Commit(root uint64) error {
 	next := p.meta
 	next.TxID, next.Root = p.meta.TxID+1, root
 
+	// A commit is the database being written to, so whatever the last close
+	// said is no longer true. Inherited, this mark would tell the operator
+	// after a power cut that the machine had been shut down properly — which
+	// is worse than not having the mark at all.
+	next.Clean = false
+
 	// The list pages written last time are replaced by the ones written below,
 	// so they are this transaction's garbage like any other page. Freed before
 	// the roll, so that they wait a transaction like everything else: a crash
@@ -503,6 +527,9 @@ func (p *Pager) writeMeta(id uint64, meta Meta) error {
 	if meta.Encrypted {
 		data[offEncrypted] = 1
 	}
+	if meta.Clean {
+		data[offClean] = 1
+	}
 	copy(data[offSalt:], meta.Salt[:])
 	copy(data[offCheck:], meta.Check[:])
 
@@ -542,6 +569,7 @@ func (p *Pager) readMeta(id uint64) (Meta, error) {
 		Freelist:  binary.BigEndian.Uint64(data[offFreelist:]),
 		PageCount: binary.BigEndian.Uint64(data[offPageCount:]),
 		Encrypted: data[offEncrypted] == 1,
+		Clean:     data[offClean] == 1,
 	}
 	copy(meta.Salt[:], data[offSalt:offSalt+SaltBytes])
 	copy(meta.Check[:], data[offCheck:offCheck+NonceBytes+TagBytes])
@@ -550,7 +578,42 @@ func (p *Pager) readMeta(id uint64) (Meta, error) {
 
 // Close releases the file. It does not commit: anything not committed was
 // never part of the database.
-func (p *Pager) Close() error { return p.file.Close() }
+//
+// It does leave a mark saying the file was closed rather than left. Written
+// into the meta slot the last commit did not use, as a copy of the current
+// meta with the mark set — never over the meta that is holding the last
+// transaction, because a torn write there would lose it. A crash during this
+// leaves the last transaction exactly where it was and the mark simply
+// absent, which is the right answer anyway.
+func (p *Pager) Close() error {
+	if !p.led && !p.meta.Clean {
+		marked := p.meta
+		marked.Clean = true
+		if err := p.writeMeta(p.nextMeta, marked); err == nil {
+			_ = p.file.Sync()
+		}
+	}
+	return p.file.Close()
+}
+
+// Interrupted is how many pages are in the file past what the last commit
+// counted.
+//
+// They are what a transaction that never finished had written. Harmless — the
+// next one allocates over them — but they are evidence, and the difference
+// between "we lost power" and "we lost power in the middle of something" is
+// worth being able to tell somebody.
+func (p *Pager) Interrupted() (uint64, error) {
+	size, err := p.file.Size()
+	if err != nil {
+		return 0, err
+	}
+	counted := int64(p.meta.PageCount) * PageBytes
+	if size <= counted {
+		return 0, nil
+	}
+	return uint64((size - counted) / PageBytes), nil
+}
 
 // seal writes the page's own header and its checksum.
 func seal(data []byte, id uint64, kind uint8) {

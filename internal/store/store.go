@@ -429,3 +429,26 @@ func matches(declared string, value any) bool {
 	}
 	return false
 }
+
+// HowItWasLeft is what happened to this database last time, or "" if it was
+// shut down properly.
+//
+// Surviving a power cut quietly is most of the job and not all of it: the
+// person asking why a write is missing needs something to read. The answer is
+// bounded, and the bound belongs in the sentence — every operation here is a
+// transaction and the answer goes back only after the commit, so the most a
+// power cut can discard is one operation, and one whose caller was never told
+// it had worked.
+func (s *Store) HowItWasLeft() string {
+	if s.pages.Meta().Clean {
+		return ""
+	}
+
+	left, err := s.pages.Interrupted()
+	if err != nil || left == 0 {
+		return fmt.Sprintf("this database was not closed cleanly; it is at transaction %d, the last one committed",
+			s.pages.Meta().TxID)
+	}
+	return fmt.Sprintf("this database was not closed cleanly; it is at transaction %d, and %d pages of an operation that never committed have been discarded — no client was ever told that operation succeeded",
+		s.pages.Meta().TxID, left)
+}
