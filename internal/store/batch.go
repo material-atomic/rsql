@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"reflect"
 )
 
 // A batch is several writes as one transaction.
@@ -219,13 +220,151 @@ func satisfies(document map[string]any, conditions []Condition, values map[strin
 // as an integer, so comparing them as `any` would make 1 and 1.0 different
 // things — which is the sort of difference nobody debugging a refused write
 // would think to look for.
+//
+// That reasoning does not stop at the outer value. condition.Equals is
+// declared TypeAny — a condition checks a document field, not an index bound,
+// so there is nothing here for a constant to encode into and so nothing to
+// refuse at declaration time (see task 0042) — and TypeAny accepts a slice or
+// an object exactly as it accepts a string. Either side of the comparison can
+// therefore be a []any or a map[string]any, and the 1-vs-1.0 difference can
+// sit one level down inside it just as easily as at the top: {"totals":[1]}
+// and {"totals":[1.0]} are the same document written two ways. A plain ==
+// on such a value does not just get that wrong, it panics outright — two
+// interface values whose dynamic type is a slice or a map are exactly what
+// Go means by "comparing uncomparable type", and unlike a Term's Value (see
+// sameTerm in ops.go) this is an ordinary field pulled out of a stored
+// document, not something a schema already limited. So this walks down: an
+// array compares element by element, an object compares by key, and only a
+// leaf that cannot be either falls back to reflect.DeepEqual — which never
+// panics, but which is not asked to do the numeric work, because DeepEqual
+// compares dynamic types and would call 1 and 1.0 different again.
+//
+// The trade this makes, so the next person does not have to rediscover it by
+// tripping over it: this recursion keeps no set of pairs it has already
+// visited, so a value that (directly or through something it contains) holds
+// itself makes it recurse forever instead of returning. JSON cannot build
+// one — json.Unmarshal only ever produces a tree — and that is why the left
+// side of every call satisfies makes, a document field read back out of this
+// store, can never be one: Put marshals a document to JSON before writing
+// it, json.Marshal refuses a cycle with its own error instead of hanging, so
+// a cyclic document is never stored in the first place. A declared
+// condition's constant (door one) is refused the same way, at declare time,
+// by DeclareOperation's own Marshal.
+//
+// Task 0042's QA round asked for the reach of this to be measured rather
+// than asserted, and the measured answer is narrower than an earlier draft
+// of this comment claimed. A single self-referential operand does not make
+// this function loop: the recursion always switches on and descends into
+// whichever value it is looking at, and the moment that walk reaches an
+// operand that is one of the two JSON-guaranteed trees above, the walk
+// bottoms out at that tree's real, finite depth — a length mismatch or a
+// failed type assertion ends it, exactly the way it would end an ordinary
+// comparison, regardless of what the other operand is doing. So sameValue
+// itself can only recurse forever if BOTH operands are self-referential at
+// once, which — because a document field never can be — means the only way
+// to trigger it is to call this unexported function directly with two
+// hand-built cyclic values. Only code inside this package can do that: a
+// test.
+//
+// That is not the same claim as "nothing outside this package can crash the
+// process with a cycle," and conflating the two would be the same kind of
+// mistake this paragraph is replacing. Door two — {"equals": {"arg": ...}} —
+// is declared TypeAny, and bind() (invoke.go) hands a caller's argument to
+// resolveIn exactly as given, with no encoding step in between. A caller of
+// the exported Invoke, in Go, in the same process, can pass a self-
+// referential slice or map as that argument, and nothing here refuses it.
+// sameValue survives that call — the paragraph above is why — but satisfies,
+// one call above it, does not: every condition that fails to match, which is
+// the ordinary outcome an optimistic-locking check exists to produce, formats
+// the value into its error with fmt.Errorf("%v", ...), and fmt's printer has
+// no cycle protection for a slice or map holding itself through a bare
+// interface. It recurses the identical shape sameValue would have and dies
+// the identical way. So the door this change leaves open is not sameValue's
+// own recursion; it is the error message one frame above it, and it is
+// reachable by any direct Go caller of Invoke, not only by a test — this
+// repo's own front doors do not reach it (cli/shell.go decodes every typed
+// word with json.Unmarshal before it ever becomes a Term or an argument, and
+// server.go decodes the wire frame the same way), but nothing stops code
+// that embeds this store as a library from calling Invoke with a hand-built
+// cyclic argument directly.
+//
+// Either way it happens, it happens the same way: the goroutine's stack
+// grows until the runtime gives up, and it gives up with `fatal error: stack
+// overflow` — a fatal error, not a panic, which no recover() anywhere can
+// catch, including one sitting at a connection's boundary. reflect.DeepEqual
+// would close the sameValue half of this (it tracks visited pairs and
+// terminates); it would not touch the satisfies/fmt.Errorf half at all,
+// because that crash never reaches sameValue. So this fix trades one
+// difference that only shows up through the direct Go API (1 and 1.0
+// disagreeing one level down, the reason this function walks at all) for a
+// cost of its own making (the recursion above) sitting next to a second cost
+// that was already there before this fix touched anything and is not this
+// fix's to close (the error path's unguarded %v). Going back to DeepEqual
+// would not buy that second one back — it has its own numeric mistake, and
+// it never runs the code that has the %v problem either. Both costs are
+// written down here, next to each other, because whoever reads this godoc
+// asking "can a cycle reach here" deserves the sharper answer, not the one
+// that stops at the function whose name is in the question.
 func sameValue(left, right any) bool {
 	if matches(TypeNumber, left) && matches(TypeNumber, right) && left != nil && right != nil {
 		return asNumber(left) == asNumber(right)
 	}
-	return left == right
+
+	switch typed := left.(type) {
+	case []any:
+		other, ok := right.([]any)
+		if !ok || len(typed) != len(other) {
+			return false
+		}
+		for i := range typed {
+			if !sameValue(typed[i], other[i]) {
+				return false
+			}
+		}
+		return true
+
+	case map[string]any:
+		other, ok := right.(map[string]any)
+		if !ok || len(typed) != len(other) {
+			return false
+		}
+		for key, value := range typed {
+			match, present := other[key]
+			if !present || !sameValue(value, match) {
+				return false
+			}
+		}
+		return true
+
+	default:
+		// left is not a []any or a map[string]any here (nil included: a type
+		// switch on a nil interface falls to default, same as everything
+		// comparable). That is not the same thing as "left is comparable",
+		// and the difference is the reason this line says DeepEqual and has
+		// to keep saying it: a []string, or a map[string]int, reaches here
+		// too. No JSON decoder builds one, but a Go caller of Invoke can hand
+		// one over, and a plain == on two of them panics with exactly the
+		// "comparing uncomparable type" this function was rewritten to stop
+		// doing. DeepEqual's own nil case is x == y on the interfaces
+		// themselves, which is always safe — a nil interface never shares a
+		// dynamic type with anything, comparable or not, so there is nothing
+		// for it to panic on.
+		return reflect.DeepEqual(left, right)
+	}
 }
 
+// asNumber flattens every number shape into one float64, which is what lets
+// the numeric branch of sameValue be a single ==.
+//
+// This case list and the TypeNumber case of matches (store.go) are two
+// switches over the same set of types, and nothing makes them agree. Adding a
+// fifth number type to matches alone is the dangerous direction: sameValue
+// would take its numeric branch for that type, this function would answer 0
+// for both sides, and every two values of it would compare equal — a
+// condition that always passes, which for an optimistic lock means a write
+// that should have been refused goes through. No panic, no vet error, and no
+// test here would say so. Adding it here alone costs much less: the pair
+// falls through to DeepEqual and only the 1-is-1.0 rule stops reaching it.
 func asNumber(value any) float64 {
 	switch typed := value.(type) {
 	case float64:
