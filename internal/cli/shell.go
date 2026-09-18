@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -60,8 +61,15 @@ type Looking interface {
 
 // Shell reads lines and runs them until the input ends.
 func Shell(look Looking, dbname string, in io.Reader, out io.Writer) error {
-	lines := bufio.NewScanner(in)
-	lines.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	// Asked for once, at the start, because completion needs it and because an
+	// operator's first question is always what is here. Best effort: a shell
+	// that could not fetch it still works, it just has nothing to offer, and
+	// guessing names would be worse than silence.
+	here, _ := look.WhatIsHere()
+
+	prompt := dbname + "> "
+	next, restore := editing(in, out, prompt, here)
+	defer restore()
 
 	// The last draft, which is what `declare` prints. Kept rather than
 	// recomputed so that what is printed is what ran, not what a second pass
@@ -69,12 +77,19 @@ func Shell(look Looking, dbname string, in io.Reader, out io.Writer) error {
 	var drafted *store.Operation
 
 	fmt.Fprintf(out, "rsql %s — type help, or exit when you are done\n", dbname)
-	fmt.Fprintf(out, "%s> ", dbname)
 
-	for lines.Scan() {
-		line := strings.TrimSpace(lines.Text())
+	for {
+		line, err := next()
+		if err != nil {
+			fmt.Fprintln(out)
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSpace(line)
 		if line == "" {
-			fmt.Fprintf(out, "%s> ", dbname)
 			continue
 		}
 
@@ -90,16 +105,29 @@ func Shell(look Looking, dbname string, in io.Reader, out io.Writer) error {
 		if done {
 			return nil
 		}
-		fmt.Fprintf(out, "%s> ", dbname)
 	}
-	fmt.Fprintln(out)
-	return lines.Err()
+}
+
+// newScanner is the line reader the plain path uses, with a buffer big enough
+// for a pasted line.
+func newScanner(in io.Reader) *bufio.Scanner {
+	lines := bufio.NewScanner(in)
+	lines.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	return lines
 }
 
 // one runs a single line, and says whether the session is over and what draft
 // it produced.
 func one(look Looking, line string, drafted *store.Operation, out io.Writer) (bool, *store.Operation, error) {
 	words := strings.Fields(line)
+
+	// Extra words are refused everywhere, not only where they could have
+	// meant something. `ls something` ran as `ls` until somebody typed it by
+	// accident: a shell that ignores what it does not understand does a
+	// different thing from the one that was typed, and says nothing about it.
+	if most, counted := taken[words[0]]; counted && len(words) > most {
+		return false, nil, fmt.Errorf("%q takes nothing after it, and got %q", words[0], words[1])
+	}
 
 	switch words[0] {
 	case "exit", "quit":
@@ -142,11 +170,18 @@ func one(look Looking, line string, drafted *store.Operation, out io.Writer) (bo
 		if err != nil {
 			return false, nil, err
 		}
-		showResult(answer.Result, out)
+		showResult(answer.Draft.Action, answer.Result, out)
 		return false, &answer.Draft, nil
 	}
 
 	return false, nil, fmt.Errorf("there is no %q here; type help", words[0])
+}
+
+// taken is how many words each command may be, for the ones that are not a
+// whole little grammar of their own. A command missing from here takes as many
+// as it likes and checks them itself.
+var taken = map[string]int{
+	"exit": 1, "quit": 1, "help": 1, "?": 1, "ls": 1, "declare": 2,
 }
 
 // access turns a typed line into the access it asks for.
@@ -184,7 +219,7 @@ func access(words []string) (store.Access, error) {
 	// index name, and the complaint lands on the second one. So a failure says
 	// what the line was understood to be. A parser that reports the wrong word
 	// sends somebody looking at the wrong half of what they typed.
-	read := "scan " + asked.Collection
+	read := asked.Kind + " " + asked.Collection
 	if len(rest) > 0 && !keyword(rest[0]) {
 		asked.Index = rest[0]
 		rest = rest[1:]
@@ -283,9 +318,15 @@ func literal(word string) (any, error) {
 	return value, nil
 }
 
-func showResult(result store.Result, out io.Writer) {
-	if len(result.Rows) == 0 {
+func showResult(action string, result store.Result, out io.Writer) {
+	if action == store.ActionCount {
 		fmt.Fprintf(out, "  %d\n", result.Count)
+	}
+	if action != store.ActionCount && len(result.Rows) == 0 {
+		// Not "0". A count answers with a number and a scan answers with rows,
+		// and printing a number for an empty scan reads as though the question
+		// asked for one.
+		fmt.Fprintln(out, "  nothing")
 	}
 	for _, row := range result.Rows {
 		encoded, err := json.Marshal(row)

@@ -111,6 +111,7 @@ func TestAShellRefusesWhatItDoesNotUnderstand(t *testing.T) {
 		// lands in the index position, so the shell says what it understood
 		// rather than complaining about the second wrong word alone.
 		{`scan books where shelf = "history"`, `read as: scan books, index "where"`},
+		{`count books where shelf = "history"`, `read as: count books, index "where"`},
 		{`scan books by_shelf from history`, `history is not a value`},
 		{`get books b1`, `b1 is not a value`},
 		{`get books`, `get takes one key`},
@@ -125,6 +126,14 @@ func TestAShellRefusesWhatItDoesNotUnderstand(t *testing.T) {
 		{`delete books "b1"`, `there is no "delete"`},
 		{`put books "b1"`, `there is no "put"`},
 		{`db.books.find({})`, `there is no "db.books.find({})"`},
+
+		// A command that takes nothing, given something. This ran as though
+		// the extra word were not there until a real session typed it.
+		{`ls books`, `"ls" takes nothing after it`},
+		{`ls scan orders`, `"ls" takes nothing after it`},
+		{`exit now`, `"exit" takes nothing after it`},
+		{`help me`, `"help" takes nothing after it`},
+		{`declare one two`, `"declare" takes nothing after it`},
 	} {
 		look := &looked{}
 		printed := typed(t, look, one.line)

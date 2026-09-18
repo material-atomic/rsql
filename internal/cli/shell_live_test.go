@@ -119,9 +119,15 @@ func TestTheShellAgainstARealServer(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The catalogue, the get and the scan. `declare` reads nothing: it prints
-	// what the server already sent back.
-	if reads != 3 {
-		t.Errorf("the log holds %d operator reads, want 3", reads)
+	// The catalogue twice — once when the shell opened, which is how it knows
+	// what to offer when somebody presses tab, and once for `ls` — then the
+	// get and the scan. `declare` reads nothing: it prints what the server
+	// already sent back.
+	//
+	// Opening a shell therefore leaves a line in the log saying somebody
+	// opened a shell, before they have typed anything. That is not an
+	// accident worth removing.
+	if reads != 4 {
+		t.Errorf("the log holds %d operator reads, want 4", reads)
 	}
 }
