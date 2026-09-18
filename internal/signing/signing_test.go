@@ -2,6 +2,7 @@ package signing
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"regexp"
 	"strings"
@@ -188,5 +189,79 @@ func TestAnUnsetLabelIsTheDefaultOneAndNotTheDirectForm(t *testing.T) {
 	}
 	if Verify(direct, parts, secret, "") {
 		t.Error("a direct signature verified against an unset label")
+	}
+}
+
+func TestProvingYouCanOperateThisServer(t *testing.T) {
+	nonce := make([]byte, NonceBytes)
+	for i := range nonce {
+		nonce[i] = byte(i)
+	}
+
+	proof, err := Operating("the-server-secret", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Operates(proof, "the-server-secret", nonce) {
+		t.Error("the proof does not verify against the secret that made it")
+	}
+
+	// A different secret, a different challenge, or nothing at all.
+	if Operates(proof, "another-secret", nonce) {
+		t.Error("a proof made with one secret verified under another")
+	}
+	other := make([]byte, NonceBytes)
+	copy(other, nonce)
+	other[0]++
+	if Operates(proof, "the-server-secret", other) {
+		t.Error("a proof answered a challenge it was not made for")
+	}
+	if Operates("", "the-server-secret", nonce) || Operates("not hex", "the-server-secret", nonce) {
+		t.Error("something that is not a proof was taken as one")
+	}
+
+	// The proof is not the connection-string signature under another name: a
+	// string somebody holds must not also make them an operator.
+	parts := Parts{AccountID: "acme", Password: "a-password-of-the-right-shape", DBName: "main"}
+	sig, err := Sign(parts, "the-server-secret", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Operates(sig, "the-server-secret", nonce) {
+		t.Error("a connection-string signature was accepted as operator proof")
+	}
+
+	// A challenge the client chose is not a challenge.
+	if _, err := Operating("the-server-secret", nil); !errors.Is(err, ErrNonce) {
+		t.Errorf("an empty challenge: want ErrNonce, got %v", err)
+	}
+	if _, err := Operating("the-server-secret", nonce[:8]); !errors.Is(err, ErrNonce) {
+		t.Errorf("a short challenge: want ErrNonce, got %v", err)
+	}
+	if _, err := Operating("", nonce); !errors.Is(err, ErrEmptySecret) {
+		t.Errorf("no secret: want ErrEmptySecret, got %v", err)
+	}
+}
+
+// TestTheOperatorProofIsTheseExactBytes pins the derivation.
+//
+// Every other test here compares this code against itself, which cannot see a
+// changed label: derive under a different one and both sides move together,
+// and the only symptom is that every operator in the field stops being one
+// after an upgrade. A vector is what a second implementation would check
+// against, and it is what stops this changing by accident.
+func TestTheOperatorProofIsTheseExactBytes(t *testing.T) {
+	nonce := make([]byte, NonceBytes)
+	for i := range nonce {
+		nonce[i] = byte(i)
+	}
+
+	proof, err := Operating("the-server-secret", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pinned = "7bc00dd603baa6bd7a2ce08a09d898cdd1c1b65f51a2f2b3e5935de2c338134e"
+	if proof != pinned {
+		t.Errorf("the proof for the pinned secret and challenge is now\n  %s\nand was\n  %s", proof, pinned)
 	}
 }

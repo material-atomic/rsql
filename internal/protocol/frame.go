@@ -44,11 +44,18 @@ const (
 	Subscribe Type = 8
 	Event     Type = 9
 	Goodbye   Type = 10
+	// Elevate answers the challenge in the welcome, proving the sender holds
+	// the server's own secret. Explore then carries an access an operator
+	// typed rather than the name of one somebody declared — refused on a
+	// connection that has not proved it.
+	Elevate Type = 11
+	Explore Type = 12
 )
 
 var typeNames = map[Type]string{
 	Hello: "hello", Welcome: "welcome", Ping: "ping", Pong: "pong", Invoke: "invoke",
 	Result: "result", Failure: "failure", Subscribe: "subscribe", Event: "event", Goodbye: "goodbye",
+	Elevate: "elevate", Explore: "explore",
 }
 
 // String names a frame type, or reports the code when this version has no name

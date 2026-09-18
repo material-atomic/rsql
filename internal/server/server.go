@@ -15,7 +15,9 @@ package server
 
 import (
 	"crypto/hkdf"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -210,6 +212,29 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 		case protocol.Goodbye:
 			return nil
 
+		case protocol.Elevate:
+			if err := s.elevate(live, frame.Payload); err != nil {
+				if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := out.send(protocol.Frame{Type: protocol.Result, ID: frame.ID}, []byte(`{"operator":true}`)); err != nil {
+				return err
+			}
+
+		case protocol.Explore:
+			body, err := s.explore(live, frame.Payload)
+			if err != nil {
+				if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := out.send(protocol.Frame{Type: protocol.Result, ID: frame.ID}, body); err != nil {
+				return err
+			}
+
 		case protocol.Invoke:
 			result, err := s.invoke(live, frame.Payload)
 			if err != nil {
@@ -269,6 +294,12 @@ type session struct {
 	// call on a hot connection is work nobody asked for — and the answer cannot
 	// change while the connection lives.
 	verified map[string]*database
+
+	// challenge is what this connection must answer to become an operator, and
+	// operator is whether it has. One challenge per connection, so a proof
+	// that leaks out of a log or a process listing is already spent.
+	challenge []byte
+	operator  bool
 }
 
 // welcome is what it gets back.
@@ -279,6 +310,10 @@ type welcome struct {
 	Mode      string `json:"mode"`
 	LSN       uint64 `json:"lsn,omitempty"`
 	Encrypted bool   `json:"encrypted"`
+	// Challenge is what an operator would have to answer. Sent to everyone,
+	// because a challenge is not a secret and deciding who gets one would mean
+	// the server knew who was asking before they had proved anything.
+	Challenge string `json:"challenge,omitempty"`
 }
 
 // How a connection is scoped.
@@ -305,7 +340,16 @@ func (s *Server) handshake(reader *protocol.Reader, out *sender) (*session, erro
 	}
 
 	live := &session{opening: opening, verified: map[string]*database{}}
-	greeting := welcome{Version: protocol.Version, Account: opening.Account, Mode: opening.Mode, Encrypted: s.options.Encrypt}
+
+	live.challenge = make([]byte, signing.NonceBytes)
+	if _, err := rand.Read(live.challenge); err != nil {
+		return nil, err
+	}
+
+	greeting := welcome{
+		Version: protocol.Version, Account: opening.Account, Mode: opening.Mode,
+		Encrypted: s.options.Encrypt, Challenge: hex.EncodeToString(live.challenge),
+	}
 
 	switch opening.Mode {
 	case ModeBound:
@@ -603,6 +647,7 @@ func codeFor(err error) string {
 		{store.ErrNoOperation, "no_operation"},
 		{store.ErrArgument, "argument"},
 		{store.ErrNotAllowed, "not_allowed"},
+		{ErrNotOperator, "not_operator"},
 		{store.ErrExists, "exists"},
 		{store.ErrMissing, "missing"},
 		{store.ErrCondition, "condition"},

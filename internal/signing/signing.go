@@ -126,3 +126,61 @@ func Verify(signature string, parts Parts, secret, label string) bool {
 	}
 	return hmac.Equal([]byte(strings.ToLower(signature)), []byte(want))
 }
+
+// Operating a database is a different permission from using one, and nothing
+// in a connection string says which you hold.
+//
+// The string signs account, password and database name — what to reach, not
+// what you may do with it. Adding a field for it would mean every existing
+// string is reissued and both sides changed, and it would still be a claim
+// the client makes about itself.
+//
+// So an operator proves something instead: possession of the server's own
+// secret, over a nonce the server just chose. That is not a new power being
+// handed out. Whoever can read the secret can already read the database files
+// and mint any connection string they like; the shell only makes it
+// comfortable, and — because every access it runs goes into the change log —
+// visible afterwards, which reading the files is not.
+//
+// The nonce is what stops the proof being a password. One is good for one
+// connection, so it cannot be copied out of a log or a process listing and
+// used again.
+const OperatorLabel = "rsql/operator:v1"
+
+// ErrNonce is a challenge that is not one: empty, or not the length the server
+// issues. A proof over a nonce the client chose proves nothing.
+var ErrNonce = errors.New("rsql: the challenge is not one the server issued")
+
+// NonceBytes is how long a challenge is.
+const NonceBytes = 32
+
+// Operating answers a challenge with proof that the secret is held.
+func Operating(secret string, nonce []byte) (string, error) {
+	if secret == "" {
+		return "", ErrEmptySecret
+	}
+	if len(nonce) != NonceBytes {
+		return "", ErrNonce
+	}
+	mac := hmac.New(sha256.New, key(secret, OperatorLabel))
+	mac.Write(nonce)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// Operates reports whether this is the answer to that challenge under this
+// secret. Constant time, and anything malformed is false rather than an error
+// path of its own.
+//
+// No test covers the constant time, and one that claimed to would be worse
+// than none: a mutation replacing hmac.Equal with == passes everything here,
+// because the difference is a timing signal and not an answer. Measuring it in
+// a unit test would be measuring the machine the test runs on. It is written
+// down here instead, which is the honest form of a property you can review but
+// not assert.
+func Operates(proof string, secret string, nonce []byte) bool {
+	want, err := Operating(secret, nonce)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal([]byte(strings.ToLower(proof)), []byte(want))
+}
