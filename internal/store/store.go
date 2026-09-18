@@ -38,6 +38,17 @@ type Store struct {
 	now         func() time.Time
 	// retain is how many log entries to keep; zero keeps all of them.
 	retain int
+
+	// files, parts, dropped and key are partitions: where other files come
+	// from, the ones open now, the ones this transaction dropped, and the key
+	// a new one is made under. See parts.go.
+	files Files
+	parts map[string]*part
+	// dropping is a partition whose row is gone but whose file is still here,
+	// because the transaction that dropped it has not landed yet.
+	dropping map[string]*part
+	dropped  []string
+	key      []byte
 }
 
 // Open reads the catalogue of an existing database, or starts an empty one.
@@ -46,6 +57,8 @@ func Open(pages *pager.Pager) (*Store, error) {
 		pages:       pages,
 		tree:        btree.New(pages),
 		collections: map[string]*Collection{},
+		parts:       map[string]*part{},
+		dropping:    map[string]*part{},
 		ids:         ulid.New(),
 		now:         time.Now,
 	}
@@ -60,7 +73,25 @@ func Open(pages *pager.Pager) (*Store, error) {
 func (s *Store) Identifiers(source *ulid.Source) { s.ids = source }
 
 // Commit makes everything written since the last one durable.
-func (s *Store) Commit() error { return s.tree.Commit() }
+//
+// Partitions first and the leader last, always. Their pages have to be on the
+// disk before anything says they are part of the database, and the leader's
+// meta is the only thing that says so.
+func (s *Store) Commit() error {
+	if err := s.commitParts(); err != nil {
+		return err
+	}
+	if err := s.tree.Commit(); err != nil {
+		return err
+	}
+
+	// Only now: a file unlinked before the transaction that dropped it landed
+	// is a file the database would still be pointing at after a crash.
+	if len(s.dropped) > 0 {
+		return s.dropFiles()
+	}
+	return nil
+}
 
 // Rollback throws away everything written since the last commit: the
 // documents, the index entries, the log entries, the declarations.
@@ -75,6 +106,13 @@ func (s *Store) Rollback() error {
 
 	s.tree = btree.New(s.pages)
 	s.collections = map[string]*Collection{}
+
+	// After the leader, because where each partition belongs is written in the
+	// leader's tree — asking before it was rolled back would be asking the
+	// transaction being undone where to undo it to.
+	if err := s.abandonParts(); err != nil {
+		return err
+	}
 	return s.load()
 }
 
