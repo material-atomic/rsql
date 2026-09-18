@@ -238,7 +238,8 @@ func reversedList(list []string) []string {
 }
 
 // checkShape walks a shape's declaration over every pair of argument values
-// the domain allows, both directions, and checks three things per pair:
+// the domain allows, both directions, and checks three things per pair when
+// the pair is not refused (see below):
 //
 //   - the forward call's rows match expectedReach, the oracle computed
 //     straight off the fixture;
@@ -257,6 +258,25 @@ func reversedList(list []string) []string {
 // Enters in direction_qa2_test.go for the mutation that survived exactly that
 // hole; checking every call on its own, forward and reverse both, is why this
 // version does not need that test's help to catch it.
+//
+// Task 0045 added a third outcome: crossing the domain against itself, as
+// "both ends arguments" and its neighbours do, writes plenty of pairs where
+// low sorts after high — a nonsensical range now refused with ErrArgument
+// rather than read as empty. This function does not try to predict, for an
+// arbitrary shape, exactly which pairs that is: doing that from outside would
+// mean recomputing boundAt's Exclusive/successor arithmetic a second time in
+// the test, which is the very duplication task 0045 mục 1 exists to close —
+// a second copy here would drift from the real rule exactly the way a third
+// copy in production would have. What this function asks instead is the
+// symmetry every other test in this round also leans on: whichever outcome a
+// pair gets, forward and reverse must get the SAME one. A mutation that made
+// stretch() direction-dependent about refusing (accepting forward, refusing
+// reverse, or the reverse) would fail here even though nothing here knows in
+// advance which pairs ought to be refused. Whether the refused-or-not split
+// is the RIGHT split, for the shapes it can happen to at all, is measured
+// directly and independently in direction_0045_test.go — this file's oracle
+// only ever knew how to check accepted rows against real ones, not whether
+// accepting was the right call, and that was already true before this round.
 func checkShape(t *testing.T, collection *Collection, index string, shape reachShape,
 	domain []string, rows []reachRow) {
 
@@ -283,7 +303,7 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 		}
 	}
 
-	walk := func(direction Direction, low, high string) []string {
+	walk := func(direction Direction, low, high string) ([]string, error) {
 		within := Range{From: shape.from.bound(low), To: shape.to.bound(high), Direction: direction}
 		var got []string
 		var err error
@@ -321,10 +341,7 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 				return true
 			})
 		}
-		if err != nil {
-			t.Fatalf("%s %v at %q/%q: %v", shape.what, direction, low, high, err)
-		}
-		return got
+		return got, err
 	}
 
 	sortedRaw := func(list []string) string {
@@ -339,8 +356,24 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 	}
 
 	for _, p := range pairs {
-		forward := walk(Forward, p.low, p.high)
-		reverse := walk(Reverse, p.low, p.high)
+		forward, ferr := walk(Forward, p.low, p.high)
+		reverse, rerr := walk(Reverse, p.low, p.high)
+
+		if (ferr == nil) != (rerr == nil) {
+			t.Errorf("%s at %q/%q: forward err=%v, reverse err=%v — a call refused in one direction must be refused in the other",
+				shape.what, p.low, p.high, ferr, rerr)
+			continue
+		}
+		if ferr != nil {
+			if !errors.Is(ferr, ErrArgument) {
+				t.Errorf("%s forward at %q/%q: want ErrArgument, got %v", shape.what, p.low, p.high, ferr)
+			}
+			if !errors.Is(rerr, ErrArgument) {
+				t.Errorf("%s reverse at %q/%q: want ErrArgument, got %v", shape.what, p.low, p.high, rerr)
+			}
+			continue
+		}
+
 		want := expectedReach(rows, shape, p.low, p.high)
 
 		if sortedRaw(forward) != sorted(want) {
@@ -435,9 +468,26 @@ func reachShapes(pin string) []reachShape {
 //
 // Round three's version of this test had an accepted/refused axis: a shape
 // was right to declare exactly when its forward and reverse reachable sets
-// came out equal, and wrong otherwise. There is no such axis now — nothing
-// here is refused for its direction — so what is left is checkShape's three
-// per-call checks (see its doc comment), run for every shape on the list.
+// came out equal, and wrong otherwise. There is no such axis for DIRECTION
+// any more — nothing here is refused for which way it reads — so what is
+// left is mostly checkShape's three per-call checks (see its doc comment),
+// run for every shape on the list.
+//
+// One shape on the list is refused for a different reason task 0045 adds:
+// "the same constant at both ends, both exclusive" pins From and To to one
+// point with both marked Exclusive, and both ends are constants — nothing
+// here waits on an argument — so refusedBackwardsRange (ops.go) sees the
+// whole of what it will ever compare at declare time. That pin is refused,
+// and correctly: exclusive at both ends of the SAME point asks the walk to
+// start after everything the point's prefix covers while also stopping
+// before any of it, which inverts the two byte positions structurally, not
+// because of what data happens to exist. It reads differently from its two
+// neighbours on the list ("From exclusive" and "To exclusive" alone, at the
+// same pin), which land on lower == upper — an empty range written on
+// purpose, and the one case this task is explicit must keep running. See
+// TestAPinnedEmptyRangeStillRuns and TestBothEndsExclusiveAtOnePointIsRefused
+// (direction_0045_test.go) for both measured directly, independent of this
+// loop.
 func TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays(t *testing.T) {
 	for _, over := range []struct {
 		index  string
@@ -473,8 +523,24 @@ func TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays(t *testing.T)
 
 			for i, shape := range shapes {
 				name := fmt.Sprintf("reach.%s.%d", over.index, i)
-				if err := declareReach(store, name, over.index, shape); err != nil {
-					t.Errorf("%s: %q was refused: %v — no shape of declaration is refused for its direction any more",
+				err := declareReach(store, name, over.index, shape)
+
+				if shape.from.constant && shape.to.constant && shape.from.fixed == shape.to.fixed &&
+					shape.from.exclusive && shape.to.exclusive {
+					// See the file comment above: this one shape is a
+					// structurally backwards range (both ends exclusive at
+					// the same point), and task 0045 refuses it at declare
+					// time rather than letting it run. There is no operation
+					// to scan with afterwards.
+					if !errors.Is(err, ErrDeclaration) {
+						t.Errorf("%s: %q: want ErrDeclaration (both ends exclusive at one point is a backwards range), got %v",
+							over.index, shape.what, err)
+					}
+					continue
+				}
+
+				if err != nil {
+					t.Errorf("%s: %q was refused: %v — no shape of declaration on this list is refused for its direction, or for being backwards",
 						over.index, shape.what, err)
 				}
 				checkShape(t, collection, over.index, shape, over.domain, rows)

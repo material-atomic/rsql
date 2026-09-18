@@ -104,12 +104,21 @@ type Operation struct {
 	//
 	// This is a change from an older convention some callers may still carry
 	// in their head, where a reversed read meant writing From as the high
-	// value and To as the low one. Doing that today reaches nothing, in
-	// EITHER direction, because From is unconditionally the low end
-	// regardless of what value is written there: there is no error and
-	// Truncated stays false, since the walk correctly finds no rows between
-	// a low end that sorts after the high end. Nothing inside the store can
-	// tell that shape apart from a stretch that is legitimately empty.
+	// value and To as the low one. Doing that today is refused, in EITHER
+	// direction, because From is unconditionally the low end regardless of
+	// what value is written there: a From that sorts after To is not a
+	// stretch that happens to be empty, it is a declaration that could never
+	// return a row with any argument, and task 0045 changed this from a
+	// silent empty answer — indistinguishable on the wire from a stretch that
+	// is legitimately empty — into an error instead. It is caught as early as
+	// the shape allows: at DeclareOperation, if both ends are constants
+	// (ErrDeclaration, validateOperation below); at Invoke, if either end is
+	// an argument or a step's key (ErrArgument, stretch() in scan.go), since
+	// only then does a value for it exist to compare. Pinning both ends to
+	// the same point, with Exclusive making one of them not quite equal to
+	// the other, is a different shape — a caller-intended empty range — and
+	// that one still runs; see stretch()'s own doc for exactly where the line
+	// between the two is.
 	//
 	// It is still the one thing about a scan an argument may decide, and it is
 	// safe for a reason that does not generalise to anything else: it widens
@@ -229,6 +238,12 @@ type Condition struct {
 // From is always the low end and To is always the high end, whichever way
 // Direction reads the stretch, so Exclusive means the same thing at both ends
 // in both directions: this point is not part of the stretch.
+//
+// A From that sorts after To is refused rather than read as an empty stretch
+// — see Operation.Direction and Range (scan.go) for where and why. Pinning
+// From and To to the same values, with Exclusive telling them apart, is not
+// that: it is how an empty stretch is written on purpose, and it keeps
+// running.
 type Endpoint struct {
 	Terms     []Term `json:"terms"`
 	Exclusive bool   `json:"exclusive,omitempty"`
@@ -498,6 +513,9 @@ func (s *Store) validateOperation(operation *Operation) error {
 				}
 			}
 		}
+		if err := refusedBackwardsRange(operation.From, operation.To, fields); err != nil {
+			return err
+		}
 		if operation.Limit <= 0 {
 			return fmt.Errorf("%w: reading a rollup must declare how many rows it may return", ErrDeclaration)
 		}
@@ -525,6 +543,9 @@ func (s *Store) validateOperation(operation *Operation) error {
 					return err
 				}
 			}
+		}
+		if err := refusedBackwardsRange(operation.From, operation.To, fields); err != nil {
+			return err
 		}
 		// Only a scan may carry one at all — see the refusal below — so a count
 		// that wrote a direction down should hear about that rather than about
@@ -757,6 +778,79 @@ func constantIsEncodable(term Term, field Field) error {
 		return fmt.Errorf("%w: the bound on %q holds a constant keys cannot encode: %v", ErrDeclaration, field.Path, err)
 	}
 	return nil
+}
+
+// refusedBackwardsRange is task 0045's other half of the same refusal
+// stretch() (scan.go) makes at call time: a From that sorts after To, caught
+// here instead when there is nothing left that could still change it — both
+// ends are written as constants, not as an argument or a step's key, so the
+// values ARE the whole of what this declaration will ever compare. A
+// half-hearted variant that also fired on an argument end would be checking
+// against whatever placeholder is in Term.Value at declare time, which
+// nobody wrote there and which has no relationship to what a caller passes —
+// that is exactly the "nothing to check yet" case only stretch() can catch,
+// once an argument's actual value exists. This function and stretch() are
+// deliberately two call sites of one calculation (boundAt, scan.go) rather
+// than two rules that happen to agree today: sameTerm, above, is what a
+// second hand-kept rule costs when the thing it is standing in for grows a
+// field nobody remembered to add.
+//
+// Only runs when both ends are present at all — an operation that leaves
+// From or To unbounded has nothing here for a caller-shaped mistake to widen
+// against, the same reason stretch() guards on upper != nil.
+func refusedBackwardsRange(from, to *Endpoint, fields []Field) error {
+	if from == nil || to == nil {
+		return nil
+	}
+	if !allConstant(from.Terms) || !allConstant(to.Terms) {
+		return nil
+	}
+
+	// The values here already passed constantIsEncodable above, at every
+	// call site of this function — so an error out of boundAt would mean
+	// this ran before that check rather than after it, and that is a bug in
+	// the caller, not a shape this declaration should be refused for. Nothing
+	// converts it to ErrDeclaration; it is returned as-is so a mistake in the
+	// calling order surfaces as the wrong error rather than a silently
+	// swallowed one.
+	lower, err := boundAt(nil, fields, endpointBound(from), false)
+	if err != nil {
+		return err
+	}
+	upper, err := boundAt(nil, fields, endpointBound(to), true)
+	if err != nil {
+		return err
+	}
+	if bytes.Compare(lower, upper) > 0 {
+		return fmt.Errorf("%w: the from bound sorts after the to bound, so this operation would never return a row with any argument; From is the low end and To is the high end, in both directions",
+			ErrDeclaration)
+	}
+	return nil
+}
+
+// allConstant is true when every term of an endpoint is a constant — the one
+// case refusedBackwardsRange has enough information to judge at declare
+// time. A single argument or step term among the rest means at least one
+// value does not exist yet.
+func allConstant(terms []Term) bool {
+	for _, term := range terms {
+		if term.Arg != "" || term.Step != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// endpointBound turns a declared Endpoint's constant terms into the *Bound
+// boundAt expects — the same shape bounds() (invoke.go) builds from an
+// endpoint's terms at call time, written a second time here because that one
+// resolves arguments this function has none of yet.
+func endpointBound(endpoint *Endpoint) *Bound {
+	bound := &Bound{Exclusive: endpoint.Exclusive}
+	for _, term := range endpoint.Terms {
+		bound.Values = append(bound.Values, term.Value)
+	}
+	return bound
 }
 
 // sameTerm compares two terms without the panic == risks. Term.Value is any,

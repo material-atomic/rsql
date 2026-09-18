@@ -181,6 +181,15 @@ func TestADeclarationThatMakesNoSenseIsRefusedWithItsName(t *testing.T) {
 		"an operation on a collection that is not there": `{"operations":[
 			{"name":"a.all","collection":"nowhere","action":"scan","index":"_key","limit":1}]}`,
 		"a field nobody knows": `{"collections":[{"name":"a","key":{"path":"id","type":"string"},"wat":1}]}`,
+		// task 0045: a declared scan whose From and To are both constants and
+		// From sorts after To can never return a row, with any argument —
+		// refused when the schema is applied, not discovered the first time
+		// somebody runs it. "b" > "a", so this is backwards.
+		"a scan whose declared from/to can never return a row": `{
+			"collections":[{"name":"a","key":{"path":"id","type":"string","auto":"ulid"},
+				"indexes":[{"name":"i","fields":[{"path":"x","type":"string","missing":"skip"}]}]}],
+			"operations":[{"name":"a.backwards","collection":"a","action":"scan","index":"i","limit":1,
+				"from":{"terms":[{"value":"b"}]},"to":{"terms":[{"value":"a"}]}}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			file := setup.write("bad.json", content)
@@ -190,6 +199,9 @@ func TestADeclarationThatMakesNoSenseIsRefusedWithItsName(t *testing.T) {
 			}
 			if !strings.Contains(errs, "bad.json") {
 				t.Errorf("the complaint does not name the file: %q", errs)
+			}
+			if strings.Contains(errs, "goroutine ") || strings.Contains(errs, "panic:") {
+				t.Errorf("the complaint looks like a raw Go crash, not an operator-readable line: %q", errs)
 			}
 		})
 	}

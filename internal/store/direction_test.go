@@ -149,23 +149,34 @@ func TestReverseReadsTheSameStretchBackwardsNotADifferentOne(t *testing.T) {
 
 	// Writing the ends the OLD way round — the convention a swapped-ends
 	// design once required for a reversed read, high value in From, low
-	// value in To — is empty now, whichever direction is asked for: From is
-	// unconditionally the low end, and s4 sorts after s1, so there is nothing
-	// between them to walk.
-	backwards := keysOf(scan(t, collection, "by_slug", Range{
+	// value in To — used to read as empty, whichever direction was asked
+	// for: From is unconditionally the low end, and s4 sorts after s1, so the
+	// walk correctly found no rows between a low end that sorts after the
+	// high end — a result nothing inside the store could tell apart from a
+	// stretch that is legitimately empty. Task 0045 changed this from a
+	// silent empty answer into ErrArgument, in both directions: this is the
+	// declaration-can-never-match-anything shape, not the merely-empty-today
+	// one (that shape is `lower == upper`, and it still runs — see
+	// TestAPinnedEmptyRangeStillRuns in direction_0045_test.go).
+	//
+	// The mutation this test used to close ("bring the swap back") is now
+	// closed a level down, in stretch() itself (scan.go) and in
+	// TestTheTwoBoundsNeverDependOnDirection (direction_v4_test.go) — this
+	// test's job narrows to confirming Scan (the caller-facing entry point,
+	// not stretch() directly) surfaces that refusal rather than swallowing
+	// it, in both directions.
+	if err := collection.Scan("by_slug", Range{
 		From:      &Bound{Values: []any{"s4"}},
 		To:        &Bound{Values: []any{"s1"}},
 		Direction: Reverse,
-	}))
-	if len(backwards) != 0 {
-		t.Errorf("From above To gave %v, want empty", backwards)
+	}, func(Found) bool { return true }); !errors.Is(err, ErrArgument) {
+		t.Errorf("From above To, reverse: want ErrArgument, got %v", err)
 	}
-	forwardBackwards := keysOf(scan(t, collection, "by_slug", Range{
+	if err := collection.Scan("by_slug", Range{
 		From: &Bound{Values: []any{"s4"}},
 		To:   &Bound{Values: []any{"s1"}},
-	}))
-	if len(forwardBackwards) != 0 {
-		t.Errorf("From above To gave %v forward too, want empty", forwardBackwards)
+	}, func(Found) bool { return true }); !errors.Is(err, ErrArgument) {
+		t.Errorf("From above To, forward: want ErrArgument, got %v", err)
 	}
 }
 

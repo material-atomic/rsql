@@ -32,19 +32,45 @@ import (
 // its oracle only knows how to check a single-term bound against real rows —
 // so the shapes that leaked in rounds two and three are added here directly,
 // against stretch(), where no oracle is needed at all.
+//
+// Task 0045 added a third outcome stretch() can return: refusal, when From
+// sorts after To. check() below was written when there were only two
+// outcomes — a byte string, always — and used to Fatal the moment either
+// call returned an error, which would have made every newly-refused pair in
+// the domain crossing below a false failure of THIS test rather than a
+// measurement of anything. What "does not depend on Direction" means for a
+// function that can now fail is not just "same bytes" any more; it is "same
+// bytes, or the same class of refusal" — a bound calculated one way that
+// refuses forward and a bound calculated the other way that quietly succeeds
+// reversed would be exactly the direction-dependent bug this whole file
+// exists to catch, just wearing the new outcome's clothes instead of the
+// old one's.
 func TestTheTwoBoundsNeverDependOnDirection(t *testing.T) {
 	_, collection := declared(t, 150)
 	fill(t, collection)
 
 	check := func(t *testing.T, what string, prefix []byte, fields []Field, from, to *Bound) {
 		t.Helper()
-		fl, fu, err := collection.stretch(Range{From: from, To: to, Direction: Forward}, prefix, fields)
-		if err != nil {
-			t.Fatalf("%s: forward: %v", what, err)
+		fl, fu, ferr := collection.stretch(Range{From: from, To: to, Direction: Forward}, prefix, fields)
+		rl, ru, rerr := collection.stretch(Range{From: from, To: to, Direction: Reverse}, prefix, fields)
+
+		if (ferr == nil) != (rerr == nil) {
+			t.Errorf("%s: forward err=%v, reverse err=%v — a bound must not depend on Direction, including whether it is refused",
+				what, ferr, rerr)
+			return
 		}
-		rl, ru, err := collection.stretch(Range{From: from, To: to, Direction: Reverse}, prefix, fields)
-		if err != nil {
-			t.Fatalf("%s: reverse: %v", what, err)
+		if ferr != nil {
+			// Same class of error, not the same string: walk() wraps whatever
+			// stretch() returns and this only cares that both directions
+			// agree it is the caller's-argument shape task 0045 added, not
+			// that the two calls worded it identically.
+			if !errors.Is(ferr, ErrArgument) {
+				t.Errorf("%s: forward refused with %v, want ErrArgument", what, ferr)
+			}
+			if !errors.Is(rerr, ErrArgument) {
+				t.Errorf("%s: reverse refused with %v, want ErrArgument", what, rerr)
+			}
+			return
 		}
 		if !bytes.Equal(fl, rl) || !bytes.Equal(fu, ru) {
 			t.Errorf("%s: forward stretch is (%x, %x), reverse stretch is (%x, %x) — a bound must not depend on Direction",

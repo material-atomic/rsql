@@ -76,6 +76,18 @@ func directionOf(value any) (Direction, error) {
 // so the swap was removed rather than patched a fourth time. See task 0012,
 // round 4.
 //
+// A From that sorts after To — somebody carrying the old swapped-ends
+// convention in their head, or simply a typo — is not read as "the stretch
+// happens to be empty". Before task 0045 it was: the walk found no rows
+// between a low end that sorted after the high end and came back with an
+// answer identical to an honestly empty stretch, on the wire and in Go both.
+// Now it is refused instead, at whichever point the two values first exist
+// together — when the operation is declared, if both ends are constants
+// (ErrDeclaration), or when it is called, if either end is an argument
+// (ErrArgument from stretch(), scan.go). Pinning both ends to the same point
+// is not this and keeps running empty on purpose; see stretch()'s own doc for
+// where that line is drawn.
+//
 // Direction is the order a Scan (or Walk) reads its rows in. A rollup read
 // (Collection.Totals) has no such order to reverse — it hands back a sum per
 // group, not a sequence of rows a caller could read backwards — so it refuses
@@ -160,11 +172,50 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 
 // stretch turns a Range into the two byte positions that bound the walk:
 // lower always comes from From, upper always comes from To, and neither reads
-// within.Direction. That is the whole of what this round changed and the
+// within.Direction. That is the whole of what round four changed and the
 // whole of why it is pulled out of walk into a function of its own — it is
 // the one thing that has to be true for "a direction widens nothing" to hold,
 // and it has to be provable by calling it twice with Direction flipped and
 // comparing the two byte strings, not by reading rows through a fixture.
+//
+// This round (0045) adds one more thing this is the right place for: a From
+// that sorts after To, discovered here because this is where the two bounds
+// first exist side by side as bytes. Before this, a caller who wrote the two
+// ends backwards — the swapped-ends convention round four retired, or simply
+// a mistake — got an empty result indistinguishable from a stretch that is
+// legitimately empty. That silence is why task 0045 exists: an operator
+// reading "rows: []" off the wire cannot tell "nothing matched" from "this
+// declaration can never match anything, with any argument". Refusing it here
+// means every caller of stretch() — Scan, walkRange (so Walk and dump too),
+// and Totals after task 0043 put it on the same path — inherits the refusal
+// for free, which is the point of task 0045 mục 1: one calculation, one
+// place a caller-shaped mistake in it is caught.
+//
+// upper != nil guards this on purpose, not defensively: successor() (below)
+// returns nil for a prefix of every byte 0xff, meaning "there is no key past
+// this, so run to the very end of the keyspace" — the unbounded-above case.
+// bytes.Compare treats a nil slice as sorting before everything, so without
+// this guard bytes.Compare(lower, nil) > 0 would be true for every non-empty
+// lower, and this would refuse every scan with no upper bound at all —
+// Walk/dump chief among them. That is not an edge case of this refusal, it
+// is most of the traffic it would otherwise break.
+//
+// lower == upper is not refused, and that is deliberate rather than an
+// off-by-one. The shape that produces it is not always what it looks like at
+// first: on a string field it is an Exclusive bound pinned against itself
+// (see bound() below) — "everything strictly after ann and at or before ann"
+// is nothing, and a caller who wrote that meant to pin an empty range. But
+// measured directly on a number field, two INCLUSIVE ends one ULP apart —
+// From: math.Nextafter(2, +Inf), To: 2, neither Exclusive — land on the
+// identical byte string too: keys.Encode's number encoding is dense, so
+// successor(encode(2.0)) and encode(Nextafter(2.0)) are the same bytes. So
+// the one fact this line relies on is narrower than "a caller pinned an
+// empty range on purpose" — it is only ever that a caller-visible pair of
+// values (whatever produced the equal byte pair) ended up describing nothing
+// between them, which today's density of the number encoding can also do
+// with two ordinary inclusive ends. Only lower strictly after upper is
+// refused; lower == upper, however it was written, is left to keep reading
+// as empty. That is why the comparison below is > and not >=.
 func (c *Collection) stretch(within Range, prefix []byte, fields []Field) (lower, upper []byte, err error) {
 	lower, err = c.bound(prefix, fields, within.From, false)
 	if err != nil {
@@ -173,6 +224,10 @@ func (c *Collection) stretch(within Range, prefix []byte, fields []Field) (lower
 	upper, err = c.bound(prefix, fields, within.To, true)
 	if err != nil {
 		return nil, nil, err
+	}
+	if upper != nil && bytes.Compare(lower, upper) > 0 {
+		return nil, nil, fmt.Errorf("%w: the from bound sorts after the to bound, so this stretch is backwards and would never return a row; From is the low end and To is the high end, in both directions",
+			ErrArgument)
 	}
 	return lower, upper, nil
 }
@@ -262,11 +317,29 @@ func (c *Collection) walk(within Range, prefix []byte, fields []Field,
 }
 
 // bound turns one end of a range into the byte position to start or stop at.
+// It is a thin method wrapper around boundAt below, kept so call sites that
+// already have a *Collection do not have to say so themselves.
+func (c *Collection) bound(prefix []byte, fields []Field, at *Bound, upper bool) ([]byte, error) {
+	return boundAt(prefix, fields, at, upper)
+}
+
+// boundAt is the calculation bound() wraps, pulled out as a function rather
+// than a method (task 0045) because validateOperation (ops.go) needs the
+// exact same arithmetic at declare time, before any *Collection is relevant
+// — a declaration is checked against the fields an index or a rollup group
+// says it has, not against a collection it is about to be attached to. The
+// two calls it makes there pass prefix as nil rather than empty: nil and
+// []byte{} both mean an empty prefix to append(), so this is a difference in
+// spelling, not in the bytes either call produces. A single caller-supplied
+// prefix is appended to both ends before either is compared to the other
+// (stretch(), scan.go), so an empty prefix here does not change which of two
+// results sorts first — bytes.Compare of "prefix+a" against "prefix+b" agrees
+// with bytes.Compare of "a" against "b" for any shared prefix, empty or not.
 //
 // The values here are never a constant written into an operation's
 // declaration — constantIsEncodable (ops.go) already refused any of those
 // that keys cannot turn into bytes, at the point the operation was declared.
-// So whatever bound() cannot encode was one of the two things that only get a
+// So whatever this cannot encode was one of the two things that only get a
 // value at call time: an argument, or what an earlier step of a batch
 // produced. Either way it is the caller's mistake, discovered here because
 // this is the first place anything tries to encode it — which is why it is
@@ -279,7 +352,13 @@ func (c *Collection) walk(within Range, prefix []byte, fields []Field,
 // The loop encodes one value at a time, rather than handing the whole slice to
 // keys.EncodeKey at once, so that a failure names the field it happened at —
 // fields[i].Path — and not just the index as a whole.
-func (c *Collection) bound(prefix []byte, fields []Field, at *Bound, upper bool) ([]byte, error) {
+//
+// grep for "successor(" turns up exactly one definition and exactly one place
+// that decides when to call it — right here. Anywhere else that needs "the
+// byte position one end of a bound sits at" should call this, not reimplement
+// the Exclusive/successor rule a second time; a second copy is how the two
+// would drift the next time either changes.
+func boundAt(prefix []byte, fields []Field, at *Bound, upper bool) ([]byte, error) {
 	if at == nil {
 		if upper {
 			// Everything in this index, and nothing after it.
