@@ -107,7 +107,13 @@ type Operation struct {
 	// the work is the same walk over the same pages, and the set of rows the
 	// declaration can reach is the same from either end — which is why a
 	// constant bound written at one end only is refused beside a caller-chosen
-	// direction, since that one would widen. See checkDirection.
+	// direction, since that one would widen, and why the two ends must be
+	// Exclusive the same way for the same reason: Exclusive marks the point the
+	// walk STARTS from, so reversing carries it to the opposite end, and a row
+	// sitting at the floor of the index's encoding — the empty string, false,
+	// a document missing the field the index is Descending + MissingLast on —
+	// comes back on the end that is inclusive and never on the one that is
+	// exclusive. See checkDirection.
 	//
 	// "Reverse" reverses the order the index declared, as a whole. An index on
 	// (a ascending, b descending) read in reverse gives (a descending, b
@@ -204,6 +210,14 @@ type Condition struct {
 
 // Endpoint is one end of a scan: values for the first fields of the index, and
 // whether that point is included.
+//
+// Exclusive marks the point where a walk that ENTERS from this end starts (or,
+// for the end a walk leaves from, where it stops). Which end that is depends on
+// Direction: reversing a walk swaps which of From and To is where it starts.
+// So beside a direction the caller chooses, From.Exclusive and To.Exclusive
+// must agree — otherwise the same declaration is a floor from one side and a
+// ceiling from the other, and whichever end is left inclusive keeps whatever
+// sits at the floor of the index's own encoding. See checkDirection.
 type Endpoint struct {
 	Terms     []Term `json:"terms"`
 	Exclusive bool   `json:"exclusive,omitempty"`
@@ -604,8 +618,10 @@ func checkDirection(operation *Operation, parameters map[string]Parameter,
 	return boundsSurviveReversal(operation, term.Arg)
 }
 
-// boundsSurviveReversal refuses the one shape in which letting the caller pick
-// the direction hands them rows the declaration was written to keep from them.
+// boundsSurviveReversal refuses the two shapes in which letting the caller
+// pick the direction hands them rows the declaration was written to keep from
+// them: a constant written at one end only, and the two ends disagreeing about
+// Exclusive.
 //
 // A constant in a bound is the only part of a stretch a caller cannot move. It
 // is how a declaration pins a floor, or a tenant, and leaves the rest of the
@@ -626,6 +642,32 @@ func checkDirection(operation *Operation, parameters map[string]Parameter,
 // the whole rest of the index in that direction and no narrower for being read
 // backwards. A direction fixed by a constant is safe too, and never reaches
 // here: there is only one order, and whoever wrote the bound chose it.
+//
+// Exclusive is the second, later way to make the same mistake, and it is not a
+// mistake in bound() — bound()'s four branches (successor on the exclusive
+// lower end, successor on the inclusive upper end) are exactly the mirror of
+// each other, there is no missing "predecessor". The mistake is upstream of
+// bound(): Exclusive is written against From and To, which are START and END
+// of the walk, not LOW and HIGH of the keyspace, and reversing swaps which one
+// starts. So `From{Arg, Exclusive}, To{Arg}` reads (lo, hi] forward and [hi,
+// lo) reversed — two different half-open intervals — and the row at the floor
+// of the type (the empty string; false, which is also half the value space of
+// a bool; any document the field's Missing rule sorts to that floor) is
+// outside every forward call and inside a reverse one. Making bound()
+// symmetric instead would mean From.Exclusive meaning "exclude the low end"
+// while From.Values still means "the point the walk starts from" — two
+// different rules read off one field, which nobody could tell apart from the
+// declaration alone. So this is fixed here, at declaration time, instead: the
+// two ends must be Exclusive the same way, with one exception below.
+//
+// The exception is an end written identically at both places — same terms,
+// term for term, Exclusive not compared. Two ends that say the same thing are
+// one point (or one prefix), and a point open on one side is empty from
+// either direction: From=To={s3}, From exclusive gives forward
+// (successor(s3), successor(s3)) and reversed (s3, s3), both empty. Losing
+// this exception would refuse three shapes that leak nothing — the pinned
+// half-open cursor of a keyset pager among them — for a rule that does not
+// need to reach them.
 func boundsSurviveReversal(operation *Operation, chosenBy string) error {
 	at := func(end *Endpoint, i int) *Term {
 		if end == nil || i >= len(end.Terms) {
@@ -656,7 +698,43 @@ func boundsSurviveReversal(operation *Operation, chosenBy string) error {
 				ErrDeclaration, chosenBy, i+1)
 		}
 	}
+
+	// exclusiveOf treats an end nobody wrote as closed: there is nothing there
+	// to exclude, and the rest of the index in that direction is reached
+	// either way.
+	exclusiveOf := func(end *Endpoint) bool { return end != nil && end.Exclusive }
+
+	if exclusiveOf(operation.From) != exclusiveOf(operation.To) && !endsAreIdentical(operation.From, operation.To) {
+		return fmt.Errorf("%w: %q chooses the direction, so From and To must be exclusive the same way — exclusive marks the point the walk starts from, reversing carries that point to the other end, and a row at the floor of the index (the empty string, false, a document missing the field) would come back from one direction and never the other",
+			ErrDeclaration, chosenBy)
+	}
 	return nil
+}
+
+// endsAreIdentical is true when From and To were written down as exactly the
+// same terms — not whether they mean the same thing at runtime, which an
+// argument-valued end cannot know until it is called, but whether the
+// declaration itself repeats one description at both places. Exclusive is
+// deliberately not part of the comparison: it is the one thing allowed to
+// differ once the terms already agree, which is what makes the exception in
+// boundsSurviveReversal an exception rather than nothing.
+func endsAreIdentical(from, to *Endpoint) bool {
+	if from == nil || to == nil {
+		// Reachable only when both are nil, and then exclusiveOf already
+		// agreed (false, false) — boundsSurviveReversal never asks this
+		// question in that case. Written out anyway so the function is
+		// correct on its own, not just for the one caller it has today.
+		return from == nil && to == nil
+	}
+	if len(from.Terms) != len(to.Terms) {
+		return false
+	}
+	for i := range from.Terms {
+		if from.Terms[i] != to.Terms[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // validateStep checks one step of a batch against the collection it names.
