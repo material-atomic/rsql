@@ -93,12 +93,21 @@ type Operation struct {
 	// declaration, an argument term lets the caller choose per call — and both
 	// are already the vocabulary everything else here is written in.
 	//
-	// It is the one thing about a scan an argument may decide, and it is safe
-	// for a reason that does not generalise to anything else: it widens
-	// nothing. The index is the declared one, the two ends are the declared
-	// ones bounding the same stretch, the limit is the declared one, and the
-	// work is the same walk over the same pages. All that changes is which end
-	// the rows come out of.
+	// From is where the walk STARTS and To where it ends, so reversing swaps
+	// which of them is the upper end of the stretch. One declaration read both
+	// ways is therefore two different stretches, not one stretch read from two
+	// sides: a caller that flips the direction and leaves from and to alone
+	// gets a different set of rows, and has to swap the two values itself to
+	// get the same ones back. A declaration with both ends written as
+	// constants, read against its fixed direction, comes back empty.
+	//
+	// It is still the one thing about a scan an argument may decide, and it is
+	// safe for a reason that does not generalise to anything else: it widens
+	// nothing. The index is the declared one, the limit is the declared one,
+	// the work is the same walk over the same pages, and the set of rows the
+	// declaration can reach is the same from either end — which is why a
+	// constant bound written at one end only is refused beside a caller-chosen
+	// direction, since that one would widen. See checkDirection.
 	//
 	// "Reverse" reverses the order the index declared, as a whole. An index on
 	// (a ascending, b descending) read in reverse gives (a descending, b
@@ -475,8 +484,13 @@ func (s *Store) validateOperation(operation *Operation) error {
 				}
 			}
 		}
-		if err := checkDirection(operation.Direction, parameters, check); err != nil {
-			return err
+		// Only a scan may carry one at all — see the refusal below — so a count
+		// that wrote a direction down should hear about that rather than about
+		// whether the word it chose was spelled right.
+		if operation.Action == ActionScan {
+			if err := checkDirection(operation, parameters, check); err != nil {
+				return err
+			}
 		}
 		if operation.Action == ActionScan && operation.Limit <= 0 {
 			return fmt.Errorf("%w: a scan must declare how many rows it may return", ErrDeclaration)
@@ -527,13 +541,19 @@ func (s *Store) validateOperation(operation *Operation) error {
 		return fmt.Errorf("%w: %q is not something an operation can do", ErrDeclaration, operation.Action)
 	}
 
-	// A direction is a thing you have along an index, and only a scan and a
-	// count walk one. Saying it anywhere else would be a word in a declaration
-	// that nothing reads, which is how a caller ends up believing a promise
-	// nobody made.
-	if operation.Direction != nil && operation.Action != ActionScan && operation.Action != ActionCount {
-		return fmt.Errorf("%w: a %s does not walk an index, so it has no direction",
-			ErrDeclaration, operation.Action)
+	// A direction is a word in a declaration, and a word nothing reads is how a
+	// caller ends up believing a promise nobody made. Only a scan reads one.
+	//
+	// A count walks an index, so it looked at first like it should be allowed
+	// one — but a count hands back a number, and min(rows, limit) is the same
+	// number from either end, Truncated with it. That is the same reason
+	// totals is refused, so it gets the same answer.
+	if operation.Direction != nil && operation.Action != ActionScan {
+		why := "does not walk an index, so it has no direction"
+		if operation.Action == ActionCount {
+			why = "hands back a number, and that number is the same from either end"
+		}
+		return fmt.Errorf("%w: a %s %s", ErrDeclaration, operation.Action, why)
 	}
 
 	for _, path := range operation.Projection {
@@ -547,9 +567,10 @@ func (s *Store) validateOperation(operation *Operation) error {
 // checkDirection refuses a direction that could not be worked out, at the point
 // where it is written rather than at the point where somebody reads rows in an
 // order they did not expect.
-func checkDirection(term *Term, parameters map[string]Parameter,
+func checkDirection(operation *Operation, parameters map[string]Parameter,
 	check func(Term, string, string) error) error {
 
+	term := operation.Direction
 	if term == nil {
 		return nil
 	}
@@ -578,6 +599,61 @@ func checkDirection(term *Term, parameters map[string]Parameter,
 	if parameter.Default != nil {
 		if _, err := directionOf(parameter.Default); err != nil {
 			return fmt.Errorf("%w: the default for %q: %v", ErrDeclaration, term.Arg, err)
+		}
+	}
+	return boundsSurviveReversal(operation, term.Arg)
+}
+
+// boundsSurviveReversal refuses the one shape in which letting the caller pick
+// the direction hands them rows the declaration was written to keep from them.
+//
+// A constant in a bound is the only part of a stretch a caller cannot move. It
+// is how a declaration pins a floor, or a tenant, and leaves the rest of the
+// range to the call. But From is where the walk starts, so reversing swaps
+// which end of the stretch is the floor — and a constant written at one end
+// only stops being a floor the moment the caller passes "reverse". Everything
+// underneath it comes back, and no forward call of the same declaration could
+// have reached any of it whatever it passed. Refused here, because "a direction
+// widens nothing" has to be true of the declaration rather than of the call.
+//
+// What survives is a constant that says the same thing from both ends: same
+// position, same value. Then it confines the stretch whichever way the walk
+// enters, which is what "one tenant, either way along time" needs — and it is
+// already the shape scanAcross forces on every partitioned scan.
+//
+// Arguments at both ends are safe without any of this: reversing only permutes
+// values the caller was choosing anyway. So is an end left unwritten, which is
+// the whole rest of the index in that direction and no narrower for being read
+// backwards. A direction fixed by a constant is safe too, and never reaches
+// here: there is only one order, and whoever wrote the bound chose it.
+func boundsSurviveReversal(operation *Operation, chosenBy string) error {
+	at := func(end *Endpoint, i int) *Term {
+		if end == nil || i >= len(end.Terms) {
+			return nil
+		}
+		return &end.Terms[i]
+	}
+	fixed := func(term *Term) bool { return term != nil && term.Arg == "" }
+
+	width := 0
+	for _, end := range []*Endpoint{operation.From, operation.To} {
+		if end != nil && len(end.Terms) > width {
+			width = len(end.Terms)
+		}
+	}
+
+	for i := 0; i < width; i++ {
+		from, to := at(operation.From, i), at(operation.To, i)
+		if !fixed(from) && !fixed(to) {
+			continue
+		}
+		// Comparing terms with == is what scanAcross does, and it is safe for
+		// the same reason: check has already said a constant bound holds a
+		// value of the index field's own type, so nothing uncomparable is in
+		// there.
+		if from == nil || to == nil || *from != *to {
+			return fmt.Errorf("%w: %q chooses the direction, so bound value %d must be written the same at both ends — a constant on one end only is a floor the reverse walk turns into a ceiling, and the rows under it are rows no forward call of this operation can reach",
+				ErrDeclaration, chosenBy, i+1)
 		}
 	}
 	return nil
@@ -702,11 +778,18 @@ func operationKey(name string, version int) []byte {
 // Hash: partition order is hash order, which is no order at all. Nothing that
 // crosses partitions can be ordered, so nothing may.
 //
-// A direction changes none of this. What this function guarantees is that the
-// partitions concatenated in partition order are in key order; the reverse of
-// something in key order is still something this function has vouched for, and
-// a scan that may not run forward may not run backward either. So there is
-// nothing extra to refuse here, and nothing extra to allow.
+// A direction changes none of this. Reversing a sequence that is in key order
+// leaves it in key order — that part holds unconditionally, and it is why a
+// scan that may not run forward may not run backward either, and why there is
+// nothing extra to refuse here and nothing extra to allow.
+//
+// What is conditional is whether the sequence is in key order in the first
+// place, and that is this function's business rather than the walk's. It
+// compares Terms as they are written, and a bound whose argument is optional
+// falls away entirely at call time — so a scan this function passed as "one
+// account, every partition" can still run as "every account, one partition
+// after another". That hole is the same in both directions and predates the
+// direction; see task 0016.
 func scanAcross(collection *Collection, operation *Operation) error {
 	divided := collection.spec.Partition
 	if divided == nil {

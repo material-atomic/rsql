@@ -535,3 +535,161 @@ func TestAReversedScanStopsEarlyAcrossPartitions(t *testing.T) {
 		t.Errorf("stopping early gave %v, want %v", seen, want)
 	}
 }
+
+// idsOf is the id of every row a scan handed back, in the order it did.
+func idsOf(rows []map[string]any) []string {
+	out := make([]string, len(rows))
+	for i, row := range rows {
+		out[i] = fmt.Sprint(row["id"])
+	}
+	return out
+}
+
+// TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling: a constant
+// written into a bound is the one thing about a stretch a caller cannot move.
+// It is how a declaration pins a floor, or a tenant, and hands the rest of the
+// range over to the call.
+//
+// Reversing swaps which end of the stretch is the floor. So a constant written
+// at one end only stops being a floor the moment the caller says "reverse", and
+// the rows underneath it — rows no forward call of that same declaration can
+// reach, whatever it passes — come back. That is precisely the widening this
+// design claims not to do, so it is refused where it is written.
+//
+// What still passes is a constant that says the same thing from both ends:
+// pinned at the same position, with the same value. Then it confines the
+// stretch whichever way the walk enters it.
+func TestAConstantBoundIsAFloorTheDirectionCannotTurnIntoACeiling(t *testing.T) {
+	store, collection := declared(t, 128)
+	fill(t, collection)
+
+	// The shape that used to reach below its own floor: forward this can never
+	// go under s3, and reversed with to=s0 it came back s3 s2 s1 s0.
+	floored := eitherWay()
+	floored.Name = "articles.floored"
+	floored.Input = []Parameter{
+		{Name: "to", Type: TypeString, Required: true},
+		{Name: "direction", Type: TypeString, Default: DirectionForward},
+	}
+	floored.From = &Endpoint{Terms: []Term{{Value: "s3"}}}
+	floored.To = &Endpoint{Terms: []Term{{Arg: "to"}}}
+	if _, err := store.DeclareOperation(floored); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a constant floor under a caller-chosen direction: want ErrDeclaration, got %v", err)
+	}
+
+	// The same thing the other way round, and the case where the other end is
+	// not written at all: an absent end is the whole rest of the index, so the
+	// constant is still the only limit and reversing still steps over it.
+	ceilinged := floored
+	ceilinged.Name = "articles.ceilinged"
+	ceilinged.From = &Endpoint{Terms: []Term{{Arg: "to"}}}
+	ceilinged.To = &Endpoint{Terms: []Term{{Value: "s3"}}}
+	if _, err := store.DeclareOperation(ceilinged); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a constant ceiling under a caller-chosen direction: want ErrDeclaration, got %v", err)
+	}
+
+	lonely := floored
+	lonely.Name = "articles.lonely"
+	lonely.From = nil
+	lonely.To = &Endpoint{Terms: []Term{{Value: "s3"}}}
+	if _, err := store.DeclareOperation(lonely); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a constant against an absent end: want ErrDeclaration, got %v", err)
+	}
+
+	// A constant does not have to be the FIRST value of a bound. by_author is
+	// (author ascending, published descending), so pinning the author as an
+	// argument and the published date as a constant leaves the constant at
+	// position two — and it is a floor there exactly as it would be at
+	// position one. Measured before it was refused: forward from (ann, 3)
+	// reaches a2 and a1, reversed it reaches a5 and a4, and no forward call
+	// can reach those two whatever it passes for the author.
+	forward := keysOf(scan(t, collection, "by_author", Range{
+		From: &Bound{Values: []any{"ann", 3.0}},
+		To:   &Bound{Values: []any{"ann"}},
+	}))
+	reverse := keysOf(scan(t, collection, "by_author", Range{
+		From:      &Bound{Values: []any{"ann", 3.0}},
+		To:        &Bound{Values: []any{"ann"}},
+		Direction: Reverse,
+	}))
+	if fmt.Sprint(forward) == fmt.Sprint(reverse) {
+		t.Fatalf("this case is supposed to differ by direction, and both gave %v", forward)
+	}
+
+	deep := Operation{
+		Name:       "articles.deep_floor",
+		Collection: "articles",
+		Action:     ActionScan,
+		Index:      "by_author",
+		Input: []Parameter{
+			{Name: "author", Type: TypeString, Required: true},
+			{Name: "direction", Type: TypeString, Required: true},
+		},
+		From:       &Endpoint{Terms: []Term{{Arg: "author"}, {Value: 3.0}}},
+		To:         &Endpoint{Terms: []Term{{Arg: "author"}}},
+		Direction:  &Term{Arg: "direction"},
+		Projection: []string{"id"},
+		Limit:      10,
+	}
+	if _, err := store.DeclareOperation(deep); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a constant at the second bound value: want ErrDeclaration, got %v", err)
+	}
+
+	// And the same declaration with the constant matched at both ends is fine,
+	// because then it pins rather than floors.
+	deep.Name = "articles.deep_pin"
+	deep.To = &Endpoint{Terms: []Term{{Arg: "author"}, {Value: 3.0}}}
+	declareOp(t, store, deep)
+
+	// A direction the declaration fixes is nobody's choice but the schema
+	// author's, so a constant bound beside it is theirs to write.
+	fixed := floored
+	fixed.Name = "articles.fixed_floor"
+	fixed.Input = []Parameter{{Name: "to", Type: TypeString, Required: true}}
+	fixed.Direction = &Term{Value: DirectionReverse}
+	declareOp(t, store, fixed)
+}
+
+// TestAPinnedConstantSurvivesBeingReadFromEitherEnd: the case the refusal above
+// must not take with it. "One author, newest first or oldest first" pins the
+// author with a constant at BOTH ends, which is what scanAcross already makes
+// every partitioned scan do. The pin holds whichever way the walk enters, so
+// the two directions see one set of rows and the claim that a direction widens
+// nothing is true of this declaration.
+func TestAPinnedConstantSurvivesBeingReadFromEitherEnd(t *testing.T) {
+	store, collection := declared(t, 129)
+	fill(t, collection)
+
+	pinned := Operation{
+		Name:       "articles.anns",
+		Collection: "articles",
+		Action:     ActionScan,
+		Index:      "by_author",
+		Input:      []Parameter{{Name: "direction", Type: TypeString, Required: true}},
+		From:       &Endpoint{Terms: []Term{{Value: "ann"}}},
+		To:         &Endpoint{Terms: []Term{{Value: "ann"}}},
+		Direction:  &Term{Arg: "direction"},
+		Projection: []string{"id"},
+		Limit:      10,
+	}
+	declareOp(t, store, pinned)
+
+	// by_author is (author ascending, published descending), and ann wrote
+	// a1, a2, a4 and a5.
+	forward := invoke(t, store, "articles.anns", map[string]any{"direction": DirectionForward})
+	if got := idsOf(forward.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a5", "a4", "a2", "a1"}) {
+		t.Errorf("forward over the pinned author gave %v", got)
+	}
+	reverse := invoke(t, store, "articles.anns", map[string]any{"direction": DirectionReverse})
+	if got := idsOf(reverse.Rows); fmt.Sprint(got) != fmt.Sprint([]string{"a1", "a2", "a4", "a5"}) {
+		t.Errorf("reverse over the pinned author gave %v", got)
+	}
+
+	// bob's articles are on the same index on both sides of ann's, and neither
+	// direction reaches them.
+	for _, row := range append(forward.Rows, reverse.Rows...) {
+		if id := fmt.Sprint(row["id"]); id == "a0" || id == "a3" {
+			t.Errorf("the pin let %q through", id)
+		}
+	}
+}

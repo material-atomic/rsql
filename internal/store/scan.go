@@ -184,21 +184,32 @@ func (c *Collection) walk(within Range, prefix []byte, fields []keys.Field,
 	}
 
 	// A reversed walk reverses the list of partitions as well as each tree in
-	// it. The concatenation of the partitions in partition order is in key
-	// order — that is what scanAcross exists to guarantee — and the reverse of
-	// a sorted concatenation is each piece reversed, last piece first.
-	// Reversing only the trees, or only the list, gives an order that is
-	// locally right and globally wrong, which no single-partition test sees.
+	// it: the reverse of a sorted concatenation is each piece reversed, last
+	// piece first. Reversing only the trees, or only the list, gives an order
+	// that is locally right and globally wrong, which no single-partition test
+	// sees.
+	//
+	// That the concatenation is sorted at all is what scanAcross decides, when
+	// the operation is declared. Reversing something in key order leaves it in
+	// key order unconditionally, so the direction adds nothing for it to check
+	// — but it has a known hole of its own, for bounds that fall away at call
+	// time, and that hole is the same in both directions. See task 0016.
 	if within.Direction == Reverse {
 		slices.Reverse(trees)
 	}
 
 	for _, tree := range trees {
 		stop := false
+		// There is no prefix test here on purpose. It was one, and it was dead
+		// in both directions: forward starts at `lower`, which is at or after
+		// the prefix, and stops at `upper`, which is the first key after
+		// everything carrying it; reversed, Descend starts below `upper` and
+		// the `lower` test below stops it, and `lower` is never nil. A
+		// defensive clause nobody can reach is worse than no clause: the next
+		// person to change bound() cannot tell what it was covering for, and
+		// every mutation of the two bounds hides behind it. Removed for the
+		// same reason the dead branch in pager.Dirty was.
 		bounded := func(key, value []byte) bool {
-			if !bytes.HasPrefix(key, prefix) {
-				return false
-			}
 			if within.Direction == Reverse {
 				// Descend already started below `upper`; `lower` is where it ends.
 				if bytes.Compare(key, lower) < 0 {

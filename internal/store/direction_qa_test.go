@@ -213,9 +213,13 @@ func TestADirectionOnARollupReadIsRefusedBecauseTotalsWouldIgnoreIt(t *testing.T
 	}
 }
 
-// TestACountIsTheSameNumberFromEitherEnd: a count walks an index and so may
-// declare a direction, which means the direction must not change the answer.
-// A limit caps the number either way, and says so either way.
+// TestACountIsTheSameNumberFromEitherEnd: a count does walk an index, which is
+// why it nearly kept the right to declare a direction. But it hands back a
+// number, and the number is the same from either end — so a direction on a
+// count is a word in a declaration that nothing reads, which is the exact
+// reason totals is refused one. It is refused here for that reason too, and
+// this test holds both halves: the refusal, and the measurement that makes it
+// the right refusal.
 func TestACountIsTheSameNumberFromEitherEnd(t *testing.T) {
 	store, collection := declared(t, 143)
 	fill(t, collection)
@@ -229,13 +233,31 @@ func TestACountIsTheSameNumberFromEitherEnd(t *testing.T) {
 		Direction:  &Term{Arg: "direction"},
 		Limit:      4,
 	}
-	declareOp(t, store, counter)
+	if _, err := store.DeclareOperation(counter); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a direction on a count: want ErrDeclaration, got %v", err)
+	}
 
-	for _, direction := range []string{DirectionForward, DirectionReverse} {
-		result := invoke(t, store, "articles.count", map[string]any{"direction": direction})
-		if result.Count != 4 || !result.Truncated {
-			t.Errorf("counting %s gave %d, truncated=%v; want 4 and true",
-				direction, result.Count, result.Truncated)
+	// And a fixed one is refused as well: there is nothing to fix, whoever
+	// writes it down.
+	counter.Direction = &Term{Value: DirectionReverse}
+	counter.Input = nil
+	if _, err := store.DeclareOperation(counter); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("a fixed direction on a count: want ErrDeclaration, got %v", err)
+	}
+
+	// The measurement behind the refusal: the same walk with a limit of 4 sees
+	// four of the six rows whichever end it starts from, and says it stopped
+	// short either way. Different rows, same number.
+	for _, direction := range []Direction{Forward, Reverse} {
+		seen := 0
+		if err := collection.Scan("by_slug", Range{Direction: direction}, func(Found) bool {
+			seen++
+			return seen < 4
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if seen != 4 {
+			t.Errorf("counting from one end gave %d, want 4", seen)
 		}
 	}
 }
