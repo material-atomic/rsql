@@ -281,7 +281,11 @@ func (c *Collection) Totals(name string, within Range, visit func(Totals) bool) 
 	// hand-written version of that same arithmetic here would sit outside
 	// that proof and outside whatever the next change to stretch() teaches
 	// it — which is exactly what this task found and exists to close.
-	lower, upper, err := c.stretch(within, prefix, fields)
+	//
+	// stretch() takes rollup.Group rather than fields (its keys.Field
+	// encodings) because bound() names the field a caller-supplied bound
+	// fails to encode, and a name is not something keys.Field carries.
+	lower, upper, err := c.stretch(within, prefix, rollup.Group)
 	if err != nil {
 		return err
 	}

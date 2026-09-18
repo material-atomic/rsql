@@ -108,11 +108,11 @@ func (c *Collection) Scan(name string, within Range, visit func(Found) bool) err
 	}
 
 	prefix := c.entries(*index)
-	fields := encodings(index.Fields)
+	fields := index.Fields
 
 	return c.walk(within, prefix, fields, func(key, value []byte) bool {
 		rest := key[len(prefix):]
-		values, rest, err := keys.DecodeKey(rest, fields)
+		values, rest, err := keys.DecodeKey(rest, encodings(fields))
 		if err != nil {
 			return false
 		}
@@ -143,7 +143,7 @@ func (c *Collection) Walk(visit func(key any, document map[string]any) bool) err
 // along it takes the same bounds.
 func (c *Collection) walkRange(within Range, visit func(key any, document map[string]any) bool) error {
 	prefix := c.documents()
-	fields := []keys.Field{{}}
+	fields := []Field{{Path: c.spec.Key.Path, Type: c.spec.Key.Type, Missing: MissingSkip}}
 
 	return c.walk(within, prefix, fields, func(key, value []byte) bool {
 		primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
@@ -165,7 +165,7 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 // the one thing that has to be true for "a direction widens nothing" to hold,
 // and it has to be provable by calling it twice with Direction flipped and
 // comparing the two byte strings, not by reading rows through a fixture.
-func (c *Collection) stretch(within Range, prefix []byte, fields []keys.Field) (lower, upper []byte, err error) {
+func (c *Collection) stretch(within Range, prefix []byte, fields []Field) (lower, upper []byte, err error) {
 	lower, err = c.bound(prefix, fields, within.From, false)
 	if err != nil {
 		return nil, nil, err
@@ -180,7 +180,7 @@ func (c *Collection) stretch(within Range, prefix []byte, fields []keys.Field) (
 // walk is the one walk both Scan and walkRange are: a stretch of one keyspace,
 // across every partition, in whichever direction was asked for. Only what to
 // do with each entry differs, so only that is passed in.
-func (c *Collection) walk(within Range, prefix []byte, fields []keys.Field,
+func (c *Collection) walk(within Range, prefix []byte, fields []Field,
 	visit func(key, value []byte) bool) error {
 
 	lower, upper, err := c.stretch(within, prefix, fields)
@@ -262,7 +262,24 @@ func (c *Collection) walk(within Range, prefix []byte, fields []keys.Field,
 }
 
 // bound turns one end of a range into the byte position to start or stop at.
-func (c *Collection) bound(prefix []byte, fields []keys.Field, at *Bound, upper bool) ([]byte, error) {
+//
+// The values here are never a constant written into an operation's
+// declaration — constantIsEncodable (ops.go) already refused any of those
+// that keys cannot turn into bytes, at the point the operation was declared.
+// So whatever bound() cannot encode was one of the two things that only get a
+// value at call time: an argument, or what an earlier step of a batch
+// produced. Either way it is the caller's mistake, discovered here because
+// this is the first place anything tries to encode it — which is why it is
+// wrapped in ErrArgument rather than returned bare. A bare error from keys
+// has no entry in codeFor's table, and a client that sees the resulting
+// code=failed learns nothing it can act on for a mistake that is, in fact,
+// entirely knowable: the argument does not fit an index built for something
+// else.
+//
+// The loop encodes one value at a time, rather than handing the whole slice to
+// keys.EncodeKey at once, so that a failure names the field it happened at —
+// fields[i].Path — and not just the index as a whole.
+func (c *Collection) bound(prefix []byte, fields []Field, at *Bound, upper bool) ([]byte, error) {
 	if at == nil {
 		if upper {
 			// Everything in this index, and nothing after it.
@@ -274,9 +291,18 @@ func (c *Collection) bound(prefix []byte, fields []keys.Field, at *Bound, upper 
 		return nil, fmt.Errorf("%w: %d values for an index of %d fields", ErrDeclaration, len(at.Values), len(fields))
 	}
 
-	key, err := keys.EncodeKey(append([]byte(nil), prefix...), at.Values, fields[:len(at.Values)])
-	if err != nil {
-		return nil, err
+	side := "from"
+	if upper {
+		side = "to"
+	}
+
+	key := append([]byte(nil), prefix...)
+	for i, value := range at.Values {
+		var err error
+		if key, err = keys.Encode(key, value, fields[i].encoding()); err != nil {
+			return nil, fmt.Errorf("%w: the %s bound holds a value for %q that keys cannot encode: %v",
+				ErrArgument, side, fields[i].Path, err)
+		}
 	}
 
 	// A bound is a prefix, and every key that extends it is inside it. So an

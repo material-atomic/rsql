@@ -919,7 +919,7 @@ func TestTotalsRowsMatchATreeWalkBoundedByStretchesOwnBytes(t *testing.T) {
 	fields := encodings(rollup.Group)
 	within := Range{From: &Bound{Values: []any{"b"}}, To: &Bound{Values: []any{"d"}}}
 
-	lower, upper, err := lines.stretch(within, prefix, fields)
+	lower, upper, err := lines.stretch(within, prefix, rollup.Group)
 	if err != nil {
 		t.Fatal(err)
 	}

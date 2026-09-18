@@ -393,13 +393,28 @@ func (c *Collection) entriesForIndex(document map[string]any, key any, index *In
 			values[spread] = element
 		}
 
-		prefix := c.entries(*index)
-		encoded, err := keys.EncodeKey(prefix, values, encodings(index.Fields))
-		if err != nil {
-			return nil, fmt.Errorf("index %q of %q: %w", index.Name, c.spec.Name, err)
+		// Encoded one field at a time, rather than handed to keys.EncodeKey as
+		// a slice, so a failure can name the field it happened at. It is
+		// reached only through a field declared "any": matches() above (and,
+		// for a spread field, the element check just above it) accepts any
+		// value for one, including a slice or a map read off the document,
+		// and those are exactly what keys.Encode refuses. That is the shape
+		// of the document, not of a caller's argument list, so this is
+		// ErrType — the same sentinel a document already fails on a few
+		// lines up, when a field typed more narrowly holds the wrong Go type
+		// — rather than ErrArgument, which scan.go's bound() uses for the
+		// equivalent failure on a scan's bound values.
+		encoded := c.entries(*index)
+		for i, value := range values {
+			var err error
+			if encoded, err = keys.Encode(encoded, value, index.Fields[i].encoding()); err != nil {
+				return nil, fmt.Errorf("%w: index %q of %q cannot encode a value for %q: %v",
+					ErrType, index.Name, c.spec.Name, index.Fields[i].Path, err)
+			}
 		}
 		length := len(encoded)
 
+		var err error
 		encoded, err = keys.Encode(encoded, key, keys.Field{})
 		if err != nil {
 			return nil, err

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-
-	"github.com/sapedb/sapedb/internal/keys"
 )
 
 // This file is round four's front door. Three rounds refused a growing list
@@ -38,7 +36,7 @@ func TestTheTwoBoundsNeverDependOnDirection(t *testing.T) {
 	_, collection := declared(t, 150)
 	fill(t, collection)
 
-	check := func(t *testing.T, what string, prefix []byte, fields []keys.Field, from, to *Bound) {
+	check := func(t *testing.T, what string, prefix []byte, fields []Field, from, to *Bound) {
 		t.Helper()
 		fl, fu, err := collection.stretch(Range{From: from, To: to, Direction: Forward}, prefix, fields)
 		if err != nil {
@@ -68,17 +66,17 @@ func TestTheTwoBoundsNeverDependOnDirection(t *testing.T) {
 	} {
 		t.Run(over.index, func(t *testing.T) {
 			var prefix []byte
-			var fields []keys.Field
+			var fields []Field
 			if over.index == ClusteredIndex {
 				prefix = collection.documents()
-				fields = []keys.Field{{}}
+				fields = []Field{{Path: collection.spec.Key.Path, Type: collection.spec.Key.Type, Missing: MissingSkip}}
 			} else {
 				index, found := collection.index(over.index)
 				if !found {
 					t.Fatalf("%q is not declared", over.index)
 				}
 				prefix = collection.entries(*index)
-				fields = encodings(index.Fields)
+				fields = index.Fields
 			}
 
 			shapes := reachShapes(over.pin)
@@ -103,7 +101,7 @@ func TestTheTwoBoundsNeverDependOnDirection(t *testing.T) {
 		t.Fatal("by_author is not declared")
 	}
 	prefix := collection.entries(*author)
-	fields := encodings(author.Fields)
+	fields := author.Fields
 
 	for _, p := range []float64{-1e9, -1, 0, 1, 2.5, 5, 1e9} {
 		check(t, "composite, From two terms / To one term", prefix, fields,

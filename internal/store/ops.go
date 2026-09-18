@@ -742,9 +742,13 @@ func scanFields(collection *Collection, name string) ([]Field, error) {
 // lets a constant of any type satisfy that — including a slice or a map read
 // off a JSON body, which keys.Encode refuses with ErrNotIndexable rather than
 // encoding. A constant is the one kind of term this can be checked for ahead
-// of time: an argument or a step reference has no value yet, and its value at
-// call time is whatever the caller or the earlier step produced, checked the
-// ordinary way when bound() tries to encode it.
+// of time: an argument or a step reference has no value yet, so this function
+// never sees it. Its value at call time is whatever the caller or the earlier
+// step produced, and bound() (scan.go) is where that value first meets
+// keys.Encode. A value that fails there is refused with ErrArgument rather
+// than left as the bare error keys.Encode returns — it is the caller's
+// mistake, discovered at the one place that can see it, not a fault of the
+// server's that the constant path here was already closed against.
 func constantIsEncodable(term Term, field Field) error {
 	if term.Arg != "" || term.Step != "" {
 		return nil
@@ -758,11 +762,27 @@ func constantIsEncodable(term Term, field Field) error {
 // sameTerm compares two terms without the panic == risks. Term.Value is any,
 // and a term may hold a constant of a type an index field declared "any"
 // accepts — a slice or a map, which Go cannot compare with ==. reflect.
-// DeepEqual has no such limit, and every other field of Term compares safely
-// with == on its own.
+// DeepEqual has no such limit.
+//
+// It compares the whole struct rather than listing Arg, Constant, Step and
+// Field by name next to a DeepEqual of Value alone, which is what this used
+// to do and which is a list somebody has to remember to extend. Term has five
+// fields today; the day a sixth is added, a hand-kept list stays silent about
+// it and quietly starts calling two different terms "the same" — and the
+// place that costs is scanAcross/totalsAcross below, which is what a
+// same-term test is standing in for a half-pinned scan or rollup across a
+// partitioned collection: exactly the shape those two functions exist to
+// refuse. DeepEqual on the struct covers a new field the moment it exists
+// rather than the moment somebody remembers this function — with the one
+// caveat that is true of DeepEqual generally, not particular to this change:
+// per its own documentation, two non-nil func values are never deeply equal
+// to each other, only to nil. Term.Value could in principle hold a func; if
+// it ever does, this reports two such terms as different rather than
+// comparing them by identity, which is the safe side of the bug this
+// replaced (silently calling two different terms "the same"), not the unsafe
+// one.
 func sameTerm(a, b Term) bool {
-	return a.Arg == b.Arg && a.Constant == b.Constant && a.Step == b.Step && a.Field == b.Field &&
-		reflect.DeepEqual(a.Value, b.Value)
+	return reflect.DeepEqual(a, b)
 }
 
 func operationPrefix(name string) []byte {
