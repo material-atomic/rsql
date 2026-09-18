@@ -254,20 +254,34 @@ func (c *Collection) contribute(tree *btree.Tree, document map[string]any, sign 
 // partition holds for it. Which is why a rollup read of a partitioned
 // collection has to name one group — checked where the operation is declared,
 // for the same reason a scan is.
+//
+// within.Direction must be Forward. A rollup read has no order to reverse —
+// it is a sum, not a sequence — so Direction is a word this function has
+// nowhere to spend, and task 0012 round 4 refused exactly that word for a
+// declared totals operation for exactly that reason ("a word nobody reads is
+// how a caller ends up believing a promise nobody made"). That refusal lives
+// in ops.go's checkDirection and only reaches a declared Operation; a Range
+// built by Go code and handed to Totals directly skips it, so it is repeated
+// here.
 func (c *Collection) Totals(name string, within Range, visit func(Totals) bool) error {
 	rollup, found := c.rollup(name)
 	if !found {
 		return fmt.Errorf("%w: %q of %q", ErrNoRollup, name, c.spec.Name)
 	}
+	if within.Direction != Forward {
+		return fmt.Errorf("%w: a rollup read has no direction to walk in; within.Direction must be Forward", ErrDeclaration)
+	}
 
 	prefix := c.rollups(*rollup)
 	fields := encodings(rollup.Group)
 
-	lower, err := c.bound(prefix, fields, within.From, false)
-	if err != nil {
-		return err
-	}
-	upper, err := c.bound(prefix, fields, within.To, true)
+	// Two calls, not a bound() of its own: this is the same stretch of the
+	// same keyspace a Scan would compute, and stretch() is where task 0012
+	// round 4 put the one proof that a direction widens nothing. A second,
+	// hand-written version of that same arithmetic here would sit outside
+	// that proof and outside whatever the next change to stretch() teaches
+	// it — which is exactly what this task found and exists to close.
+	lower, upper, err := c.stretch(within, prefix, fields)
 	if err != nil {
 		return err
 	}

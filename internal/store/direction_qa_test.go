@@ -149,14 +149,22 @@ func TestOneDeclarationReadBothWaysCoversTheSameStretch(t *testing.T) {
 	}
 }
 
-// TestADirectionOnARollupReadIsRefusedBecauseTotalsWouldIgnoreIt: Totals takes
-// the same Range every scan does and reads within.Direction nowhere, so a
-// direction that reached it would be a word in a declaration that changes
-// nothing — rows in the order the caller did not ask for, with no error.
+// TestADirectionOnARollupReadIsRefusedAtDeclarationAndAtTheGoCallToo: a
+// rollup read has no direction to walk in. Two different doors used to lead
+// there, and until task 0043 only one of them was locked.
 //
-// The refusal at declaration is what keeps that unreachable, so it is worth a
-// test of its own rather than being covered only by the refusal on a get.
-func TestADirectionOnARollupReadIsRefusedBecauseTotalsWouldIgnoreIt(t *testing.T) {
+// The declared Operation's own Direction field was already refused for any
+// action that is not a scan — the blanket check in ops.go, below
+// checkDirection, catches ActionTotals the same way it catches ActionCount.
+// What that check cannot reach is Collection.Totals called directly from Go
+// with a Range whose Direction is Reverse: bounds() never sets Direction for
+// a totals invocation, so no declared operation can produce one, but nothing
+// stopped Go code from building one by hand. Until this task that Range read
+// forward and said nothing — the exact hazard the comment on this test used
+// to name as the reason the declaration-level refusal mattered ("a direction
+// that reached [Totals] would be a word … that changes nothing … with no
+// error"). Now it does not reach it silently either.
+func TestADirectionOnARollupReadIsRefusedAtDeclarationAndAtTheGoCallToo(t *testing.T) {
 	_, store := fresh(t, 142)
 	lines := takings(t, store)
 
@@ -181,17 +189,10 @@ func TestADirectionOnARollupReadIsRefusedBecauseTotalsWouldIgnoreIt(t *testing.T
 		t.Errorf("a direction on a rollup read: want ErrDeclaration, got %v", err)
 	}
 
-	// And this is why it has to be refused rather than allowed and ignored: a
-	// Range that says Reverse reads forward here, silently.
-	var groups []string
-	if err := lines.Totals("per_account", Range{Direction: Reverse}, func(row Totals) bool {
-		groups = append(groups, fmt.Sprint(row.Group[0]))
-		return true
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"ann", "bob", "cid"}; fmt.Sprint(groups) != fmt.Sprint(want) {
-		t.Errorf("Totals now honours a direction, so the refusal above can go: %v", groups)
+	// And the Go call that used to be the silent door is refused too, rather
+	// than left as the one path the check above never covered.
+	if err := lines.Totals("per_account", Range{Direction: Reverse}, func(Totals) bool { return true }); !errors.Is(err, ErrDeclaration) {
+		t.Errorf("Totals with Range{Direction: Reverse}: want ErrDeclaration, got %v", err)
 	}
 }
 

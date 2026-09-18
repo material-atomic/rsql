@@ -75,6 +75,12 @@ func directionOf(value any) (Direction, error) {
 // whose meaning depended on an argument the person who wrote it never sees —
 // so the swap was removed rather than patched a fourth time. See task 0012,
 // round 4.
+//
+// Direction is the order a Scan (or Walk) reads its rows in. A rollup read
+// (Collection.Totals) has no such order to reverse — it hands back a sum per
+// group, not a sequence of rows a caller could read backwards — so it refuses
+// a Range whose Direction is anything but Forward rather than accept a word
+// it would then have nowhere to spend. See Totals's own doc.
 type Range struct {
 	From      *Bound
 	To        *Bound
