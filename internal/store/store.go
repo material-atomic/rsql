@@ -170,6 +170,13 @@ func (s *Store) Declare(spec Spec) (*Collection, error) {
 	if existing.spec.Key != spec.Key {
 		return nil, fmt.Errorf("%w: the primary key of %q was declared %+v", ErrIncompatible, spec.Name, existing.spec.Key)
 	}
+	// How a collection is divided decides which file every document is in, so
+	// changing it would mean moving all of them — which is a migration
+	// somebody runs, not something a redeclaration does quietly.
+	if !samePartition(existing.spec.Partition, spec.Partition) {
+		return nil, fmt.Errorf("%w: %q is already divided %s; moving every document is not something redeclaring does",
+			ErrIncompatible, spec.Name, describePartition(existing.spec.Partition))
+	}
 
 	updated := existing.spec
 	updated.Indexes = nil
@@ -338,9 +345,16 @@ func (s *Store) takeCollectionID() (uint32, error) {
 // Collected first and deleted afterwards: deleting while walking would be
 // changing the tree under the walk.
 func (s *Store) deleteRange(prefix []byte) error {
+	return deleteRange(s.tree, prefix)
+}
+
+// deleteRange removes everything under a prefix from one tree. Taken out of
+// the Store because a partitioned collection has to do it once per partition,
+// and a tree is what a partition is.
+func deleteRange(tree *btree.Tree, prefix []byte) error {
 	var doomed [][]byte
 
-	err := s.tree.Ascend(prefix, func(key, _ []byte) bool {
+	err := tree.Ascend(prefix, func(key, _ []byte) bool {
 		if !bytes.HasPrefix(key, prefix) {
 			return false
 		}
@@ -352,7 +366,7 @@ func (s *Store) deleteRange(prefix []byte) error {
 	}
 
 	for _, key := range doomed {
-		if _, err := s.tree.Delete(key); err != nil {
+		if _, err := tree.Delete(key); err != nil {
 			return err
 		}
 	}

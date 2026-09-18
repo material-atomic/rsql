@@ -8,6 +8,7 @@ import (
 
 	"github.com/material-atomic/rsql/internal/btree"
 	"github.com/material-atomic/rsql/internal/pager"
+	"github.com/material-atomic/rsql/internal/vfs"
 )
 
 // One database, several files, one commit.
@@ -58,20 +59,9 @@ var (
 // test, and neither should have to know about the other. Open makes the file
 // if it is not there, which is what a partition being created means.
 type Files interface {
-	Open(name string) (File, error)
+	Open(name string) (vfs.File, error)
 	Remove(name string) error
 	Names() ([]string, error)
-}
-
-// File is what a partition is kept in. It is vfs.File, named here so that this
-// package states what it needs rather than importing it to say so.
-type File interface {
-	ReadAt(p []byte, off int64) (int, error)
-	WriteAt(p []byte, off int64) (int, error)
-	Sync() error
-	Truncate(size int64) error
-	Close() error
-	Size() (int64, error)
 }
 
 // part is one partition: its own pages, its own tree, and no say in when
@@ -139,18 +129,35 @@ func (s *Store) Part(name string) (*btree.Tree, error) {
 	return made.tree, nil
 }
 
-// Parts is every partition this database knows about, in order.
+// Parts is every partition this database has, in order, as the transaction in
+// progress sees it.
+//
+// Which means the ones committed plus the ones made since, minus the ones
+// dropped since. Reading only the committed rows would make a partition
+// invisible to the transaction that just created it — and the first thing that
+// went wrong when this was written was that expiry could not see the partition
+// whose arrival was supposed to trigger it.
 func (s *Store) Parts() []string {
 	prefix := []byte{spaceParts}
+	seen := map[string]bool{}
 	names := []string{}
 
 	_ = s.tree.Ascend(prefix, func(key, _ []byte) bool {
 		if len(key) <= 1 || key[0] != spaceParts {
 			return false
 		}
-		names = append(names, string(key[1:]))
+		name := string(key[1:])
+		seen[name] = true
+		names = append(names, name)
 		return true
 	})
+
+	for name := range s.parts {
+		if !seen[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
 	return names
 }
 
@@ -164,9 +171,13 @@ func (s *Store) DropPart(name string) error {
 	if s.files == nil {
 		return fmt.Errorf("%w: cannot drop %q", ErrNoFiles, name)
 	}
-	if _, recorded, err := s.readPart(name); err != nil {
+	_, recorded, err := s.readPart(name)
+	if err != nil {
 		return err
-	} else if !recorded {
+	}
+
+	open, live := s.parts[name]
+	if !recorded && !live {
 		return nil
 	}
 
@@ -174,13 +185,18 @@ func (s *Store) DropPart(name string) error {
 	// partition somebody can still read, and a handle closed halfway through a
 	// transaction is one that cannot be given back — the first test written
 	// for this fell straight into it.
-	if open, live := s.parts[name]; live {
+	if live {
 		delete(s.parts, name)
 		s.dropping[name] = open
 	}
 
-	if _, err := s.tree.Delete(append([]byte{spaceParts}, name...)); err != nil {
-		return err
+	// A partition made by this same transaction has no row to delete — it was
+	// never committed. It still has a file, and the file still goes, because
+	// everything in it was written by the transaction that is dropping it.
+	if recorded {
+		if _, err := s.tree.Delete(append([]byte{spaceParts}, name...)); err != nil {
+			return err
+		}
 	}
 	s.dropped = append(s.dropped, name)
 	return nil

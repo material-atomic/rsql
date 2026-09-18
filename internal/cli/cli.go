@@ -277,6 +277,17 @@ func open(opts options) (*store.Store, func(), error) {
 		held.Close()
 		return nil, nil, err
 	}
+
+	// The same directory the server uses, so that a tool and a server see the
+	// same database rather than each seeing the part of it they made.
+	folder, err := vfs.At(strings.TrimSuffix(path, ".rsql")+".parts", 0o600)
+	if err != nil {
+		file.Close()
+		held.Close()
+		return nil, nil, err
+	}
+	opened.Keep(folder, settings.Key)
+
 	return opened, func() { pages.Close(); held.Close() }, nil
 }
 

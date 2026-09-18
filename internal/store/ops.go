@@ -418,6 +418,9 @@ func (s *Store) validateOperation(operation *Operation) error {
 		if operation.Action == ActionScan && operation.Limit <= 0 {
 			return fmt.Errorf("%w: a scan must declare how many rows it may return", ErrDeclaration)
 		}
+		if err := scanAcross(collection, operation); err != nil {
+			return err
+		}
 		if operation.Limit < 0 {
 			return fmt.Errorf("%w: a limit of %d", ErrDeclaration, operation.Limit)
 		}
@@ -567,4 +570,60 @@ func operationKey(name string, version int) []byte {
 	var raw [4]byte
 	binary.BigEndian.PutUint32(raw[:], uint32(version))
 	return append(key, raw[:]...)
+}
+
+// scanAcross refuses a scan of a partitioned collection that would come back
+// in an order nobody asked for.
+//
+// An index on a partitioned collection is local to its partition — it has to
+// be, or dropping a partition would stop being an unlink — so a scan that
+// crosses partitions is the results of several indexes one after another.
+// Whether that is the right order depends on the collection, and it is
+// knowable here, which is the only place it should ever be decided.
+//
+// Time: partition names sort in the order the periods happened, and the key is
+// a ulid, so partition order is key order. Every index entry ends with the key.
+// So the concatenation is correctly ordered as long as the declared fields of
+// the index are all fixed and the only thing varying is the key. A scan that
+// leaves a declared field free would return, say, every account of January
+// before every account of February.
+//
+// Hash: partition order is hash order, which is no order at all. Nothing that
+// crosses partitions can be ordered, so nothing may.
+func scanAcross(collection *Collection, operation *Operation) error {
+	divided := collection.spec.Partition
+	if divided == nil {
+		return nil
+	}
+
+	where := fmt.Sprintf("%q is divided %s", collection.spec.Name, describePartition(divided))
+
+	if divided.By == ByHash {
+		return fmt.Errorf("%w: %s, so a scan of it would run over partitions in hash order, which is no order; read it by key",
+			ErrDeclaration, where)
+	}
+
+	// The clustered index is the key itself, and partition order is key order,
+	// so walking every partition in turn is exactly key order.
+	if operation.Index == "" || operation.Index == ClusteredIndex {
+		return nil
+	}
+
+	index, found := collection.index(operation.Index)
+	if !found {
+		return fmt.Errorf("%w: %q of %q", ErrNoIndex, operation.Index, collection.spec.Name)
+	}
+
+	if operation.From == nil || operation.To == nil ||
+		len(operation.From.Terms) != len(index.Fields) || len(operation.To.Terms) != len(index.Fields) {
+		return fmt.Errorf("%w: %s, so a scan on %q must fix all %d of its fields and let only the key vary — otherwise the partitions come back one after another rather than in order",
+			ErrDeclaration, where, index.Name, len(index.Fields))
+	}
+	for i := range index.Fields {
+		if operation.From.Terms[i] != operation.To.Terms[i] {
+			return fmt.Errorf("%w: %s, so a scan on %q must fix %q rather than range over it",
+				ErrDeclaration, where, index.Name, index.Fields[i].Path)
+		}
+	}
+	return nil
 }

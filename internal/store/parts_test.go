@@ -24,7 +24,7 @@ func newShelf(seed int64) *shelfOfFiles {
 	return &shelfOfFiles{disks: map[string]*vfs.SimDisk{}, seed: seed}
 }
 
-func (s *shelfOfFiles) Open(name string) (File, error) {
+func (s *shelfOfFiles) Open(name string) (vfs.File, error) {
 	if disk, made := s.disks[name]; made {
 		return kept{disk}, nil
 	}

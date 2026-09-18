@@ -549,11 +549,22 @@ func (s *Server) openFile(path, account, name string) (*database, error) {
 		return nil, err
 	}
 
+	// Where this database's partitions live: a directory of its own, so that
+	// "what files does this database have" is answered by the directory rather
+	// than by a naming convention. A wrong answer to that question unlinks
+	// somebody else's data.
+	folder, err := vfs.At(strings.TrimSuffix(path, ".rsql")+".parts", 0o600)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
 	opened, err := store.Open(pages)
 	if err != nil {
 		file.Close()
 		return nil, err
 	}
+	opened.Keep(folder, options.Key)
 	return &database{pages: pages, store: opened, file: file, changed: make(chan struct{})}, nil
 }
 

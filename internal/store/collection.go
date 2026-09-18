@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/material-atomic/rsql/internal/btree"
 	"github.com/material-atomic/rsql/internal/keys"
 )
 
@@ -18,6 +19,82 @@ type Collection struct {
 
 // Spec is the declaration this collection is running.
 func (c *Collection) Spec() Spec { return c.spec }
+
+// into is the tree this key's document lives in.
+//
+// For a collection nobody divided that is the one tree there is. For a
+// partitioned one it is decided by the key alone, which is why the key is the
+// only thing a partition may be decided by: every read, write and delete
+// already has it, and none of them has to go looking first.
+func (c *Collection) into(key any) (*btree.Tree, error) {
+	if c.spec.Partition == nil {
+		return c.store.tree, nil
+	}
+	name, err := c.spec.Partition.name(c.spec.Name, key)
+	if err != nil {
+		return nil, err
+	}
+
+	tree, err := c.store.Part(name)
+	if err != nil {
+		return nil, err
+	}
+
+	// A new partition is what ages a collection. Checked here rather than on a
+	// timer, because a database nobody has written to for a year should not
+	// lose a year of history the moment somebody opens it — what makes data
+	// old is new data arriving.
+	if err := c.expire(); err != nil {
+		return nil, err
+	}
+	return tree, nil
+}
+
+// expire drops the partitions that have fallen out of what is kept.
+func (c *Collection) expire() error {
+	if c.spec.Partition == nil || c.spec.Partition.Keep <= 0 {
+		return nil
+	}
+
+	mine := []string{}
+	for _, name := range c.store.Parts() {
+		if strings.HasPrefix(name, c.spec.Name+"-") {
+			mine = append(mine, name)
+		}
+	}
+
+	for _, old := range c.spec.Partition.expired(mine) {
+		if err := c.store.DropPart(old); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// across is every tree this collection lives in, oldest partition first.
+//
+// Partition names are written so that they sort in the order the periods
+// happened, so this is also the order a scan walks them in — which is what
+// makes concatenating the results of a scan across partitions come out in the
+// right order. See the check in ops.go for when that is true.
+func (c *Collection) across() ([]*btree.Tree, error) {
+	if c.spec.Partition == nil {
+		return []*btree.Tree{c.store.tree}, nil
+	}
+
+	trees := []*btree.Tree{}
+	for _, name := range c.store.Parts() {
+		if !strings.HasPrefix(name, c.spec.Name+"-") {
+			continue
+		}
+		tree, err := c.store.Part(name)
+		if err != nil {
+			return nil, err
+		}
+		trees = append(trees, tree)
+	}
+	return trees, nil
+}
 
 // live refuses a handle to a collection that has been dropped. Writing through
 // one would fill a keyspace nothing points at, and a later collection given the
@@ -83,7 +160,12 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 		return nil, err
 	}
 
-	previous, replaced, err := c.read(stored)
+	tree, err := c.into(key)
+	if err != nil {
+		return nil, err
+	}
+
+	previous, replaced, err := c.read(tree, stored)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +176,7 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.checkUnique(additions, stored); err != nil {
+	if err := c.checkUnique(tree, additions, stored); err != nil {
 		return nil, err
 	}
 
@@ -104,7 +186,7 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 			return nil, err
 		}
 		for _, entry := range removals {
-			if _, err := c.store.tree.Delete(entry.key); err != nil {
+			if _, err := tree.Delete(entry.key); err != nil {
 				return nil, err
 			}
 		}
@@ -114,11 +196,11 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 	if err != nil {
 		return nil, fmt.Errorf("rsql/store: this document cannot be stored: %w", err)
 	}
-	if err := c.store.tree.Put(stored, encoded); err != nil {
+	if err := tree.Put(stored, encoded); err != nil {
 		return nil, err
 	}
 	for _, entry := range additions {
-		if err := c.store.tree.Put(entry.key, entry.value); err != nil {
+		if err := tree.Put(entry.key, entry.value); err != nil {
 			return nil, err
 		}
 	}
@@ -140,7 +222,11 @@ func (c *Collection) Get(key any) (map[string]any, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	return c.read(stored)
+	tree, err := c.into(key)
+	if err != nil {
+		return nil, false, err
+	}
+	return c.read(tree, stored)
 }
 
 // Delete removes a document and everything the indexes say about it.
@@ -163,7 +249,12 @@ func (c *Collection) remove(by Attribution, key any, record bool) (bool, error) 
 		return false, err
 	}
 
-	document, found, err := c.read(stored)
+	tree, err := c.into(key)
+	if err != nil {
+		return false, err
+	}
+
+	document, found, err := c.read(tree, stored)
 	if err != nil || !found {
 		return false, err
 	}
@@ -173,14 +264,14 @@ func (c *Collection) remove(by Attribution, key any, record bool) (bool, error) 
 		return false, err
 	}
 	for _, entry := range removals {
-		if _, err := c.store.tree.Delete(entry.key); err != nil {
+		if _, err := tree.Delete(entry.key); err != nil {
 			return false, err
 		}
 	}
 
 	// The document was read above, so this removes it: a key that was not there
 	// returned before any of this.
-	if _, err := c.store.tree.Delete(stored); err != nil {
+	if _, err := tree.Delete(stored); err != nil {
 		return false, err
 	}
 
@@ -194,8 +285,8 @@ func (c *Collection) remove(by Attribution, key any, record bool) (bool, error) 
 	return true, nil
 }
 
-func (c *Collection) read(stored []byte) (map[string]any, bool, error) {
-	value, found, err := c.store.tree.Get(stored)
+func (c *Collection) read(tree *btree.Tree, stored []byte) (map[string]any, bool, error) {
+	value, found, err := tree.Get(stored)
 	if err != nil || !found {
 		return nil, false, err
 	}
@@ -312,7 +403,7 @@ func (c *Collection) entriesForIndex(document map[string]any, key any, index *In
 
 // checkUnique refuses a write that would put a second document under a value a
 // unique index already holds.
-func (c *Collection) checkUnique(additions []entry, stored []byte) error {
+func (c *Collection) checkUnique(tree *btree.Tree, additions []entry, stored []byte) error {
 	for _, addition := range additions {
 		if !addition.index.Unique {
 			continue
@@ -321,7 +412,7 @@ func (c *Collection) checkUnique(additions []entry, stored []byte) error {
 		prefix := addition.key[:addition.prefix]
 		var clash []byte
 
-		err := c.store.tree.Ascend(prefix, func(key, _ []byte) bool {
+		err := tree.Ascend(prefix, func(key, _ []byte) bool {
 			if !bytes.HasPrefix(key, prefix) {
 				return false
 			}
@@ -363,10 +454,25 @@ func (c *Collection) include(document map[string]any, index *Index) ([]byte, err
 
 // buildIndex fills a new index from the documents already stored.
 func (c *Collection) buildIndex(index Index) error {
+	trees, err := c.across()
+	if err != nil {
+		return err
+	}
+	for _, tree := range trees {
+		if err := c.buildIndexIn(tree, index); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildIndexIn fills a new index from the documents in one tree. An index is
+// local to its partition, so building one is this, once per partition.
+func (c *Collection) buildIndexIn(tree *btree.Tree, index Index) error {
 	prefix := c.documents()
 	var made []entry
 
-	err := c.store.tree.Ascend(prefix, func(key, value []byte) bool {
+	err := tree.Ascend(prefix, func(key, value []byte) bool {
 		if !bytes.HasPrefix(key, prefix) {
 			return false
 		}
@@ -390,11 +496,11 @@ func (c *Collection) buildIndex(index Index) error {
 			// The key of the document this entry describes, as a document key,
 			// so that the check can tell "already there" from "this one".
 			own := append(c.documents(), one.key[one.prefix:]...)
-			if err := c.checkUnique([]entry{one}, own); err != nil {
+			if err := c.checkUnique(tree, []entry{one}, own); err != nil {
 				return err
 			}
 		}
-		if err := c.store.tree.Put(one.key, one.value); err != nil {
+		if err := tree.Put(one.key, one.value); err != nil {
 			return err
 		}
 	}
@@ -402,7 +508,16 @@ func (c *Collection) buildIndex(index Index) error {
 }
 
 func (c *Collection) dropIndex(index Index) error {
-	return c.store.deleteRange(c.entries(index))
+	trees, err := c.across()
+	if err != nil {
+		return err
+	}
+	for _, tree := range trees {
+		if err := deleteRange(tree, c.entries(index)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func encodings(fields []Field) []keys.Field {

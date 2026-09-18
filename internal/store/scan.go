@@ -61,55 +61,64 @@ func (c *Collection) Scan(name string, within Range, visit func(Found) bool) err
 		return err
 	}
 
-	return c.store.tree.Ascend(lower, func(key, value []byte) bool {
-		if !bytes.HasPrefix(key, prefix) {
-			return false
-		}
-		if upper != nil && bytes.Compare(key, upper) >= 0 {
-			return false
-		}
+	// Every partition, oldest first. An index is local to its partition, so
+	// this is the only way to see all of them — and the order is right because
+	// what an operation may declare on a partitioned collection is checked
+	// where it is declared. See ops.go.
+	trees, err := c.across()
+	if err != nil {
+		return err
+	}
 
-		rest := key[len(prefix):]
-		values, rest, err := keys.DecodeKey(rest, fields)
-		if err != nil {
-			return false
-		}
-		primary, rest, err := keys.Decode(rest, keys.Field{})
-		if err != nil || len(rest) != 0 {
-			return false
-		}
-
-		entry := Found{Values: values, Key: primary}
-		if len(value) > 0 {
-			entry.Include = map[string]any{}
-			if err := json.Unmarshal(value, &entry.Include); err != nil {
+	for _, tree := range trees {
+		stop := false
+		err := tree.Ascend(lower, func(key, value []byte) bool {
+			if !bytes.HasPrefix(key, prefix) {
 				return false
 			}
+			if upper != nil && bytes.Compare(key, upper) >= 0 {
+				return false
+			}
+
+			rest := key[len(prefix):]
+			values, rest, err := keys.DecodeKey(rest, fields)
+			if err != nil {
+				return false
+			}
+			primary, rest, err := keys.Decode(rest, keys.Field{})
+			if err != nil || len(rest) != 0 {
+				return false
+			}
+
+			entry := Found{Values: values, Key: primary}
+			if len(value) > 0 {
+				entry.Include = map[string]any{}
+				if err := json.Unmarshal(value, &entry.Include); err != nil {
+					return false
+				}
+			}
+			if !visit(entry) {
+				// The caller has had enough, and it has had enough of the
+				// whole scan rather than of this partition.
+				stop = true
+				return false
+			}
+			return true
+		})
+		if err != nil {
+			return err
 		}
-		return visit(entry)
-	})
+		if stop {
+			return nil
+		}
+	}
+	return nil
 }
 
 // Walk hands back every document in primary-key order, which is the order they
 // are stored in.
 func (c *Collection) Walk(visit func(key any, document map[string]any) bool) error {
-	prefix := c.documents()
-
-	return c.store.tree.Ascend(prefix, func(key, value []byte) bool {
-		if !bytes.HasPrefix(key, prefix) {
-			return false
-		}
-		primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
-		if err != nil || len(rest) != 0 {
-			return false
-		}
-
-		document := map[string]any{}
-		if err := json.Unmarshal(value, &document); err != nil {
-			return false
-		}
-		return visit(primary, document)
-	})
+	return c.walkRange(Range{}, visit)
 }
 
 // walkRange is Walk over a stretch of the primary key rather than all of it.
@@ -128,24 +137,43 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 		return err
 	}
 
-	return c.store.tree.Ascend(lower, func(key, value []byte) bool {
-		if !bytes.HasPrefix(key, prefix) {
-			return false
-		}
-		if upper != nil && bytes.Compare(key, upper) >= 0 {
-			return false
-		}
+	trees, err := c.across()
+	if err != nil {
+		return err
+	}
 
-		primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
-		if err != nil || len(rest) != 0 {
-			return false
+	for _, tree := range trees {
+		stop := false
+		err := tree.Ascend(lower, func(key, value []byte) bool {
+			if !bytes.HasPrefix(key, prefix) {
+				return false
+			}
+			if upper != nil && bytes.Compare(key, upper) >= 0 {
+				return false
+			}
+
+			primary, rest, err := keys.Decode(key[len(prefix):], keys.Field{})
+			if err != nil || len(rest) != 0 {
+				return false
+			}
+			document := map[string]any{}
+			if err := json.Unmarshal(value, &document); err != nil {
+				return false
+			}
+			if !visit(primary, document) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if err != nil {
+			return err
 		}
-		document := map[string]any{}
-		if err := json.Unmarshal(value, &document); err != nil {
-			return false
+		if stop {
+			return nil
 		}
-		return visit(primary, document)
-	})
+	}
+	return nil
 }
 
 // bound turns one end of a range into the byte position to start or stop at.

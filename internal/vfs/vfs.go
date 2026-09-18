@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // File is what a storage engine needs from a file, and nothing more.
@@ -113,4 +114,75 @@ func (f *osFile) Size() (int64, error) {
 		return 0, err
 	}
 	return info.Size(), nil
+}
+
+// Folder is a directory of files, which is what a partitioned database is.
+//
+// One directory per database rather than one shared by all of them, so that
+// "what files does this database have" is a question the directory answers by
+// itself. A shared directory would make it a question about naming, and a
+// wrong answer there deletes somebody else's data.
+type Folder struct {
+	path string
+	perm os.FileMode
+}
+
+// At is a folder, made if it is not there yet.
+func At(path string, perm os.FileMode) (*Folder, error) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return nil, err
+	}
+	return &Folder{path: path, perm: perm}, nil
+}
+
+// Open is one file in the folder, made if it is not there.
+func (f *Folder) Open(name string) (File, error) {
+	if err := safeName(name); err != nil {
+		return nil, err
+	}
+	return OpenFile(filepath.Join(f.path, name), f.perm)
+}
+
+// Remove unlinks one file.
+func (f *Folder) Remove(name string) error {
+	if err := safeName(name); err != nil {
+		return err
+	}
+	err := os.Remove(filepath.Join(f.path, name))
+	if errors.Is(err, os.ErrNotExist) {
+		// Already gone is the outcome that was wanted. A crash between a file
+		// being unlinked and the database noticing must not turn into an error
+		// every time afterwards.
+		return nil
+	}
+	return err
+}
+
+// Names is every file in the folder.
+func (f *Folder) Names() ([]string, error) {
+	entries, err := os.ReadDir(f.path)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
+}
+
+// ErrName is a file name that is not one.
+var ErrName = errors.New("rsql/vfs: a file name may not be a path")
+
+// safeName refuses anything that could leave the folder. The names come from
+// inside this program and are checked before they are used anywhere else, so
+// this is the second lock on a door that is already locked — which is the
+// right number of locks on the door that leads to os.Remove.
+func safeName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("%w: %q", ErrName, name)
+	}
+	return nil
 }

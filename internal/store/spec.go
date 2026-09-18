@@ -57,6 +57,10 @@ type Spec struct {
 	Key     Key     `json:"key"`
 	Indexes []Index `json:"indexes"`
 
+	// Partition divides this collection into files, decided by the key. Nil
+	// is one file, which is what most collections want. See partition.go.
+	Partition *Partition `json:"partition,omitempty"`
+
 	// ID and the counters are assigned by the store. They are in the stored
 	// descriptor so that adding an index never renumbers the ones already
 	// there — an index id is written into every one of its keys.
@@ -128,6 +132,12 @@ func (s *Spec) validate() error {
 	case TypeString, TypeNumber:
 	default:
 		return fmt.Errorf("%w: a primary key is a string or a number, not %q", ErrDeclaration, s.Key.Type)
+	}
+
+	if s.Partition != nil {
+		if err := s.Partition.check(s.Key); err != nil {
+			return err
+		}
 	}
 	switch s.Key.Auto {
 	case "":
