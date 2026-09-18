@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sapedb/sapedb/internal/pager"
 	"github.com/sapedb/sapedb/internal/protocol"
@@ -925,5 +928,335 @@ func copyTree(t *testing.T, from, to string) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --- 0048: a rejected connection used to leave sapedbd saying nothing ---
+
+// notices collects what a server said through Options.Notice. Serve calls it
+// from a goroutine per connection, and the tests below read it from the main
+// goroutine, so it needs its own lock — the same reason sender exists for the
+// wire on the other side of this same race.
+type notices struct {
+	mutex sync.Mutex
+	lines []string
+}
+
+func (n *notices) record(line string) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	n.lines = append(n.lines, line)
+}
+
+func (n *notices) all() []string {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	return append([]string{}, n.lines...)
+}
+
+// runningNoticed is running with Options.Notice wired to a notices collector
+// instead of nowhere, so a test can see what sapedbd would have printed —
+// and with the "acme/main" fixture database already declared, the way every
+// caller in this file wants it.
+//
+// The declare happens before Notice is wired up, on purpose: a database's
+// very first open is itself "not closed cleanly" by sayHowItWasLeft's own
+// test (Clean starts false in CreateWith and only turns true on a proper
+// Close), so declaring after Notice is live would put one unrelated line in
+// front of whatever a test is actually checking. Once declared, the
+// database stays cached in Server.open, so nothing reopens the file for the
+// rest of a test and the notice does not recur.
+func runningNoticed(t *testing.T) (*Server, string, *notices) {
+	t.Helper()
+
+	server, err := New(Options{Dir: t.TempDir(), Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	declare(t, server, "acme", "main")
+
+	said := &notices{}
+	server.Say(said.record)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = server.Serve(listener) }()
+
+	return server, listener.Addr().String(), said
+}
+
+// waitClosed blocks until the far end (the server) closes its side of conn.
+//
+// Serve's per-connection goroutine calls Notice, if it is going to at all,
+// strictly before its deferred conn.Close() runs — same goroutine, no
+// scheduling between the two. So a caller that first observes the close and
+// only then reads what was said is not racing the goroutine that says it;
+// it is reading after a happens-before edge, not guessing at a delay.
+func waitClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("the server did not close the connection")
+	}
+}
+
+// TestARejectedSignatureLeavesExactlyOneNoticeLine is case 1 of task 0048's
+// test table: a bound connection with a signature that does not verify must
+// print one line naming why, where nothing was printed before, and the
+// client must still get its Failure frame over the wire as it always has.
+func TestARejectedSignatureLeavesExactlyOneNoticeLine(t *testing.T) {
+	_, address, said := runningNoticed(t)
+
+	client := dial(t, address)
+	client.send(protocol.Hello, hello{
+		Account: "acme", Password: password, DBName: "main",
+		Signature: strings.Repeat("ab", 32),
+	})
+
+	frame := client.read()
+	if frame.Type != protocol.Failure {
+		t.Fatalf("it was let in with a %s", frame.Type)
+	}
+	// codeFor's own list checks signing.ErrBadSignature before ErrHandshake,
+	// but handshake() wraps a bad signature as "%w: %v" with ErrHandshake in
+	// the %w slot — so the chain errors.Is walks only ever reaches
+	// ErrHandshake, and the code a client actually receives here is
+	// "handshake", not "signature". Task 0048 mục 6 named "signature"; mục 2
+	// of the same task already hedges with "signature hoặc handshake", and
+	// codeFor/handshake() are explicitly out of scope for this task, so this
+	// test asserts what the code actually does rather than what one line of
+	// the task guessed it did.
+	if !strings.Contains(string(frame.Payload), `"code":"handshake"`) {
+		t.Errorf("the failure's code is not what a client would switch on: %s", frame.Payload)
+	}
+
+	waitClosed(t, client.conn)
+
+	lines := said.all()
+	if len(lines) != 1 {
+		t.Fatalf("a rejected handshake said %v, want exactly one line", lines)
+	}
+	if !strings.Contains(lines[0], "signature does not verify") {
+		t.Errorf("the line does not name the real reason: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], client.conn.LocalAddr().String()) {
+		t.Errorf("the line does not name which connection: %q", lines[0])
+	}
+}
+
+// TestARejectedHandshakeNoticeNeverCarriesTheSignatureOrPassword is case 6:
+// a negative assertion against the exact line case-1's scenario produces,
+// because a Notice that echoed the hello payload would be a second place a
+// secret can leak, right next to the one this task's own design decision
+// (mục 3, quyết định A.1) says must never happen.
+func TestARejectedHandshakeNoticeNeverCarriesTheSignatureOrPassword(t *testing.T) {
+	_, address, said := runningNoticed(t)
+
+	madeUpSignature := strings.Repeat("f00dcafe", 8)
+	client := dial(t, address)
+	client.send(protocol.Hello, hello{
+		Account: "acme", Password: password, DBName: "main", Signature: madeUpSignature,
+	})
+	if frame := client.read(); frame.Type != protocol.Failure {
+		t.Fatalf("it was let in with a %s", frame.Type)
+	}
+	waitClosed(t, client.conn)
+
+	lines := said.all()
+	if len(lines) != 1 {
+		t.Fatalf("said %v, want exactly one line", lines)
+	}
+	if strings.Contains(lines[0], madeUpSignature) {
+		t.Errorf("the notice line echoes the signature it was sent: %q", lines[0])
+	}
+	if strings.Contains(lines[0], password) {
+		t.Errorf("the notice line echoes the password it was sent: %q", lines[0])
+	}
+}
+
+// TestABoundHandshakeDatabaseFailureNamesTheRealReasonNotAGenericClose is
+// case 2: a signature that verifies, for a database file that will not
+// open, must print the real reason — never the phrase a client-side
+// Unavailable error uses, because sapedbd is not the client and does not
+// get to be that vague about a file it can see on its own disk.
+func TestABoundHandshakeDatabaseFailureNamesTheRealReasonNotAGenericClose(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "acme"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A file at exactly the path a real database would use, but not one: no
+	// server ever wrote these bytes. Two full pages, so both meta-page reads
+	// succeed and fail on the magic check rather than on a short read — a
+	// short file gives ErrNoMeta ("EOF / EOF"), which is a different, and
+	// less telling, real reason than the one this test wants to see named.
+	garbage := filepath.Join(dir, "acme", "main.sapedb")
+	if err := os.WriteFile(garbage, bytes.Repeat([]byte{0xAB}, 2*pager.PageBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	said := &notices{}
+	server, err := New(Options{Dir: dir, Secret: secret, Notice: said.record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = server.Serve(listener) }()
+
+	signature, err := server.Sign("acme", password, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dial(t, listener.Addr().String())
+	client.send(protocol.Hello, hello{Account: "acme", Password: password, DBName: "main", Signature: signature})
+	if frame := client.read(); frame.Type != protocol.Failure {
+		t.Fatalf("a garbage file was accepted as a database: %s", frame.Type)
+	}
+	waitClosed(t, client.conn)
+
+	lines := said.all()
+	if len(lines) != 1 {
+		t.Fatalf("said %v, want exactly one line", lines)
+	}
+	if strings.Contains(lines[0], "closed the connection") {
+		t.Errorf("the operator's own line repeats the client's vague wording: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "not a sapedb file") {
+		t.Errorf("the line does not name the real reason a file this broken failed: %q", lines[0])
+	}
+}
+
+// TestACleanGoodbyeSaysNothing and TestAClientClosingTheSocketSaysNothing are
+// the other half of the same table (cases 3 and 4): a connection that ends
+// the way everyone expected it to must produce no line at all, or a caller
+// who does nothing wrong yet gets logged every time drowns out the caller
+// who did.
+func TestACleanGoodbyeSaysNothing(t *testing.T) {
+	server, address, said := runningNoticed(t)
+
+	client := dial(t, address)
+	client.open(server, "acme", "main")
+	client.send(protocol.Goodbye, nil)
+
+	waitClosed(t, client.conn)
+	if lines := said.all(); len(lines) != 0 {
+		t.Errorf("a clean Goodbye said %v", lines)
+	}
+}
+
+func TestAClientClosingTheSocketSaysNothing(t *testing.T) {
+	server, address, said := runningNoticed(t)
+
+	client := dial(t, address)
+	client.open(server, "acme", "main")
+
+	// Closing only the write half leaves the read half open, so this test can
+	// still see the server close its side afterwards rather than guessing at
+	// a delay. The server sees end-of-stream exactly as it would from a
+	// client that hung up entirely; io.EOF, not an error.
+	tcp, ok := client.conn.(*net.TCPConn)
+	if !ok {
+		t.Fatal("dial did not return a TCP connection")
+	}
+	if err := tcp.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitClosed(t, client.conn)
+	if lines := said.all(); len(lines) != 0 {
+		t.Errorf("a client hanging up said %v", lines)
+	}
+}
+
+// TestAFrameBeforeHelloGetsOneLineNamingTheFrame is case 5: whatever a
+// client sends first, if it is not a Hello, is a handshake failure too, and
+// gets the same one line, naming which frame it actually was.
+func TestAFrameBeforeHelloGetsOneLineNamingTheFrame(t *testing.T) {
+	_, address, said := runningNoticed(t)
+
+	client := dial(t, address)
+	client.send(protocol.Invoke, call{Command: "articles.add"})
+
+	frame := client.read()
+	if frame.Type != protocol.Failure {
+		t.Fatalf("it was answered with a %s", frame.Type)
+	}
+	waitClosed(t, client.conn)
+
+	lines := said.all()
+	if len(lines) != 1 {
+		t.Fatalf("said %v, want exactly one line", lines)
+	}
+	if !strings.Contains(lines[0], "invoke frame") {
+		t.Errorf("the line does not say which frame it was: %q", lines[0])
+	}
+}
+
+// TestAFailureAfterAGoodHandshakeAlsoGetsOneLine is case 7, ngoài mục 6's
+// table: 0048's own equivalence axis is handshake-time failure versus
+// serving-time failure, and a Notice that only fires for errors.Is(err,
+// ErrHandshake) — mutation G5 — would pass every one of cases 1, 2 and 5
+// above, because all three really are ErrHandshake. This is the test that
+// needs a failure Handle returns from *after* a successful handshake, which
+// is not wrapped in ErrHandshake at all: a frame with a version this build
+// does not read.
+//
+// Run for both modes, because this is also the mode-equivalence check the
+// task's own measuring rules ask for: nothing about where Notice is called
+// (Serve, not Handle or handshake) treats bound and account differently, so
+// neither should the result.
+func TestAFailureAfterAGoodHandshakeAlsoGetsOneLine(t *testing.T) {
+	for _, mode := range []string{ModeBound, ModeAccount} {
+		t.Run(mode, func(t *testing.T) {
+			server, address, said := runningNoticed(t)
+
+			client := dial(t, address)
+			opening := hello{Account: "acme", Password: password, Mode: mode}
+			if mode == ModeBound {
+				signature, err := server.Sign("acme", password, "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				opening.DBName, opening.Signature = "main", signature
+			}
+			client.send(protocol.Hello, opening)
+			if frame := client.read(); frame.Type != protocol.Welcome {
+				t.Fatalf("the handshake did not open: %s %s", frame.Type, frame.Payload)
+			}
+
+			// A frame this reader was not told to accept. Encode writes the
+			// version this side speaks by default, so it has to be poked in
+			// by hand to be wrong.
+			bad, err := protocol.Encode(protocol.Frame{Type: protocol.Ping, ID: 99})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bad[0] = 200
+			if _, err := client.conn.Write(bad); err != nil {
+				t.Fatal(err)
+			}
+
+			waitClosed(t, client.conn)
+
+			lines := said.all()
+			if len(lines) != 1 {
+				t.Fatalf("a post-handshake protocol error said %v, want exactly one line", lines)
+			}
+			if strings.Contains(lines[0], "did not open properly") {
+				t.Errorf("a serving-time failure was blamed on the handshake: %q", lines[0])
+			}
+			if !strings.Contains(lines[0], "version") {
+				t.Errorf("the line does not name the real reason: %q", lines[0])
+			}
+		})
 	}
 }

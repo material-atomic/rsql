@@ -142,9 +142,55 @@ func (s *Server) Serve(listener net.Listener) error {
 		}
 		go func() {
 			defer conn.Close()
-			_ = s.Handle(conn)
+			// Handle already told the client why, over the wire, when it can —
+			// a Failure frame for a handshake that failed. But the client was
+			// the one asking; the operator running sapedbd was not in that
+			// conversation and, until this, had no way to be. A dropped error
+			// here (the underscore this replaced) meant a signature rejected,
+			// a database file that would not open, or a client that spoke out
+			// of turn all looked identical from the outside: the socket just
+			// closed, and sapedbd never said a word.
+			if err := s.Handle(conn); err != nil {
+				s.notice(conn, err)
+			}
 		}()
 	}
+}
+
+// notice reports a connection that ended in error, one line per connection.
+//
+// Handle returns nil for a Goodbye and for a clean EOF, so this never fires
+// for a connection that ended the way everyone expected — only for one that
+// did not, which is the only case an operator needs to see. It also fires
+// for every kind of failure Handle can return, not only a handshake one:
+// a client that goes silent mid-stream, or sends a frame this build cannot
+// read, is exactly as invisible today as a rejected handshake was, and the
+// fix for one is the fix for both.
+//
+// What gets printed is conn.RemoteAddr() and err.Error(), nothing else.
+// err.Error() is not a fixed vocabulary: handshake() wraps its inner error
+// with %v, and some of those errors do quote a value the caller sent —
+// "no mode called %q" prints the mode verbatim, and usableComponent prints
+// one rune of an account or database name plus its length. What none of
+// them touch is the password or the signature: verify() answers with the
+// constant signing.ErrBadSignature and nothing else ever reads those two
+// fields into an error. That is the property this relies on, and it is a
+// property of which fields today's errors reach for — not a rule the
+// structure enforces — so anyone adding a field to hello (a token, a
+// session key) has to check it again rather than assume this axis is
+// closed for free. Quoting is %q throughout, so a newline in a caller's
+// value cannot forge a second line in the log.
+//
+// No throttle: a caller that keeps knocking with the same bad credentials
+// produces one line per attempt. A handshake that fails has already spent an
+// accepted connection, and until now this was the only place any connection
+// failure — handshake or not — was visible to the person running the
+// server. Adding a rate limit is future work, not this task's.
+func (s *Server) notice(conn net.Conn, err error) {
+	if s.options.Notice == nil {
+		return
+	}
+	s.options.Notice(fmt.Sprintf("a connection from %s ended: %v", conn.RemoteAddr(), err))
 }
 
 // Close shuts every open database. Connections in flight finish on their own.
