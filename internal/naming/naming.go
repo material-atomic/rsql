@@ -149,22 +149,27 @@ var Exceptions = []Exception{
 	{
 		// The Marker is the whole line, value included, not just the
 		// declaration keyword — on purpose. A prefix-only marker like
-		// "const dbKeyLabel = " excuses whatever value sits after it, so it
-		// would keep waving this line through even if the two copies below
-		// drifted apart (one bumped to a "v2" while the other stayed "v1").
-		// That drift is exactly the failure this pair of constants exists to
-		// prevent — see server.go's own copy and its comment — and a marker
-		// that only matches the keyword can't see it happen. Built by
-		// concatenation, not typed whole, for the same reason target is: this
-		// file's own source must not spell the old name out contiguously.
-		File:   "internal/cli/cli.go",
-		Marker: "const dbKeyLabel = \"" + target + "/server:database:v1\"",
-		Why:    "a key-derivation label baked into every encrypted database; must match internal/server's copy, value included — a prefix-only marker would excuse the two drifting apart",
-	},
-	{
-		File:   "internal/server/server.go",
-		Marker: "const dbKeyLabel = \"" + target + "/server:database:v1\"",
-		Why:    "the server's copy of the same label as internal/cli's dbKeyLabel; the task's own exception table named only the CLI's copy, and dropping this one would make the two derive different keys. Marker pins the value too, not just the keyword, so the two copies drifting apart (one edited, one not) shows up as an unexcused hit on whichever line changed, instead of both staying silently waved through",
+		// "const Label = " would excuse whatever value sits after it, and
+		// this is the one label internal/cli and internal/server both derive
+		// their database key from — see internal/dbkey's own comment. Built
+		// by concatenation, not typed whole, for the same reason target is:
+		// this file's own source must not spell the old name out
+		// contiguously.
+		//
+		// There used to be two rows here, one for internal/cli/cli.go and one
+		// for internal/server/server.go, because each package carried its own
+		// copy of this label and its own hkdf.Key call. Task 0047 collapsed
+		// both onto internal/dbkey.Key, so there is now exactly one line in
+		// the whole tree that can carry this value, and exactly one row here
+		// to excuse it. A single source can still be edited to a "v2" by
+		// mistake — naming_test.go's
+		// TestAllowedRequiresTheDbKeyLabelValueToMatchNotJustTheKeyword pins
+		// that a marker this specific still refuses it — but it can no longer
+		// drift from a sibling copy, because
+		// there is no longer a sibling copy to drift from.
+		File:   "internal/dbkey/dbkey.go",
+		Marker: "const Label = \"" + target + "/server:database:v1\"",
+		Why:    "the single key-derivation label internal/cli and internal/server both call dbkey.Key with; changing its value silently rotates the key of every encrypted database that already exists",
 	},
 }
 

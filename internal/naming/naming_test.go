@@ -206,18 +206,19 @@ func TestAllowedIsScopedToTheExactLineNotTheWholeFile(t *testing.T) {
 // (TestAllowedIsScopedToTheExactLineNotTheWholeFile) covers "same file,
 // different content"; the old version of this one — a bare comment built
 // from target alone, matching no Marker anywhere — only ever covered
-// "different file, non-matching content". The cell neither one reached was "different
-// file, matching content", and that is exactly the cell QA found a second
-// copy of dbKeyLabel waved through in round 1: the fixture below is now the
-// real dbKeyLabel line, verbatim, sitting in a file that is not on the
-// table at all. Dropping the `hit.File == exception.File` check from
-// Allowed is invisible to every other test in this file — Text-only
-// matching already agrees with them — and is only caught here.
+// "different file, non-matching content". The cell neither one reached was
+// "different file, matching content", and that is exactly the cell QA found
+// a second copy of the key-derivation label waved through in round 1: the
+// fixture below is now the real dbkey.Label line, verbatim, sitting in a
+// file that is not on the table at all. Dropping the
+// `hit.File == exception.File` check from Allowed is invisible to every
+// other test in this file — Text-only matching already agrees with them —
+// and is only caught here.
 func TestAllowedRefusesAFileNotOnTheTable(t *testing.T) {
 	hit := Hit{
 		File: "internal/store/ops.go",
 		Line: 1,
-		Text: "const dbKeyLabel = \"" + target + "/server:database:v1\"",
+		Text: "const Label = \"" + target + "/server:database:v1\"",
 	}
 	if Allowed(hit) {
 		t.Error("Allowed excused a file that is not in the exception table at all, even though its content matches a real exception's Marker verbatim")
@@ -225,52 +226,35 @@ func TestAllowedRefusesAFileNotOnTheTable(t *testing.T) {
 }
 
 // TestAllowedRequiresTheDbKeyLabelValueToMatchNotJustTheKeyword pins the gap
-// QA measured directly: cli.go and server.go each carry their own copy of
-// dbKeyLabel, and nothing before this test ties the two to each other.
-// Earlier this table's Marker for both rows was just "const dbKeyLabel = " —
-// the keyword, not the value — which would keep waving a line through even
-// after its value drifted away from the sibling copy. That is observable
-// from outside the patrol entirely: change server.go's value to end in
-// "database:v2" while cli.go stays "v1" and every database the CLI writes
-// becomes unreadable through the server — "wrong secret" for a secret that
-// is right. Allowed must keep excusing the one exact line each file's row
-// names, and must stop excusing either copy the moment its value disagrees
-// with the other.
+// QA measured directly, and task 0047 changed what closing it means. Before
+// 0047, internal/cli and internal/server each carried their own copy of this
+// label, and the risk was the two copies drifting apart from each other —
+// hence a Marker that pins the value, not just the keyword, on each of two
+// rows. 0047 collapsed both callers onto internal/dbkey.Key, so there is now
+// exactly one place in the tree this label's value can live. The risk this
+// test now pins is narrower but not gone: a prefix-only marker
+// ("const Label = ", value not included) would keep waving that one line
+// through even after somebody edited its value to a "v2" — silently rotating
+// the key of every encrypted database that already exists, the same failure
+// the pre-0047 two-copy version of this test was written against, just with
+// one copy left to make it happen to instead of two.
 func TestAllowedRequiresTheDbKeyLabelValueToMatchNotJustTheKeyword(t *testing.T) {
-	matchingServer := Hit{
-		File: "internal/server/server.go",
-		Line: 51,
-		Text: "const dbKeyLabel = \"" + target + "/server:database:v1\"",
+	matching := Hit{
+		File: "internal/dbkey/dbkey.go",
+		Line: 27,
+		Text: "const Label = \"" + target + "/server:database:v1\"",
 	}
-	if !Allowed(matchingServer) {
-		t.Fatal("Allowed refused the exact line internal/server/server.go's row names")
-	}
-
-	matchingCLI := Hit{
-		File: "internal/cli/cli.go",
-		Line: 45,
-		Text: "const dbKeyLabel = \"" + target + "/server:database:v1\"",
-	}
-	if !Allowed(matchingCLI) {
-		t.Fatal("Allowed refused the exact line internal/cli/cli.go's row names")
+	if !Allowed(matching) {
+		t.Fatal("Allowed refused the exact line internal/dbkey/dbkey.go's row names")
 	}
 
-	driftedServer := Hit{
-		File: "internal/server/server.go",
-		Line: 51,
-		Text: "const dbKeyLabel = \"" + target + "/server:database:v2\"",
+	drifted := Hit{
+		File: "internal/dbkey/dbkey.go",
+		Line: 27,
+		Text: "const Label = \"" + target + "/server:database:v2\"",
 	}
-	if Allowed(driftedServer) {
-		t.Error("Allowed excused server.go's dbKeyLabel after its value drifted from cli.go's copy — a prefix-only marker would miss exactly this")
-	}
-
-	driftedCLI := Hit{
-		File: "internal/cli/cli.go",
-		Line: 45,
-		Text: "const dbKeyLabel = \"" + target + "/server:database:v2\"",
-	}
-	if Allowed(driftedCLI) {
-		t.Error("Allowed excused cli.go's dbKeyLabel after its value drifted from server.go's copy — a prefix-only marker would miss exactly this")
+	if Allowed(drifted) {
+		t.Error("Allowed excused dbkey.Label after its value changed to v2 — a prefix-only marker would miss exactly this, and it is the only copy left, so nothing else in the tree would catch the rotation either")
 	}
 }
 

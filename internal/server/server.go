@@ -14,9 +14,7 @@
 package server
 
 import (
-	"crypto/hkdf"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,26 +27,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sapedb/sapedb/internal/dbkey"
 	"github.com/sapedb/sapedb/internal/pager"
 	"github.com/sapedb/sapedb/internal/protocol"
 	"github.com/sapedb/sapedb/internal/signing"
 	"github.com/sapedb/sapedb/internal/store"
 	"github.com/sapedb/sapedb/internal/vfs"
 )
-
-// dbKeyLabel separates the key a database file is encrypted with from every
-// other use of the same secret.
-//
-// It still carries the product's old name on purpose, not by oversight: it
-// is baked into every encrypted database file that already exists, and
-// changing it — here without changing internal/cli's copy the same way, in
-// the same commit — is a silent, unannounced key rotation: the key this
-// server derives would stop matching the key the file was written under,
-// which reads as "wrong secret" for a secret that is right. It only ever
-// moves together with a migration that re-derives and re-encrypts every
-// affected database under the new label, and with internal/cli's copy
-// changing in that same commit. This is not that commit.
-const dbKeyLabel = "rsql/server:database:v1"
 
 var (
 	ErrHandshake  = errors.New("sapedb/server: the connection did not open properly")
@@ -582,7 +567,7 @@ func (s *Server) openFile(path, account, name string) (*database, error) {
 
 	options := pager.Options{}
 	if s.options.Encrypt {
-		key, err := hkdf.Key(sha256.New, []byte(s.options.Secret), []byte(account+"/"+name), dbKeyLabel, pager.KeyBytes)
+		key, err := dbkey.Key(s.options.Secret, account, name)
 		if err != nil {
 			file.Close()
 			return nil, err

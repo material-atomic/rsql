@@ -13,9 +13,7 @@
 package cli
 
 import (
-	"crypto/hkdf"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,25 +22,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/sapedb/sapedb/internal/dbkey"
 	"github.com/sapedb/sapedb/internal/pager"
 	"github.com/sapedb/sapedb/internal/signing"
 	"github.com/sapedb/sapedb/internal/store"
 	"github.com/sapedb/sapedb/internal/vfs"
 )
-
-// dbKeyLabel must match what the server derives with, or a database written by
-// one is unreadable by the other.
-//
-// It still carries the product's old name on purpose, not by oversight: it
-// is baked into every encrypted database file that already exists, and
-// changing it — here without changing internal/server's copy the same way,
-// in the same commit — is a silent, unannounced key rotation: the key this
-// tool derives would stop matching the key the file was written under,
-// which reads as "wrong secret" for a secret that is right. It only ever
-// moves together with a migration that re-derives and re-encrypts every
-// affected database under the new label, and with internal/server's copy
-// changing in that same commit. This is not that commit.
-const dbKeyLabel = "rsql/server:database:v1"
 
 // passwordBytes is how long a generated password is. Well inside the 16..128
 // the format allows, and long enough that guessing is not a strategy.
@@ -347,7 +332,7 @@ func open(opts options) (*store.Store, func(), error) {
 
 	settings := pager.Options{}
 	if opts.encrypt {
-		key, err := hkdf.Key(sha256.New, []byte(opts.secret), []byte(opts.account+"/"+opts.db), dbKeyLabel, pager.KeyBytes)
+		key, err := dbkey.Key(opts.secret, opts.account, opts.db)
 		if err != nil {
 			file.Close()
 			held.Close()
