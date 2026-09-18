@@ -78,6 +78,38 @@ type database struct {
 	pages *pager.Pager
 	store *store.Store
 	file  vfs.File
+
+	// changed is closed and replaced every time something is committed. A
+	// subscriber waits on it instead of asking again and again: a feed that
+	// polls is a feed that is either late or wasteful, and usually both.
+	watch   sync.Mutex
+	changed chan struct{}
+}
+
+// notify wakes everything waiting for a change.
+func (d *database) notify() {
+	d.watch.Lock()
+	defer d.watch.Unlock()
+
+	if d.changed != nil {
+		close(d.changed)
+	}
+	d.changed = make(chan struct{})
+}
+
+// waiting is a channel that closes when the next change is committed.
+//
+// Taken BEFORE reading the log, or a change committed between the read and the
+// wait is one nothing ever wakes for — a subscriber that stops at exactly the
+// wrong moment and looks healthy.
+func (d *database) waiting() <-chan struct{} {
+	d.watch.Lock()
+	defer d.watch.Unlock()
+
+	if d.changed == nil {
+		d.changed = make(chan struct{})
+	}
+	return d.changed
 }
 
 // New checks the options and returns a server that has opened nothing yet.
@@ -142,11 +174,21 @@ func (s *Server) Close() error {
 func (s *Server) Handle(conn io.ReadWriter) error {
 	reader := protocol.NewReader(conn).Accept(protocol.Version)
 
-	live, err := s.handshake(reader, conn)
+	// Subscriptions write from goroutines of their own, so every write goes
+	// through one place. Two writers on one socket make bytes that are each
+	// correct and together are not a frame.
+	out := &sender{conn: conn}
+
+	// Closed when this connection ends, which is how a subscription learns to
+	// stop rather than streaming into a socket nobody is reading.
+	done := make(chan struct{})
+	defer close(done)
+
+	live, err := s.handshake(reader, out)
 	if err != nil {
 		// The client is told why, then the connection ends: a handshake that
 		// failed must not leave a socket that looks usable.
-		_ = write(conn, protocol.Frame{Type: protocol.Failure, ID: 0}, failure(err))
+		_ = out.send(protocol.Frame{Type: protocol.Failure, ID: 0}, failure(err))
 		return err
 	}
 
@@ -161,7 +203,7 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 
 		switch frame.Type {
 		case protocol.Ping:
-			if err := write(conn, protocol.Frame{Type: protocol.Pong, ID: frame.ID}, nil); err != nil {
+			if err := out.send(protocol.Frame{Type: protocol.Pong, ID: frame.ID}, nil); err != nil {
 				return err
 			}
 
@@ -171,13 +213,20 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 		case protocol.Invoke:
 			result, err := s.invoke(live, frame.Payload)
 			if err != nil {
-				if err := write(conn, protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
+				if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := write(conn, protocol.Frame{Type: protocol.Result, ID: frame.ID}, result); err != nil {
+			if err := out.send(protocol.Frame{Type: protocol.Result, ID: frame.ID}, result); err != nil {
 				return err
+			}
+
+		case protocol.Subscribe:
+			if err := s.follow(live, out, frame.ID, frame.Payload, done); err != nil {
+				if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, failure(err)); err != nil {
+					return err
+				}
 			}
 
 		default:
@@ -185,7 +234,7 @@ func (s *Server) Handle(conn io.ReadWriter) error {
 			// than ignored: a client waiting for an answer that never comes is
 			// worse off than one that is told no.
 			body := failure(fmt.Errorf("rsql/server: nothing here serves a %s frame", frame.Type))
-			if err := write(conn, protocol.Frame{Type: protocol.Failure, ID: frame.ID}, body); err != nil {
+			if err := out.send(protocol.Frame{Type: protocol.Failure, ID: frame.ID}, body); err != nil {
 				return err
 			}
 		}
@@ -238,7 +287,7 @@ const (
 	ModeAccount = "account"
 )
 
-func (s *Server) handshake(reader *protocol.Reader, conn io.Writer) (*session, error) {
+func (s *Server) handshake(reader *protocol.Reader, out *sender) (*session, error) {
 	frame, err := reader.Read()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrHandshake, err)
@@ -290,7 +339,7 @@ func (s *Server) handshake(reader *protocol.Reader, conn io.Writer) (*session, e
 	if err != nil {
 		return nil, err
 	}
-	if err := write(conn, protocol.Frame{Type: protocol.Welcome, ID: frame.ID}, body); err != nil {
+	if err := out.send(protocol.Frame{Type: protocol.Welcome, ID: frame.ID}, body); err != nil {
 		return nil, err
 	}
 	return live, nil
@@ -353,6 +402,7 @@ func (s *Server) invoke(live *session, payload []byte) ([]byte, error) {
 		if err := db.store.Commit(); err != nil {
 			return nil, err
 		}
+		db.notify()
 	}
 	return json.Marshal(result)
 }
@@ -460,7 +510,7 @@ func (s *Server) openFile(path, account, name string) (*database, error) {
 		file.Close()
 		return nil, err
 	}
-	return &database{pages: pages, store: opened, file: file}, nil
+	return &database{pages: pages, store: opened, file: file, changed: make(chan struct{})}, nil
 }
 
 // Store hands back the store for an account and database, for a caller inside
@@ -549,6 +599,7 @@ func codeFor(err error) string {
 		{ErrHandshake, "handshake"},
 		{ErrName, "name"},
 		{ErrClosed, "closed"},
+		{ErrTooFarBehind, "too_far_behind"},
 		{store.ErrNoOperation, "no_operation"},
 		{store.ErrArgument, "argument"},
 		{store.ErrNotAllowed, "not_allowed"},

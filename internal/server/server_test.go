@@ -366,9 +366,9 @@ func TestAFrameThisVersionDoesNotServeIsAnsweredAnyway(t *testing.T) {
 	client := dial(t, address)
 	client.open(server, "acme", "main")
 
-	// Subscribe is in the protocol and not yet served here. A client waiting
-	// for an answer that never comes is worse off than one told no.
-	id := client.send(protocol.Subscribe, map[string]any{"from": 1})
+	// An Event is a frame the server sends, never one it takes. A client
+	// waiting for an answer that never comes is worse off than one told no.
+	id := client.send(protocol.Event, map[string]any{"lsn": 1})
 	frame := client.read()
 	if frame.Type != protocol.Failure || frame.ID != id {
 		t.Fatalf("got %s#%d, want a failure tagged %d", frame.Type, frame.ID, id)
