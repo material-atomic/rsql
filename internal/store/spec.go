@@ -45,6 +45,7 @@ var (
 	ErrIncompatible = errors.New("rsql/store: this does not match what was declared before")
 	ErrNoCollection = errors.New("rsql/store: no such collection")
 	ErrNoIndex      = errors.New("rsql/store: no such index")
+	ErrNoRollup     = errors.New("rsql/store: no such rollup")
 	ErrNoKey        = errors.New("rsql/store: the document has no primary key")
 	ErrType         = errors.New("rsql/store: the value is not the type the field was declared as")
 	ErrDuplicate    = errors.New("rsql/store: a unique index already holds this value")
@@ -61,11 +62,16 @@ type Spec struct {
 	// is one file, which is what most collections want. See partition.go.
 	Partition *Partition `json:"partition,omitempty"`
 
+	// Rollups are totals kept up to date by every write, in the same
+	// transaction as the write. See rollup.go.
+	Rollups []Rollup `json:"rollups,omitempty"`
+
 	// ID and the counters are assigned by the store. They are in the stored
 	// descriptor so that adding an index never renumbers the ones already
 	// there — an index id is written into every one of its keys.
-	ID          uint32 `json:"id"`
-	NextIndexID uint16 `json:"next_index_id"`
+	ID           uint32 `json:"id"`
+	NextIndexID  uint16 `json:"next_index_id"`
+	NextRollupID uint16 `json:"next_rollup_id"`
 }
 
 // Key is the primary key: where it lives in the document and what it is.
@@ -138,6 +144,17 @@ func (s *Spec) validate() error {
 		if err := s.Partition.check(s.Key); err != nil {
 			return err
 		}
+	}
+
+	named := map[string]bool{}
+	for i := range s.Rollups {
+		if err := s.Rollups[i].validate(); err != nil {
+			return err
+		}
+		if named[s.Rollups[i].Name] {
+			return fmt.Errorf("%w: two rollups of %q are called %q", ErrDeclaration, s.Name, s.Rollups[i].Name)
+		}
+		named[s.Rollups[i].Name] = true
 	}
 	switch s.Key.Auto {
 	case "":

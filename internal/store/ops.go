@@ -36,6 +36,7 @@ const (
 	ActionGet    = "get"    // one document by its primary key
 	ActionScan   = "scan"   // a stretch of one index
 	ActionCount  = "count"  // the same stretch, counted rather than returned
+	ActionTotals = "totals" // a declared rollup, read
 	ActionInsert = "insert" // a new document; refused if the key is taken
 	ActionPut    = "put"    // a document, replacing one under the same key
 	ActionUpdate = "update" // named fields of an existing document
@@ -66,6 +67,9 @@ type Operation struct {
 
 	// Key is which document, for the actions that work on exactly one.
 	Key *Term `json:"key,omitempty"`
+
+	// Rollup is which declared total to read, for an operation that reads one.
+	Rollup string `json:"rollup,omitempty"`
 
 	// Index, From and To are the access path of a scan: which index, and where
 	// along it to start and stop. Nothing else may narrow a scan, so nothing
@@ -397,6 +401,33 @@ func (s *Store) validateOperation(operation *Operation) error {
 			}
 		}
 
+	case ActionTotals:
+		rollup, found := collection.rollup(operation.Rollup)
+		if !found {
+			return fmt.Errorf("%w: %q of %q", ErrNoRollup, operation.Rollup, operation.Collection)
+		}
+		fields := rollup.Group
+		for _, endpoint := range []*Endpoint{operation.From, operation.To} {
+			if endpoint == nil {
+				continue
+			}
+			if len(endpoint.Terms) > len(fields) {
+				return fmt.Errorf("%w: %d bound values for a rollup grouped by %d fields",
+					ErrDeclaration, len(endpoint.Terms), len(fields))
+			}
+			for i, term := range endpoint.Terms {
+				if err := check(term, fields[i].Type, fmt.Sprintf("the bound on %q", fields[i].Path)); err != nil {
+					return err
+				}
+			}
+		}
+		if operation.Limit <= 0 {
+			return fmt.Errorf("%w: reading a rollup must declare how many rows it may return", ErrDeclaration)
+		}
+		if err := totalsAcross(collection, rollup, operation); err != nil {
+			return err
+		}
+
 	case ActionScan, ActionCount:
 		fields, err := scanFields(collection, operation.Index)
 		if err != nil {
@@ -623,6 +654,36 @@ func scanAcross(collection *Collection, operation *Operation) error {
 		if operation.From.Terms[i] != operation.To.Terms[i] {
 			return fmt.Errorf("%w: %s, so a scan on %q must fix %q rather than range over it",
 				ErrDeclaration, where, index.Name, index.Fields[i].Path)
+		}
+	}
+	return nil
+}
+
+// totalsAcross refuses a rollup read of a partitioned collection that would
+// have to add up groups it has not finished finding.
+//
+// A rollup row is a total, and a group's total is the sum of what each
+// partition holds for it. Adding them up while walking is fine when the read
+// names one group, because there is one number to arrive at. Over a range it
+// is not: the read would have to hold every group in the range until the last
+// partition had been walked, which is memory nobody declared, bounded by the
+// data rather than by the operation.
+func totalsAcross(collection *Collection, rollup *Rollup, operation *Operation) error {
+	if collection.spec.Partition == nil {
+		return nil
+	}
+
+	where := fmt.Sprintf("%q is divided %s", collection.spec.Name, describePartition(collection.spec.Partition))
+
+	if operation.From == nil || operation.To == nil ||
+		len(operation.From.Terms) != len(rollup.Group) || len(operation.To.Terms) != len(rollup.Group) {
+		return fmt.Errorf("%w: %s, so reading %q must name one group — every partition holds part of each total, and finding them all over a range is work nobody declared",
+			ErrDeclaration, where, rollup.Name)
+	}
+	for i := range rollup.Group {
+		if operation.From.Terms[i] != operation.To.Terms[i] {
+			return fmt.Errorf("%w: %s, so reading %q must fix %q rather than range over it",
+				ErrDeclaration, where, rollup.Name, rollup.Group[i].Path)
 		}
 	}
 	return nil

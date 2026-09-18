@@ -196,6 +196,19 @@ func (c *Collection) write(by Attribution, document map[string]any, record bool)
 	if err != nil {
 		return nil, fmt.Errorf("rsql/store: this document cannot be stored: %w", err)
 	}
+	// The totals move in the same transaction as the document. A counter kept
+	// anywhere else is a counter that stops matching the data the first time
+	// anything goes wrong between the two, which is the commonest data bug
+	// there is.
+	if replaced {
+		if err := c.contribute(tree, previous, -1); err != nil {
+			return nil, err
+		}
+	}
+	if err := c.contribute(tree, document, 1); err != nil {
+		return nil, err
+	}
+
 	if err := tree.Put(stored, encoded); err != nil {
 		return nil, err
 	}
@@ -267,6 +280,10 @@ func (c *Collection) remove(by Attribution, key any, record bool) (bool, error) 
 		if _, err := tree.Delete(entry.key); err != nil {
 			return false, err
 		}
+	}
+
+	if err := c.contribute(tree, document, -1); err != nil {
+		return false, err
 	}
 
 	// The document was read above, so this removes it: a key that was not there

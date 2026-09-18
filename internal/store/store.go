@@ -157,6 +157,10 @@ func (s *Store) Declare(spec Spec) (*Collection, error) {
 			spec.Indexes[i].ID = uint16(i)
 		}
 		spec.NextIndexID = uint16(len(spec.Indexes))
+		for i := range spec.Rollups {
+			spec.Rollups[i].ID = uint16(i)
+		}
+		spec.NextRollupID = uint16(len(spec.Rollups))
 
 		if err := s.install(spec); err != nil {
 			return nil, err
@@ -180,7 +184,55 @@ func (s *Store) Declare(spec Spec) (*Collection, error) {
 
 	updated := existing.spec
 	updated.Indexes = nil
+	updated.Rollups = nil
 	wanted := map[string]bool{}
+	kept := map[string]bool{}
+
+	// Rollups first, because adding one has to fill it from the documents that
+	// are already there, and dropping one has to take its rows with it.
+	for _, rollup := range spec.Rollups {
+		kept[rollup.Name] = true
+
+		if before, ok := existing.rollup(rollup.Name); ok {
+			if !sameRollup(*before, rollup) {
+				return nil, fmt.Errorf("%w: rollup %q of %q is already declared differently", ErrIncompatible, rollup.Name, spec.Name)
+			}
+			updated.Rollups = append(updated.Rollups, *before)
+			continue
+		}
+
+		rollup.ID = updated.NextRollupID
+		updated.NextRollupID++
+		if err := rollup.validate(); err != nil {
+			return nil, err
+		}
+
+		trees, err := existing.across()
+		if err != nil {
+			return nil, err
+		}
+		for _, tree := range trees {
+			if err := existing.buildRollup(tree, rollup); err != nil {
+				return nil, err
+			}
+		}
+		updated.Rollups = append(updated.Rollups, rollup)
+	}
+
+	for _, rollup := range existing.spec.Rollups {
+		if kept[rollup.Name] {
+			continue
+		}
+		trees, err := existing.across()
+		if err != nil {
+			return nil, err
+		}
+		for _, tree := range trees {
+			if err := deleteRange(tree, existing.rollups(rollup)); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	for _, index := range spec.Indexes {
 		wanted[index.Name] = true

@@ -87,6 +87,24 @@ func (s *Store) perform(caller Caller, operation Operation, arguments map[string
 			result.Count = 1
 		}
 
+	case ActionTotals:
+		within, err := bounds(operation, values)
+		if err != nil {
+			return Result{}, err
+		}
+		err = collection.Totals(operation.Rollup, within, func(row Totals) bool {
+			if len(result.Rows) >= operation.Limit {
+				result.Truncated = true
+				return false
+			}
+			result.Rows = append(result.Rows, rowOf(row))
+			result.Count = len(result.Rows)
+			return true
+		})
+		if err != nil {
+			return Result{}, err
+		}
+
 	case ActionScan, ActionCount:
 		within, err := bounds(operation, values)
 		if err != nil {
@@ -365,4 +383,17 @@ func project(document map[string]any, fields []string) map[string]any {
 		}
 	}
 	return kept
+}
+
+// rowOf is a rollup row as a document, so that a caller reading totals gets
+// the same shape back as a caller reading anything else.
+func rowOf(row Totals) map[string]any {
+	made := map[string]any{"count": float64(row.Count)}
+	if len(row.Group) > 0 {
+		made["group"] = row.Group
+	}
+	for path, total := range row.Sum {
+		made[path] = total
+	}
+	return made
 }
