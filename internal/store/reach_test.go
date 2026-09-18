@@ -303,6 +303,20 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 				// value are two rows; grouping by the value would let a
 				// widened scan that only picks up a second document with a
 				// value already seen read as "reached nothing new".
+				//
+				// Nothing in this file measures that, and this is the place
+				// to say so rather than leave the line above reading as a
+				// proven property. fill() gives every document its own slug
+				// (s0..s5, plus the floor row's ""), so no two rows in this
+				// fixture share an indexed value, and there is no other index
+				// here for them to share one on. Reading Values[0] here
+				// instead would go red at once, but on the slug not being the
+				// id (s3 against a3) rather than on two rows collapsing into
+				// one — which is a different failure, and no evidence about
+				// the sentence above. Measuring it needs a non-unique index
+				// with two documents on the same value, which is a fixture to
+				// add, not a reason to invent a collision that would not
+				// actually collide.
 				got = append(got, fmt.Sprint(one.Key))
 				return true
 			})
@@ -313,12 +327,15 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 		return got
 	}
 
-	asSet := func(list []string) map[string]bool {
-		set := make(map[string]bool, len(list))
-		for _, k := range list {
-			set[k] = true
+	sortedRaw := func(list []string) string {
+		out := make([]string, len(list))
+		copy(out, list)
+		sort.Strings(out)
+		quoted := make([]string, len(out))
+		for i, v := range out {
+			quoted[i] = fmt.Sprintf("%q", v)
 		}
-		return set
+		return fmt.Sprint(quoted)
 	}
 
 	for _, p := range pairs {
@@ -326,13 +343,13 @@ func checkShape(t *testing.T, collection *Collection, index string, shape reachS
 		reverse := walk(Reverse, p.low, p.high)
 		want := expectedReach(rows, shape, p.low, p.high)
 
-		if sorted(asSet(forward)) != sorted(want) {
+		if sortedRaw(forward) != sorted(want) {
 			t.Errorf("%s forward at %q/%q: the walk gave %v, the oracle says %v",
-				shape.what, p.low, p.high, sorted(asSet(forward)), sorted(want))
+				shape.what, p.low, p.high, sortedRaw(forward), sorted(want))
 		}
-		if sorted(asSet(reverse)) != sorted(want) {
+		if sortedRaw(reverse) != sorted(want) {
 			t.Errorf("%s reverse at %q/%q: the walk gave %v, the oracle says %v",
-				shape.what, p.low, p.high, sorted(asSet(reverse)), sorted(want))
+				shape.what, p.low, p.high, sortedRaw(reverse), sorted(want))
 		}
 		if fmt.Sprint(reverse) != fmt.Sprint(reversedList(forward)) {
 			t.Errorf("%s at %q/%q: reverse %v is not forward %v backwards",

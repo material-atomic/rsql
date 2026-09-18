@@ -266,8 +266,9 @@ func TestAnArrayConstantAtAScanBoundIsRefusedRatherThanPanicking(t *testing.T) {
 		t.Errorf("a map constant at a scan bound: want ErrDeclaration, got %v", err)
 	}
 
-	// Refused even when the constant is nil, since Encode can be asked and
-	// checked without special-casing what it might refuse.
+	// NOT refused when the constant is nil: nil encodes fine, unlike a slice
+	// or a map, so this checks the refusal above is about what Encode does
+	// with the value, not about the field being declared "any".
 	null := array
 	null.Name = "widgets.by_null"
 	null.From = &Endpoint{Terms: []Term{{Value: nil, Constant: true}}}
@@ -320,14 +321,14 @@ func TestSameTermComparesUncomparableValuesWithoutPanicking(t *testing.T) {
 	}
 }
 
-// TestScanAcrossRefusesDifferingConstantsWithoutPanicking and
-// TestTotalsAcrossRefusesDifferingConstantsWithoutPanicking exercise sameTerm
-// through the real declaration path rather than calling it directly, on the
-// two functions round three's Reviewer named. Both constants here are
-// ordinary comparable strings — == would not have panicked on these — so
-// what these two check is that sameTerm still tells them apart correctly,
-// which a mutation making it always report "equal" would break.
-func TestScanAcrossRefusesDifferingConstantsWithoutPanicking(t *testing.T) {
+// TestScanAcrossTellsTwoConstantsApart and TestTotalsAcrossTellsTwoConstantsApart
+// exercise sameTerm through the real declaration path rather than calling it
+// directly, on the two functions round three's Reviewer named. Both constants
+// here are ordinary comparable strings — == would not have panicked on these,
+// and no path in the repo reaches either function with a constant that would
+// — so what these two check is that sameTerm still tells them apart
+// correctly, which a mutation making it always report "equal" would break.
+func TestScanAcrossTellsTwoConstantsApart(t *testing.T) {
 	_, _, store := partitioned(t, 154)
 	entriesByMonth(t, store, 0)
 
@@ -345,7 +346,7 @@ func TestScanAcrossRefusesDifferingConstantsWithoutPanicking(t *testing.T) {
 	}
 }
 
-func TestTotalsAcrossRefusesDifferingConstantsWithoutPanicking(t *testing.T) {
+func TestTotalsAcrossTellsTwoConstantsApart(t *testing.T) {
 	_, _, store := partitioned(t, 155)
 
 	lines, err := store.Declare(Spec{

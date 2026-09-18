@@ -102,6 +102,15 @@ type Operation struct {
 	// stretch, read from either end: a caller that flips the direction and
 	// leaves From and To alone gets the same rows back, backwards.
 	//
+	// This is a change from an older convention some callers may still carry
+	// in their head, where a reversed read meant writing From as the high
+	// value and To as the low one. Doing that today reaches nothing, in
+	// EITHER direction, because From is unconditionally the low end
+	// regardless of what value is written there: there is no error and
+	// Truncated stays false, since the walk correctly finds no rows between
+	// a low end that sorts after the high end. Nothing inside the store can
+	// tell that shape apart from a stretch that is legitimately empty.
+	//
 	// It is still the one thing about a scan an argument may decide, and it is
 	// safe for a reason that does not generalise to anything else: it widens
 	// nothing. The index is the declared one, the limit is the declared one,

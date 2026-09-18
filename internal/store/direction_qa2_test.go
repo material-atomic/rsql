@@ -15,7 +15,10 @@ import (
 // arithmetic. QA found the forward half of this untested: turning
 // `Compare(key, upper) >= 0` into `> 0` hands the bound row back and the whole
 // repo stayed green. The reversed half was already covered; it is here beside
-// its mirror so the next person changing bound() breaks both at once.
+// its mirror so the next person changing the `bounded` closure in walk
+// (scan.go, the two Compare calls) breaks both at once. That closure, not
+// bound(), is where these two live: bound() works out the byte position each
+// end sits at, and `bounded` decides which side of it a key has to be on.
 //
 // Round four removed the swap that used to put To in the "far end, entered
 // first" position when reversed: From and To no longer trade places, so the
@@ -27,9 +30,19 @@ import (
 // walk is now From, the low end, which is why the exclusive bound moves
 // there below.
 //
-// reach_test does not see this. It compares the union of what every argument
-// value reaches, and a row excluded by one call is reached by another, so the
-// union saturates and an off-by-one in a single call leaves it unchanged.
+// reach_test.go used to miss this: round three's version of checkShape
+// unioned every call's rows across the whole argument domain before
+// comparing directions, and a row excluded by one call was reached by
+// another, so the union saturated and an off-by-one in a single call left it
+// unchanged. Round four rewrote checkShape to compare each call against an
+// oracle computed straight off the fixture rather than against the union, and
+// that per-call comparison does catch this mutation on its own —
+// TestEveryShapeOfDeclarationDeclaresAndReadsOneStretchBothWays turns red on
+// exactly this change to the far-end comparison. This test stays anyway: it
+// pins the two comparisons at the byte level, at the place they are written
+// rather than through rows read out of a harness, on the one walk (clustered)
+// where a bound can land exactly on a stored key — which is a narrower and
+// cheaper thing to read than the shape harness when it goes red.
 func TestAnExclusiveEndIsOutsideTheStretchWhicheverWayTheWalkEnters(t *testing.T) {
 	_, collection := declared(t, 133)
 	fill(t, collection)
