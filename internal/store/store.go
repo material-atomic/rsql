@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/material-atomic/rsql/internal/btree"
 	"github.com/material-atomic/rsql/internal/keys"
@@ -33,6 +34,9 @@ type Store struct {
 	tree        *btree.Tree
 	collections map[string]*Collection
 	ids         *ulid.Source
+	now         func() time.Time
+	// retain is how many log entries to keep; zero keeps all of them.
+	retain int
 }
 
 // Open reads the catalogue of an existing database, or starts an empty one.
@@ -41,6 +45,7 @@ func Open(pages *pager.Pager) (*Store, error) {
 		tree:        btree.New(pages),
 		collections: map[string]*Collection{},
 		ids:         ulid.New(),
+		now:         time.Now,
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -97,12 +102,13 @@ func (s *Store) Declare(spec Spec) (*Collection, error) {
 		}
 		spec.NextIndexID = uint16(len(spec.Indexes))
 
-		collection := &Collection{store: s, spec: spec}
-		if err := s.writeSpec(spec); err != nil {
+		if err := s.install(spec); err != nil {
 			return nil, err
 		}
-		s.collections[spec.Name] = collection
-		return collection, nil
+		if _, err := s.record(Change{Kind: ChangeDeclare, Collection: spec.Name, Spec: &spec}); err != nil {
+			return nil, err
+		}
+		return s.collections[spec.Name], nil
 	}
 
 	if existing.spec.Key != spec.Key {
@@ -129,30 +135,69 @@ func (s *Store) Declare(spec Spec) (*Collection, error) {
 		updated.Indexes = append(updated.Indexes, index)
 	}
 
-	// Indexes left out of the declaration are dropped, entries and all.
-	for _, before := range existing.spec.Indexes {
-		if !wanted[before.Name] {
-			if err := existing.dropIndex(before); err != nil {
-				return nil, err
+	if err := s.install(updated); err != nil {
+		return nil, err
+	}
+	if _, err := s.record(Change{Kind: ChangeDeclare, Collection: updated.Name, Spec: &updated}); err != nil {
+		return nil, err
+	}
+	return s.collections[updated.Name], nil
+}
+
+// install puts a declaration into effect: indexes that are new are built from
+// the documents already stored, indexes that are gone take their entries with
+// them. It assigns nothing — the numbers in the spec are the ones it is given,
+// which is what lets a replica install exactly what the primary did.
+//
+// The collection object is updated in place rather than replaced. A handle
+// somebody is holding must see the declaration that is now in force: one
+// pointing at the old declaration would keep writing documents without
+// entries in an index that exists, and nothing would say so until a query
+// came back short.
+func (s *Store) install(spec Spec) error {
+	collection, found := s.collections[spec.Name]
+	if !found {
+		collection = &Collection{store: s, spec: spec}
+		s.collections[spec.Name] = collection
+	}
+
+	previous := collection.spec
+	collection.spec = spec
+
+	if found {
+		for _, before := range previous.Indexes {
+			if _, still := collection.index(before.Name); !still {
+				if err := collection.dropIndex(before); err != nil {
+					collection.spec = previous
+					return err
+				}
+			}
+		}
+		for _, index := range spec.Indexes {
+			if declaredBefore(previous, index.Name) {
+				continue
+			}
+			if err := collection.buildIndex(index); err != nil {
+				collection.spec = previous
+				return err
 			}
 		}
 	}
 
-	collection := &Collection{store: s, spec: updated}
-	for _, index := range updated.Indexes {
-		if _, ok := existing.index(index.Name); ok {
-			continue
-		}
-		if err := collection.buildIndex(index); err != nil {
-			return nil, err
-		}
+	if err := s.writeSpec(spec); err != nil {
+		collection.spec = previous
+		return err
 	}
+	return nil
+}
 
-	if err := s.writeSpec(updated); err != nil {
-		return nil, err
+func declaredBefore(spec Spec, name string) bool {
+	for _, index := range spec.Indexes {
+		if index.Name == name {
+			return true
+		}
 	}
-	s.collections[spec.Name] = collection
-	return collection, nil
+	return false
 }
 
 // Collection is a collection that has been declared.
@@ -175,7 +220,9 @@ func (s *Store) Collections() []string {
 
 // Drop removes a collection: its documents, its index entries and its
 // declaration.
-func (s *Store) Drop(name string) error {
+func (s *Store) Drop(name string) error { return s.drop(name, true) }
+
+func (s *Store) drop(name string, record bool) error {
 	collection, err := s.Collection(name)
 	if err != nil {
 		return err
@@ -194,6 +241,12 @@ func (s *Store) Drop(name string) error {
 	}
 
 	delete(s.collections, name)
+
+	if record {
+		if _, err := s.record(Change{Kind: ChangeDrop, Collection: name}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

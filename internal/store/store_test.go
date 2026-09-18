@@ -762,3 +762,59 @@ func indexed(document map[string]any, index Index) []string {
 	}
 	return out
 }
+
+// A handle held across a declaration must see the declaration now in force.
+// One still pointing at the old one would write documents with no entry in an
+// index that exists, and nothing would say so until a query came back short.
+func TestAHandleHeldAcrossADeclarationMaintainsTheNewIndex(t *testing.T) {
+	_, store := fresh(t, 16)
+	spec := articles()
+	spec.Indexes = spec.Indexes[:1]
+	held, err := store.Declare(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, held, map[string]any{"id": "before", "author": "ann", "slug": "s-before"})
+
+	// A second index is declared through the store, while `held` stays what the
+	// caller has.
+	if _, err := store.Declare(articles()); err != nil {
+		t.Fatal(err)
+	}
+	put(t, held, map[string]any{"id": "after", "author": "ann", "slug": "s-after"})
+
+	entries := scan(t, held, "by_slug", Range{})
+	if len(entries) != 2 {
+		t.Fatalf("the new index holds %d entries, want both documents: %v", len(entries), keysOf(entries))
+	}
+
+	// And a delete through the old handle clears the new index too.
+	if removed, err := held.Delete("after"); err != nil || !removed {
+		t.Fatal(err)
+	}
+	if entries := scan(t, held, "by_slug", Range{}); len(entries) != 1 {
+		t.Errorf("after a delete the index holds %d entries", len(entries))
+	}
+}
+
+func TestAHandleToADroppedCollectionRefusesToWrite(t *testing.T) {
+	_, store := fresh(t, 17)
+	held, err := store.Declare(articles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, held, map[string]any{"id": "a", "title": "One"})
+
+	if err := store.Drop("articles"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Writing through it would fill a keyspace nothing points at, and the next
+	// collection given that id would inherit the documents.
+	if _, err := held.Put(map[string]any{"id": "b", "title": "Two"}); !errors.Is(err, ErrNoCollection) {
+		t.Errorf("put: want ErrNoCollection, got %v", err)
+	}
+	if _, err := held.Delete("a"); !errors.Is(err, ErrNoCollection) {
+		t.Errorf("delete: want ErrNoCollection, got %v", err)
+	}
+}

@@ -115,9 +115,17 @@ type Endpoint struct {
 	Exclusive bool   `json:"exclusive,omitempty"`
 }
 
-// Caller is who is running an operation.
+// Caller is the context of one call: who is running the operation, what they
+// hold, and their own id for the write if it is one.
 type Caller struct {
 	Scopes []string
+	// Actor is recorded with any change this call makes, so the log says who
+	// as well as what.
+	Actor string
+	// WriteID is the caller's own id for this write. The same id arriving twice
+	// is answered from what the first one did rather than applied again, which
+	// is what makes a retry after a lost connection safe.
+	WriteID string
 }
 
 // Result is what running an operation produced.
@@ -132,6 +140,10 @@ type Result struct {
 	// more. A caller that does not look at this is reading a partial answer as
 	// a whole one, so it is a field rather than a silence.
 	Truncated bool `json:"truncated,omitempty"`
+	// Repeated is the log entry a write id had already produced, when this call
+	// was a retry of a write that had already landed. Nothing was written
+	// again.
+	Repeated uint64 `json:"repeated,omitempty"`
 }
 
 // DeclareOperation stores an operation, as a new version if the name is
@@ -155,6 +167,9 @@ func (s *Store) DeclareOperation(operation Operation) (Operation, error) {
 		return Operation{}, err
 	}
 	if err := s.tree.Put(operationKey(operation.Name, operation.Version), encoded); err != nil {
+		return Operation{}, err
+	}
+	if _, err := s.record(Change{Kind: ChangeOperation, Operation: &operation}); err != nil {
 		return Operation{}, err
 	}
 	return operation, nil

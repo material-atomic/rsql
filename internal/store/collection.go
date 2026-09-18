@@ -19,6 +19,16 @@ type Collection struct {
 // Spec is the declaration this collection is running.
 func (c *Collection) Spec() Spec { return c.spec }
 
+// live refuses a handle to a collection that has been dropped. Writing through
+// one would fill a keyspace nothing points at, and a later collection given the
+// same id would inherit it.
+func (c *Collection) live() error {
+	if c.store.collections[c.spec.Name] != c {
+		return fmt.Errorf("%w: %q was dropped", ErrNoCollection, c.spec.Name)
+	}
+	return nil
+}
+
 func (c *Collection) index(name string) (*Index, bool) {
 	for i := range c.spec.Indexes {
 		if c.spec.Indexes[i].Name == name {
@@ -30,11 +40,29 @@ func (c *Collection) index(name string) (*Index, bool) {
 
 // Put stores a document, replacing whatever was under the same primary key,
 // and returns that key.
-//
-// The document and every index entry that describes it are written together.
-// Half of that is worse than none: an index entry with no document behind it
-// makes a query return something that is not there.
 func (c *Collection) Put(document map[string]any) (any, error) {
+	return c.write(Attribution{}, document, true)
+}
+
+// PutBy is Put with a record of who did it and why, which is what ends up in
+// the change log.
+func (c *Collection) PutBy(by Attribution, document map[string]any) (any, error) {
+	return c.write(by, document, true)
+}
+
+// write stores a document, and — unless this is a replay of somebody else's
+// log — records that it did.
+//
+// The document, every index entry that describes it and the log entry that
+// announces it are one write. Any two of the three without the third is worse
+// than none of them: an index entry with no document makes a query return
+// something that is not there, and a log that missed a change makes every
+// replica of this database quietly wrong.
+func (c *Collection) write(by Attribution, document map[string]any, record bool) (any, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+
 	key, found := document[c.spec.Key.Path]
 	if !found || key == nil {
 		if c.spec.Key.Auto != "ulid" {
@@ -95,6 +123,14 @@ func (c *Collection) Put(document map[string]any) (any, error) {
 		}
 	}
 
+	if record {
+		if _, err := c.store.record(Change{
+			Kind: ChangePut, Collection: c.spec.Name, Key: key, Document: document, By: by,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	return key, nil
 }
 
@@ -109,6 +145,19 @@ func (c *Collection) Get(key any) (map[string]any, bool, error) {
 
 // Delete removes a document and everything the indexes say about it.
 func (c *Collection) Delete(key any) (bool, error) {
+	return c.remove(Attribution{}, key, true)
+}
+
+// DeleteBy is Delete with a record of who did it and why.
+func (c *Collection) DeleteBy(by Attribution, key any) (bool, error) {
+	return c.remove(by, key, true)
+}
+
+func (c *Collection) remove(by Attribution, key any, record bool) (bool, error) {
+	if err := c.live(); err != nil {
+		return false, err
+	}
+
 	stored, err := c.encodeKey(key)
 	if err != nil {
 		return false, err
@@ -128,7 +177,21 @@ func (c *Collection) Delete(key any) (bool, error) {
 			return false, err
 		}
 	}
-	return c.store.tree.Delete(stored)
+
+	// The document was read above, so this removes it: a key that was not there
+	// returned before any of this.
+	if _, err := c.store.tree.Delete(stored); err != nil {
+		return false, err
+	}
+
+	if record {
+		if _, err := c.store.record(Change{
+			Kind: ChangeDelete, Collection: c.spec.Name, Key: key, By: by,
+		}); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (c *Collection) read(stored []byte) (map[string]any, bool, error) {

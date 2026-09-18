@@ -32,6 +32,29 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 	}
 
 	result := Result{Operation: operation.Name, Version: operation.Version}
+	by := Attribution{
+		Operation: operation.Name,
+		Version:   operation.Version,
+		Actor:     caller.Actor,
+		WriteID:   caller.WriteID,
+	}
+
+	// A write that arrives twice under one id is answered from what the first
+	// one did. The connection dropping after the write landed but before the
+	// answer got back is the ordinary case, and a caller that retries then must
+	// not end up with two documents.
+	if writes(operation.Action) && caller.WriteID != "" {
+		lsn, key, done, err := s.Wrote(caller.WriteID)
+		if err != nil {
+			return Result{}, err
+		}
+		if done {
+			result.Key = key
+			result.Changed = 1
+			result.Repeated = lsn
+			return result, nil
+		}
+	}
 
 	switch operation.Action {
 	case ActionGet:
@@ -71,7 +94,7 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 				}
 			}
 		}
-		key, err := collection.Put(document)
+		key, err := collection.PutBy(by, document)
 		if err != nil {
 			return Result{}, err
 		}
@@ -97,7 +120,7 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 		for field, value := range changes {
 			document[field] = value
 		}
-		if _, err := collection.Put(document); err != nil {
+		if _, err := collection.PutBy(by, document); err != nil {
 			return Result{}, err
 		}
 		result.Key = key
@@ -108,7 +131,7 @@ func (s *Store) Invoke(caller Caller, name string, version int, arguments map[st
 		if err != nil {
 			return Result{}, err
 		}
-		removed, err := collection.Delete(key)
+		removed, err := collection.DeleteBy(by, key)
 		if err != nil {
 			return Result{}, err
 		}
@@ -166,6 +189,16 @@ func (s *Store) run(collection *Collection, operation Operation, within Range, r
 		}
 		return visit(entry.Key, document)
 	})
+}
+
+// writes says whether an action changes anything, which decides whether a
+// write id means something for it.
+func writes(action string) bool {
+	switch action {
+	case ActionInsert, ActionPut, ActionUpdate, ActionDelete:
+		return true
+	}
+	return false
 }
 
 // allowed is the fail-closed scope check: every scope the operation names must
