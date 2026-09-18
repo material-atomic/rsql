@@ -66,6 +66,9 @@ type Server struct {
 	mutex  sync.Mutex
 	open   map[string]*database
 	closed bool
+	// held is the lock on the whole directory. One server per directory, found
+	// out at startup rather than at whichever request first collided.
+	held io.Closer
 }
 
 // database is one open file and the lock that keeps its single writer single.
@@ -87,7 +90,12 @@ func New(options Options) (*Server, error) {
 	if err := os.MkdirAll(options.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Server{options: options, open: map[string]*database{}}, nil
+
+	held, err := vfs.LockDir(options.Dir)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{options: options, open: map[string]*database{}, held: held}, nil
 }
 
 // Serve accepts connections until the listener is closed.
@@ -119,6 +127,13 @@ func (s *Server) Close() error {
 		db.mutex.Unlock()
 	}
 	s.open = map[string]*database{}
+
+	if s.held != nil {
+		if err := s.held.Close(); err != nil && failed == nil {
+			failed = err
+		}
+		s.held = nil
+	}
 	return failed
 }
 

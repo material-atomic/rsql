@@ -14,6 +14,7 @@ import (
 	"github.com/material-atomic/rsql/internal/pager"
 	"github.com/material-atomic/rsql/internal/protocol"
 	"github.com/material-atomic/rsql/internal/store"
+	"github.com/material-atomic/rsql/internal/vfs"
 )
 
 const (
@@ -698,5 +699,36 @@ func TestManyConnectionsToOneDatabase(t *testing.T) {
 	}
 	if count != connections*each || len(titles) != connections*each {
 		t.Errorf("%d documents with %d distinct titles, want %d of each", count, len(titles), connections*each)
+	}
+}
+
+// Two servers on one directory is the operator mistake that matters, and it
+// has to be found at startup. Locking each database file is not enough on its
+// own: a server opens one only when somebody asks for it, so both would come
+// up looking healthy and collide later, at whichever request first touched the
+// same database.
+func TestTwoServersCannotShareADirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := New(Options{Dir: dir, Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(Options{Dir: dir, Secret: secret}); !errors.Is(err, vfs.ErrLocked) {
+		t.Fatalf("a second server started on the same directory: %v", err)
+	}
+
+	// And the directory is free again once the first one closes, which is what
+	// a supervisor restarting it depends on.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(Options{Dir: dir, Secret: secret})
+	if err != nil {
+		t.Fatalf("after the first closed, the second is still refused: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

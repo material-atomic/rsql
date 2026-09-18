@@ -3,6 +3,7 @@ package vfs
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -299,4 +300,49 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// Two writers on one database file do not fail — they produce a file where
+// each process's pages are correct and the two disagree, which neither can
+// detect and no checksum can catch. The lock is the only thing between that
+// and a server started twice on one directory.
+func TestADatabaseFileIsOpenedByOneProcessAtATime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "held.rsql")
+
+	first, err := OpenFile(path, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenFile(path, 0o600); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second writer was let in: %v", err)
+	}
+
+	// And the lock goes with the handle: after closing, the next one gets in.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenFile(path, 0o600)
+	if err != nil {
+		t.Fatalf("after the first closed, the second is still refused: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Refusing must not depend on the file already existing: the race that matters
+// is two processes starting at once on a directory that is empty.
+func TestTheLockIsTakenOnAFileBeingCreated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "new.rsql")
+
+	first, err := OpenFile(path, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	if _, err := OpenFile(path, 0o600); !errors.Is(err, ErrLocked) {
+		t.Errorf("two processes created the same database: %v", err)
+	}
 }
