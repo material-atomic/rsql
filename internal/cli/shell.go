@@ -405,19 +405,34 @@ func connect(opts options, address string, insecure bool) (*wire.Client, error) 
 	return client, nil
 }
 
+// checkShell is shell's argument check, moved here verbatim from what used
+// to be shell()'s own body: everything after the host, if anything, has to
+// be "-insecure". Guarded on len(args) > 0 because args[1:] on an empty
+// slice is one index past its length — a case this function has to survive
+// now that check runs for every command, including one given no arguments
+// at all, and not only for the two shapes ("shell host" and "shell host
+// -insecure") this package's own tests happened to call it with before.
+func checkShell(_ options, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	for _, arg := range args[1:] {
+		if arg != "-insecure" {
+			return fmt.Errorf("%w: shell takes host:port and optionally -insecure, not %q", ErrUsage, arg)
+		}
+	}
+	return nil
+}
+
 // shell is the command.
 func shell(opts options, args []string, in io.Reader, out io.Writer) error {
 	address := "localhost:7433"
 	if len(args) > 0 {
 		address = args[0]
 	}
-	insecure := false
-	for _, arg := range args[1:] {
-		if arg != "-insecure" {
-			return fmt.Errorf("%w: shell takes host:port and optionally -insecure, not %q", ErrUsage, arg)
-		}
-		insecure = true
-	}
+	// checkShell has already refused anything in args[1:] that is not
+	// "-insecure", so its mere presence is enough to turn this on.
+	insecure := len(args) > 1
 
 	client, err := connect(opts, address, insecure)
 	if err != nil {

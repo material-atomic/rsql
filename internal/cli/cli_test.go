@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -443,6 +444,31 @@ func walkTree(t *testing.T, root string) []string {
 	return paths
 }
 
+// treesMatch is the actual comparison assertTreeUnchanged makes, factored
+// out so TestWalkTreeSeesAPathThatChangedIdentity, below, can drive it
+// directly with a synthetic before/after pair — without going through a
+// *testing.T, where a comparison that is SUPPOSED to report a difference
+// would mark that meta-test itself failed rather than letting it assert on
+// the result. Comparing full paths, not just how many there are: none of
+// the 18 cases in TestARejectedArgumentLeavesTheDiskExactlyAsItFound ever
+// removes a path (see section 5 of task 0058), so on every case in THAT
+// TABLE len(before) != len(after) already — the only shape a length-only
+// comparison would miss there is a path renamed to a different name of the
+// same count.
+//
+// That is a claim about this test file's own case table, not about the
+// package. QA 0058 read the rest of the tree: Collection.expire() ->
+// store.DropPart -> vfs.Folder.Remove -> os.Remove does delete a path, and
+// apply can reach it — schema.Collections is passed straight through to
+// db.Declare, Partition.Keep included. No case here builds that shape (it
+// needs a partitioned collection to actually expire a part, which none of
+// the 18 cases sets up), so the length-only blind spot stays theoretical
+// for this file; a future case that does build it must not lean on
+// length alone.
+func treesMatch(before, after []string) bool {
+	return reflect.DeepEqual(before, after)
+}
+
 // assertTreeUnchanged compares a snapshot taken before running a command
 // against the tree now, and fails with both lists when they differ — so a
 // failure names exactly what appeared or disappeared, not just that
@@ -450,7 +476,7 @@ func walkTree(t *testing.T, root string) []string {
 func assertTreeUnchanged(t *testing.T, root string, before []string) {
 	t.Helper()
 	after := walkTree(t, root)
-	if !reflect.DeepEqual(before, after) {
+	if !treesMatch(before, after) {
 		t.Errorf("a refused command changed %s\n  before: %v\n  after:  %v", root, before, after)
 	}
 }
@@ -473,9 +499,21 @@ func assertTreeUnchanged(t *testing.T, root string, before []string) {
 // directory). Both commands that reach open() on this path are exercised
 // — ls and apply — because a fix that only moved the check late enough to
 // satisfy ls would say nothing about apply.
+//
+// apply is given a real, valid file rather than none at all: task 0058
+// moved apply's own argument check (a file is required, and has to parse)
+// ahead of open(), so "apply" with no file now stops there and never
+// reaches checkOldExtension — a case this test would otherwise stop
+// covering for apply without saying so.
 func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
-	for _, command := range []string{"ls", "apply"} {
-		t.Run(command, func(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args func(t *testing.T) []string
+	}{
+		{name: "ls", args: func(*testing.T) []string { return []string{"ls"} }},
+		{name: "apply", args: func(t *testing.T) []string { return []string{"apply", writeOutside(t, articles)} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			setup := start(t)
 			if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
 				t.Fatal(err)
@@ -487,7 +525,7 @@ func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
 
 			before := walkTree(t, setup.dir)
 
-			_, errs, status := setup.run(command)
+			_, errs, status := setup.run(tc.args(t)...)
 			if status == 0 {
 				t.Fatal("it ran against a database whose only file on disk carries the old extension")
 			}
@@ -955,5 +993,562 @@ func TestTheToolIsRefusedWhileAServerHoldsTheDirectory(t *testing.T) {
 	}
 	if _, errs, status := setup.run("ls"); status != 0 {
 		t.Errorf("after the server let go: %s", errs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 0058: a command refused because of a bad ARGUMENT must not touch disk
+// at all, not merely "not create a database file". Section 6 of the task
+// lays out eighteen cases below, each changing exactly one axis from the
+// case before it, all read through walkTree and assertTreeUnchanged above so
+// a failure names exactly what appeared or disappeared. Every case gets its
+// own start(t) — the shared-fixture trap in TestWhatIsNotACommandIsExplained
+// above (see the comment on that test's "apply with no file" row) is not one
+// this table repeats.
+
+// canonicalShape is the tree a database actually leaves behind once it opens
+// and something inside it succeeds: .lock and the account folder from
+// open(), main.sapedb from the pager, main.parts from vfs.At. Cases 14 and
+// 15 below assert the tree equals exactly this — not merely that these
+// paths exist — because a fix that suppressed main.parts unconditionally
+// would make every refusal case above pass for the wrong reason.
+func canonicalShape() []string {
+	return []string{
+		".lock",
+		"acme",
+		filepath.Join("acme", "main.parts"),
+		filepath.Join("acme", "main.sapedb"),
+	}
+}
+
+// writeOutside puts a file somewhere other than SAPEDB_DIR. Every case below
+// that gives apply a real file uses this instead of setup.write: a file
+// living inside SAPEDB_DIR would show up in the very walkTree snapshot the
+// case is trying to keep clean, and the assertion would end up measuring the
+// test's own fixture instead of the command under test.
+func writeOutside(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "schema.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+const onePersonSchema = `{"collections":[{"name":"people","key":{"path":"id","type":"string"}}]}`
+
+const unknownFieldSchema = `{"collections":[{"name":"a","key":{"path":"id","type":"string"},"unexpectedField":1}]}`
+
+const brokenJSONSchema = `{"collections": [ { "name": "a" `
+
+// conflictingArticlesSchema redeclares the "articles" collection from the
+// package-level articles constant, above, with a different primary key.
+// store.Declare refuses that — comparing the key it already has against the
+// one just asked for — before writing anything, which is what makes case 18
+// below a check on SAVED STATE rather than on an argument: section 4 of the
+// task draws that line on purpose, and this task does not move it.
+const conflictingArticlesSchema = `{"collections":[{"name":"articles","key":{"path":"id","type":"number"}}]}`
+
+func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
+	// Case 1: apply, no file at all, on a fresh directory.
+	t.Run("1 apply with no file", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("apply")
+		if status == 0 {
+			t.Fatal("apply ran with no file")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 2: a file argument that is present but points nowhere.
+	t.Run("2 apply, a file that does not exist", func(t *testing.T) {
+		setup := start(t)
+		missing := filepath.Join(t.TempDir(), "missing.json")
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("apply", missing)
+		if status == 0 {
+			t.Fatal("apply ran against a file that is not there")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 3: a file argument that exists but is a directory. os.ReadFile
+	// fails on a directory the way os.Stat would not — this case exists
+	// specifically to catch a check that uses the wrong one of the two.
+	t.Run("3 apply, a directory instead of a file", func(t *testing.T) {
+		setup := start(t)
+		asDir := t.TempDir()
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("apply", asDir)
+		if status == 0 {
+			t.Fatal("apply ran with a directory as its file argument")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 4: the file exists and reads, but is not valid JSON.
+	t.Run("4 apply, broken JSON", func(t *testing.T) {
+		setup := start(t)
+		file := writeOutside(t, brokenJSONSchema)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("apply", file)
+		if status == 0 {
+			t.Fatal("apply ran with broken JSON")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 5: valid JSON, but a field DisallowUnknownFields does not know.
+	t.Run("5 apply, an unknown field", func(t *testing.T) {
+		setup := start(t)
+		file := writeOutside(t, unknownFieldSchema)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("apply", file)
+		if status == 0 {
+			t.Fatal("apply ran with a field nobody declared")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 6: two files, and the SECOND one is missing. This is the index
+	// axis: a check that only ever reads files[0] would let this straight
+	// through to open() and to apply()'s own loop, which would declare
+	// "people" from the first file — printing it — before failing on the
+	// second. Neither the tree nor stdout may show that.
+	t.Run("6 apply, two files, the second one missing", func(t *testing.T) {
+		setup := start(t)
+		ok := writeOutside(t, onePersonSchema)
+		missing := filepath.Join(t.TempDir(), "missing.json")
+		before := walkTree(t, setup.dir)
+		out, _, status := setup.run("apply", ok, missing)
+		if status == 0 {
+			t.Fatal("apply ran with its second file missing")
+		}
+		if strings.Contains(out, "collection") {
+			t.Errorf("apply declared something before failing on the second file: %q", out)
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 7: log's own argument is not a number.
+	t.Run("7 log, not a number", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("log", "not-a-number")
+		if status == 0 {
+			t.Fatal("log ran with a non-numeric position")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 8: log takes at most one argument (FROM); this gives it three.
+	// Before this task only args[0] was ever read, so the extra two were
+	// silently dropped and the command ran anyway.
+	t.Run("8 log, too many arguments", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("log", "1", "2", "3")
+		if status == 0 {
+			t.Fatal("log ran with three positional arguments")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 8b: the actual wall, not the one case 8 happens to sit on. QA
+	// 0058 measured that checkLog's `len(args) > 1` guard was only ever
+	// exercised at N=3 (case 8 above, and rejectionCases["log"] — same
+	// N), and nudging it outward by one to `len(args) > 2` (mutation P6)
+	// survived every test in this file: at N=3 both walls agree ("too
+	// many" either way), so N=3 alone cannot tell `> 1` from `> 2` apart.
+	// N=2 is the one shape that does — this is the case that closes that
+	// gap by pinning the wall at the point where the two disagree, rather
+	// than only widening case 8's name to admit it was never checked.
+	t.Run("8b log, exactly two arguments (the wall itself, not N=3)", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("log", "1", "2")
+		if status == 0 {
+			t.Fatal("log ran with two positional arguments")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 9: ls takes no arguments at all. Before this task it took one
+	// anyway and ignored it.
+	t.Run("9 ls, an argument it has no use for", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("ls", "junk")
+		if status == 0 {
+			t.Fatal("ls ran with an argument")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 10: dump only ever writes to stdout; an argument means nothing.
+	t.Run("10 dump, an argument it has no use for", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("dump", "junk")
+		if status == 0 {
+			t.Fatal("dump ran with an argument")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 11: restore reads a dump from stdin; an argument means nothing.
+	t.Run("11 restore, an argument it has no use for", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("restore", "junk")
+		if status == 0 {
+			t.Fatal("restore ran with an argument")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 12: the depth axis QA 0050 left as debt. .lock and an empty
+	// acme/ are seeded by hand, both at depth 1, so that everything a
+	// rejected command would add (main.parts/, main.sapedb) sits at depth 2
+	// and nowhere else. A walkTree limited to one level, or a command that
+	// still calls open() before checking its argument, both see [.lock
+	// acme] before and after and call that unchanged; only an actual
+	// recursive diff catches it.
+	t.Run("12 depth 2 or deeper", func(t *testing.T) {
+		setup := start(t)
+		if err := os.WriteFile(filepath.Join(setup.dir, ".lock"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := walkTree(t, setup.dir)
+
+		_, _, status := setup.run("log", "not-a-number")
+		if status == 0 {
+			t.Fatal("log ran with a non-numeric position")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 13: the other half of the same debt — a database that is
+	// completely real except that main.parts/ is missing, so the only
+	// path a rejected command could add back is a single EMPTY DIRECTORY.
+	// A walkTree that only counts files, or a comparison that only checks
+	// len(before) == len(after), is blind to this.
+	t.Run("13 a single empty directory reappearing", func(t *testing.T) {
+		setup := start(t)
+		file := writeOutside(t, articles)
+		if _, errs, status := setup.run("apply", file); status != 0 {
+			t.Fatalf("seeding a real database: %s", errs)
+		}
+		if err := os.RemoveAll(filepath.Join(setup.dir, "acme", "main.parts")); err != nil {
+			t.Fatal(err)
+		}
+		before := walkTree(t, setup.dir)
+
+		_, _, status := setup.run("log", "not-a-number")
+		if status == 0 {
+			t.Fatal("log ran with a non-numeric position")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 14: the positive control for cases 12 and 13, and a different
+	// SHAPE of command from case 15 below — this one only prints. A command
+	// that actually runs must still produce main.parts/: it is the shape of
+	// the database, not debris from a refusal.
+	t.Run("14 a command that runs recreates main.parts (log)", func(t *testing.T) {
+		setup := start(t)
+		file := writeOutside(t, articles)
+		if _, errs, status := setup.run("apply", file); status != 0 {
+			t.Fatalf("seeding a real database: %s", errs)
+		}
+		if err := os.RemoveAll(filepath.Join(setup.dir, "acme", "main.parts")); err != nil {
+			t.Fatal(err)
+		}
+
+		_, errs, status := setup.run("log")
+		if status != 0 {
+			t.Fatalf("log: %s", errs)
+		}
+		got := walkTree(t, setup.dir)
+		if !reflect.DeepEqual(got, canonicalShape()) {
+			t.Errorf("after a command that ran: %v, want %v", got, canonicalShape())
+		}
+	})
+
+	// Case 15: the write-side positive control — apply, not log, on a
+	// completely fresh directory.
+	t.Run("15 a command that runs creates the whole shape (apply)", func(t *testing.T) {
+		setup := start(t)
+		file := writeOutside(t, articles)
+
+		_, errs, status := setup.run("apply", file)
+		if status != 0 {
+			t.Fatalf("apply: %s", errs)
+		}
+		got := walkTree(t, setup.dir)
+		if !reflect.DeepEqual(got, canonicalShape()) {
+			t.Errorf("after apply: %v, want %v", got, canonicalShape())
+		}
+	})
+
+	// Case 16: url never opens a database at all — this pins that the new
+	// command table did not change that.
+	t.Run("16 url, a password given as an argument", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("url", "localhost:7433", "hunter2")
+		if status == 0 {
+			t.Fatal("url accepted a password as an argument")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 16b: the arity cap checkURL was missing entirely, found by QA
+	// 0058 on the user-facing path — "url localhost:9 - junk junk2"
+	// exited 0, printed the connection string, and dropped "junk" and
+	// "junk2" in silence. url now takes at most a host and one more word
+	// ("-" or a password); this pins that a word past that is refused,
+	// not swallowed. The password on stdin has to be the right SHAPE
+	// (16-128 characters — see TestAPasswordIsNeverAnArgument) precisely
+	// so this case is refused for the trailing word alone: "hunter2" is
+	// short enough that signing.Sign would refuse it on its own, which
+	// would make this case pass for the wrong reason and say nothing
+	// about the arity cap it exists to pin.
+	t.Run("16b url, a word left over after the password marker", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.runWith(nil, "a-password-of-the-right-shape\n", "url", "localhost:7433", "-", "junk", "junk2")
+		if status == 0 {
+			t.Fatal("url accepted a leftover word after the password marker")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 17: same for shell, refused before any network is touched —
+	// "-nope" is not a valid trailing option.
+	t.Run("17 shell, an option it does not have", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, _, status := setup.run("shell", "localhost:1", "-nope")
+		if status == 0 {
+			t.Fatal("shell accepted an option it does not have")
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 18: the boundary this task deliberately leaves alone. Once a
+	// database file exists, a conflicting redeclaration is refused by
+	// store.Declare — comparing the key it already has against the one
+	// being asked for — before either side writes anything. That is a
+	// check on SAVED STATE, not on an argument, and section 4 of the task
+	// is explicit that it stays where it is, after open().
+	t.Run("18 a conflicting redeclaration against a real database", func(t *testing.T) {
+		setup := start(t)
+		first := writeOutside(t, articles)
+		if _, errs, status := setup.run("apply", first); status != 0 {
+			t.Fatalf("seeding a real database: %s", errs)
+		}
+		before := walkTree(t, setup.dir)
+
+		second := writeOutside(t, conflictingArticlesSchema)
+		_, errs, status := setup.run("apply", second)
+		if status == 0 {
+			t.Fatal("a conflicting redeclaration was applied")
+		}
+		if !strings.Contains(errs, "articles") {
+			t.Errorf("the refusal does not name the collection: %q", errs)
+		}
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+}
+
+// TestUsageListsExactlyTheCommandsInTheTable is G1. usage is prose a human
+// reads and commands is the table run() actually dispatches through; they
+// are written independently of each other on purpose. Generating usage from
+// commands is banned, not merely unnecessary — it would turn this into a
+// string compared against itself, which cannot fail no matter what a future
+// eighth command does to only one of the two.
+func TestUsageListsExactlyTheCommandsInTheTable(t *testing.T) {
+	re := regexp.MustCompile(`(?m)^  sapedb \[options\] (\S+)`)
+	matches := re.FindAllStringSubmatch(usage, -1)
+	if len(matches) == 0 {
+		t.Fatal("no command lines found in usage — did its format change?")
+	}
+	var fromUsage []string
+	for _, m := range matches {
+		fromUsage = append(fromUsage, m[1])
+	}
+
+	var fromTable []string
+	for _, c := range commands {
+		fromTable = append(fromTable, c.name)
+	}
+
+	if !reflect.DeepEqual(fromUsage, fromTable) {
+		t.Errorf("usage lists %v, commands lists %v", fromUsage, fromTable)
+	}
+}
+
+// rejectionCase is one command line, given as a literal invocation, that G2
+// below asserts is refused with the tree exactly as it was.
+type rejectionCase struct {
+	args  []string
+	stdin string
+}
+
+// rejectionCases is written by hand and does not derive from commands: it is
+// the second, independent source a name added to commands without a
+// matching entry here is missing from. Every value must actually be
+// refused — this is checked, not assumed — and every one is chosen to be
+// refused at the check stage, before open(), so the case also demonstrates
+// the tree staying clean.
+var rejectionCases = map[string]rejectionCase{
+	"apply":   {args: []string{"apply"}},
+	"ls":      {args: []string{"ls", "junk"}},
+	"dump":    {args: []string{"dump", "junk"}},
+	"restore": {args: []string{"restore", "junk"}},
+	"log":     {args: []string{"log", "1", "2", "3"}},
+	"url":     {args: []string{"url", "localhost:7433", "hunter2"}},
+	"shell":   {args: []string{"shell", "localhost:1", "-nope"}},
+}
+
+// TestEveryCommandInTheTableHasARejectionCase is G2. A command added to
+// commands with opens and check set, but with no case here, would still
+// pass TestUsageListsExactlyTheCommandsInTheTable as long as usage got the
+// same update — this test is the second, independent guard, and it names
+// exactly which command is missing rather than just reporting a mismatch.
+func TestEveryCommandInTheTableHasARejectionCase(t *testing.T) {
+	var fromTable []string
+	for _, c := range commands {
+		fromTable = append(fromTable, c.name)
+	}
+	sort.Strings(fromTable)
+
+	var fromMap []string
+	for name := range rejectionCases {
+		fromMap = append(fromMap, name)
+	}
+	sort.Strings(fromMap)
+
+	if !reflect.DeepEqual(fromTable, fromMap) {
+		want := map[string]bool{}
+		for _, n := range fromTable {
+			want[n] = true
+		}
+		have := map[string]bool{}
+		for _, n := range fromMap {
+			have[n] = true
+		}
+		var missing, extra []string
+		for _, n := range fromTable {
+			if !have[n] {
+				missing = append(missing, n)
+			}
+		}
+		for _, n := range fromMap {
+			if !want[n] {
+				extra = append(extra, n)
+			}
+		}
+		t.Fatalf("commands and rejectionCases disagree — in commands but missing a rejection case: %v; in rejectionCases but not a real command: %v", missing, extra)
+	}
+
+	for name, tc := range rejectionCases {
+		t.Run(name, func(t *testing.T) {
+			setup := start(t)
+			before := walkTree(t, setup.dir)
+			_, _, status := setup.runWith(nil, tc.stdin, tc.args...)
+			if status == 0 {
+				t.Fatalf("%q ran when the case table says it must be refused", name)
+			}
+			assertTreeUnchanged(t, setup.dir, before)
+		})
+	}
+}
+
+// TestACommandNameMustMatchExactly pins findCommand's equality check. QA
+// 0058 (Q6) found that swapping c.name == name for
+// strings.HasPrefix(c.name, name) survives every other test in this file —
+// "l" is a prefix of "ls", "app" is a prefix of "apply", and findCommand
+// runs before check ever sees the rest of the argument list, so nothing
+// downstream gets a chance to object. Under that mutation "sapedb l" would
+// run ls and "sapedb app" would try to run apply; both must instead be
+// refused as an unknown command.
+func TestACommandNameMustMatchExactly(t *testing.T) {
+	for _, name := range []string{"l", "app"} {
+		t.Run(name, func(t *testing.T) {
+			setup := start(t)
+			before := walkTree(t, setup.dir)
+			_, errs, status := setup.run(name)
+			if status == 0 {
+				t.Fatalf("%q ran as if it were a real command", name)
+			}
+			if !strings.Contains(errs, "no command called") {
+				t.Errorf("%q was refused, but not for being an unknown command: %q", name, errs)
+			}
+			assertTreeUnchanged(t, setup.dir, before)
+		})
+	}
+}
+
+// TestCheckShellAcceptsHostAlone is the positive control checkShell was
+// missing at N=1. QA 0058 (Q5) found that `for _, arg := range args[1:]`
+// turned into `for _, arg := range args` survives every test in this
+// file: the only case that exercises checkShell (case 17, N=2 with a bad
+// trailing option) is refused either way — args[1:] rejects "-nope",
+// args also rejects it, same outcome, no case tells them apart. N=1 is
+// the shape that does: with only a host and nothing after it, args[1:] is
+// empty and there is nothing to object to, but args still holds the host
+// string itself, which is not "-insecure" and gets refused as if it were
+// a bad option — refusing "sapedb shell HOST", the exact form usage
+// documents ("shell [HOST]").
+//
+// This calls checkShell directly rather than going through the full CLI:
+// shell's run() dials a real connection once check passes, and "localhost:1"
+// with nothing listening would make this test depend on the network stack
+// refusing the right way instead of on the one function task 0058 moved.
+func TestCheckShellAcceptsHostAlone(t *testing.T) {
+	if err := checkShell(options{}, []string{"localhost:1"}); err != nil {
+		t.Fatalf("shell HOST alone, the form usage documents, was refused before it ever tried to connect: %v", err)
+	}
+}
+
+// TestWalkTreeSeesAPathThatChangedIdentity is a test of the test helper
+// itself, for one specific reason: none of the 18 cases in
+// TestARejectedArgumentLeavesTheDiskExactlyAsItFound builds a delete — every
+// regression they guard against strictly ADDS a path. That is a claim about
+// this test file's own case table, same scope as the note on treesMatch's
+// comment above: the package does have a real delete path
+// (Collection.expire() -> store.DropPart -> vfs.Folder.Remove ->
+// os.Remove, reachable through apply), none of these 18 cases sets up a
+// partitioned collection to trigger it. So on THIS TABLE, len(before) !=
+// len(after) already holds for every real bug above. A comparison that
+// checked only the length instead of the actual paths would still happen to
+// catch every case in this file, for the wrong reason, and would only be
+// exposed by a path changing identity without the count changing — a shape
+// none of these 18 cases builds, though the package can. So this builds
+// that shape directly on disk, without going through the CLI, and drives
+// the exact comparison the case table above relies on.
+func TestWalkTreeSeesAPathThatChangedIdentity(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := walkTree(t, dir)
+
+	if err := os.Rename(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
+		t.Fatal(err)
+	}
+	after := walkTree(t, dir)
+
+	if len(before) != len(after) {
+		t.Fatalf("this test needs the count to stay the same to make its point: before %v after %v", before, after)
+	}
+	if treesMatch(before, after) {
+		t.Fatal("treesMatch did not notice a path renamed to a different name of the same count")
 	}
 }

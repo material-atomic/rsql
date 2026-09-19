@@ -200,38 +200,213 @@ func run(args []string, lookup func(string) (string, bool), stdin io.Reader, std
 		return oldPathHint(opts, err)
 	}
 
-	command, rest := rest[0], rest[1:]
+	name, rest := rest[0], rest[1:]
 
-	switch command {
-	case "url":
-		return url(opts, rest, stdin, stdout)
-	case "shell":
-		// Not opened here: the shell talks to a running server, and taking the
-		// directory lock is exactly what it must not do — the database an
-		// operator wants to look inside is the one that is serving.
-		return shell(opts, rest, stdin, stdout)
-	case "apply", "ls", "dump", "restore", "log":
-	default:
-		return fmt.Errorf("%w: no command called %q", ErrUsage, command)
+	entry, found := findCommand(name)
+	if !found {
+		return fmt.Errorf("%w: no command called %q", ErrUsage, name)
 	}
 
-	db, close, err := open(opts)
-	if err != nil {
+	// entry.check sees only opts and rest — argv, and whatever files rest
+	// names — never db. That is the whole point: everything decidable from
+	// what the caller typed is decided here, before open() has touched
+	// disk, so a bad argument cannot leave .lock, an account folder, or
+	// main.parts/ behind on its way to being refused. See section 4 of task
+	// 0058's own text for where this line is drawn and why: state that only
+	// the database itself knows (a name already declared differently, a
+	// wrong secret on an encrypted file) is deliberately NOT here — it
+	// stays behind open(), and is not cleaned up, because open() creates
+	// nothing new once the file it is opening already exists.
+	if err := entry.check(opts, rest); err != nil {
 		return err
 	}
-	defer close()
 
-	switch command {
-	case "apply":
-		return apply(db, rest, stdout)
-	case "ls":
-		return list(db, stdout)
-	case "dump":
-		return dump(db, stdout)
-	case "restore":
-		return restore(db, stdin, stdout)
-	case "log":
-		return changes(db, rest, stdout)
+	var db *store.Store
+	if entry.opens {
+		opened, closeDB, err := open(opts)
+		if err != nil {
+			return err
+		}
+		defer closeDB()
+		db = opened
+	}
+
+	return entry.run(opts, db, rest, stdin, stdout)
+}
+
+// command is one row of the table run() dispatches through. Before task
+// 0058 the list of commands existed three times in this file — the usage
+// string, a switch that decided whether to call open(), and a second switch
+// that actually ran the command — and argument checking was scattered across
+// four of the seven commands, with the other three (ls, dump, restore)
+// having none at all. This table is the one place both switches used to be:
+// findCommand replaces both, check replaces the argument checks that used to
+// live inside apply/changes/url/shell (and adds the three that were simply
+// missing), and opens replaces the fact that a hand-written case list in the
+// first switch happened to agree with a second hand-written case list in the
+// second one.
+type command struct {
+	name string
+	// opens says whether this command needs the database file open to run
+	// at all. url and shell do not — a connection string is signed from
+	// opts alone, and shell talks to a server over the network, never to a
+	// file on this host.
+	opens bool
+	// check is everything about a call that can be judged from opts and
+	// the arguments alone, with no database open. It runs before open(),
+	// every time, for every command — including the three that had no
+	// argument checking at all before this task.
+	check func(opts options, args []string) error
+	// run is the command itself. db is nil when opens is false.
+	run func(opts options, db *store.Store, args []string, stdin io.Reader, stdout io.Writer) error
+}
+
+// commands is the one list. usage (above) and this table are written
+// independently on purpose — see TestUsageListsExactlyTheCommandsInTheTable
+// in cli_test.go, which is why generating usage from this table is banned
+// rather than merely unnecessary: it would turn that test into a string
+// compared against itself.
+var commands = []command{
+	{
+		name:  "apply",
+		opens: true,
+		check: checkApply,
+		run: func(_ options, db *store.Store, args []string, _ io.Reader, out io.Writer) error {
+			return apply(db, args, out)
+		},
+	},
+	{
+		name:  "ls",
+		opens: true,
+		check: checkNoArguments("ls"),
+		run: func(_ options, db *store.Store, _ []string, _ io.Reader, out io.Writer) error {
+			return list(db, out)
+		},
+	},
+	{
+		name:  "dump",
+		opens: true,
+		check: checkNoArguments("dump"),
+		run: func(_ options, db *store.Store, _ []string, _ io.Reader, out io.Writer) error {
+			return dump(db, out)
+		},
+	},
+	{
+		name:  "restore",
+		opens: true,
+		// checkNoArguments only, not the content of stdin — stdin is not
+		// argv, and checking it here would mean buffering it and handing
+		// Restore an already-read stream instead of the reader it gets
+		// today. Section 4's "a real exception" is exactly this: restore on
+		// garbage stdin still opens an empty database before failing, and
+		// this task does not change that. What it does change is the
+		// argument case: "restore junk" is refused before open() runs at
+		// all, same as ls and dump.
+		check: checkNoArguments("restore"),
+		run: func(_ options, db *store.Store, _ []string, in io.Reader, out io.Writer) error {
+			return restore(db, in, out)
+		},
+	},
+	{
+		name:  "log",
+		opens: true,
+		check: checkLog,
+		run: func(_ options, db *store.Store, args []string, _ io.Reader, out io.Writer) error {
+			return changes(db, args, out)
+		},
+	},
+	{
+		name:  "url",
+		opens: false,
+		check: checkURL,
+		run: func(opts options, _ *store.Store, args []string, in io.Reader, out io.Writer) error {
+			return url(opts, args, in, out)
+		},
+	},
+	{
+		name:  "shell",
+		opens: false,
+		check: checkShell,
+		run: func(opts options, _ *store.Store, args []string, in io.Reader, out io.Writer) error {
+			// Not opened above: the shell talks to a running server, and
+			// taking the directory lock is exactly what it must not do —
+			// the database an operator wants to look inside is the one
+			// that is serving.
+			return shell(opts, args, in, out)
+		},
+	},
+}
+
+// findCommand looks a name up in commands. A linear scan over seven entries
+// is not a data structure decision worth a map: this runs once per process.
+func findCommand(name string) (command, bool) {
+	for _, c := range commands {
+		if c.name == name {
+			return c, true
+		}
+	}
+	return command{}, false
+}
+
+// checkNoArguments builds the check for the three commands that were missing
+// one entirely before this task: ls, dump and restore all take zero
+// arguments, and all three ran anyway — silently ignoring whatever came
+// after them — right up until this task. "sapedb ls junk" and "sapedb dump
+// junk" both exited 0 on the commit this task started from.
+func checkNoArguments(name string) func(options, []string) error {
+	return func(_ options, args []string) error {
+		if len(args) != 0 {
+			return fmt.Errorf("%w: %s takes no arguments, and got %q", ErrUsage, name, args)
+		}
+		return nil
+	}
+}
+
+// checkApply is apply's argument check: a file to declare, present, readable,
+// and valid JSON that DisallowUnknownFields accepts — everything apply()
+// itself checks about a file before ever calling db.Declare. It duplicates
+// apply()'s read-and-decode rather than sharing it, on purpose: task 0058's
+// own text allows either design, and a duplicate keeps the two apply
+// mutations that target this function (skip len(files)==0, or skip decoding)
+// from also silently changing what apply() itself does when check is not
+// what caught them.
+//
+// The loop matters as much as the read: checking only files[0] would let
+// "apply ok.json missing.json" reach open() and apply()'s own loop, which
+// would declare ok.json's collection and print it before failing on the
+// second file — exactly the half-applied run task 0058 exists to prevent
+// happening even one file layer up from the database itself.
+func checkApply(_ options, files []string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("%w: apply needs a file", ErrUsage)
+	}
+	for _, name := range files {
+		content, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		wanted := schema{}
+		decoder := json.NewDecoder(strings.NewReader(string(content)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&wanted); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// checkLog is log's argument check: at most one argument, and when given,
+// it has to be the number changes() will Sscanf it as. Before this task
+// "log 1 2 3" ran, reading only args[0] and dropping the rest.
+func checkLog(_ options, args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf("%w: log takes at most one argument, FROM", ErrUsage)
+	}
+	if len(args) == 1 {
+		var from uint64
+		if _, err := fmt.Sscanf(args[0], "%d", &from); err != nil {
+			return fmt.Errorf("%w: %q is not an entry number", ErrUsage, args[0])
+		}
 	}
 	return nil
 }
@@ -667,6 +842,33 @@ func changes(db *store.Store, args []string, out io.Writer) error {
 	})
 }
 
+// checkURL is url's argument check, moved here verbatim from what used to be
+// url()'s own body: a password is read from stdin with "-", never given as
+// an argument, because arguments are visible in ps to every user on the
+// machine. This is the check task 0058's mutation P12 nudges outward by one
+// (len(args) > 1 to len(args) > 2) to ask whether that guard is pinned to
+// N=2 by a real wall or only by coincidence — see the Kết quả table for the
+// answer.
+//
+// The len(args) > 2 line below is not from the original task 0058 patch —
+// QA 0058 measured that "sapedb url localhost:9 - junk junk2" exited 0,
+// printed the connection string, and dropped "junk" and "junk2" without a
+// word, because this function had no upper bound on argument count at all.
+// That is the exact shape task 0058's own rule 1 forbids ("a rejected
+// argument must not be silently dropped by any subcommand"), so this closes
+// it here rather than leaving it as a debt: url now takes at most a host
+// and one more word ("-" or a password), same as every other subcommand.
+// See CHANGELOG.md — this is the fifth breaking change, called out there.
+func checkURL(_ options, args []string) error {
+	if len(args) > 1 && args[1] != "-" {
+		return fmt.Errorf("%w: a password is read from stdin with -, never given as an argument", ErrUsage)
+	}
+	if len(args) > 2 {
+		return fmt.Errorf("%w: url takes at most a host and -, and got %q", ErrUsage, args)
+	}
+	return nil
+}
+
 // url prints a connection string.
 //
 // The password is made here and printed as part of the string, or read from
@@ -681,9 +883,7 @@ func url(opts options, args []string, stdin io.Reader, out io.Writer) error {
 
 	password := ""
 	if len(args) > 1 {
-		if args[1] != "-" {
-			return fmt.Errorf("%w: a password is read from stdin with -, never given as an argument", ErrUsage)
-		}
+		// checkURL has already refused anything here but "-".
 		read, err := io.ReadAll(io.LimitReader(stdin, 1024))
 		if err != nil {
 			return err
