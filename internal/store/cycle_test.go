@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime/debug"
@@ -134,37 +136,38 @@ func TestSameValueOfTwoMutuallyCyclicValuesDiesFatallyAndUncatchably(t *testing.
 	}
 }
 
-// TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue is the
-// finding that corrected the "who can reach it" claim in the other
-// direction from the test above. It answers a question the earlier
-// versions of this task's tests never asked: given that sameValue itself
-// survives a single cyclic operand (measured above), is a self-referential
-// value passed through the exported Invoke — door two, {"equals":
-// {"arg": ...}}, which bind() (invoke.go) hands to resolveIn with no
-// encoding step at all — actually harmless end to end?
+// TestArgDoorCyclicValueNoLongerCrashesThroughSatisfiesItReturnsErrCondition
+// is what task 0042's own finding above looked like before task 0049 closed
+// it, and what it measures now that 0049 has: this was
+// TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue, and
+// its assertions ran the other way — the child was expected to die of
+// `fatal error: stack overflow` inside satisfies' own %v formatting. That
+// was 0042's measured, correct account of the code as it stood then. It is
+// not the account of the code as it stands now: satisfies (batch.go) formats
+// "wanted" and a mismatched "value" through describe (describe.go) instead
+// of a bare %v, and describe is built to return a bounded string instead of
+// recursing forever on exactly this shape. Leaving the old version of this
+// test in place, unchanged, would have meant a green suite quietly stopped
+// measuring the one thing this file exists to measure — the house rule
+// about a mutation harness needing its assertions kept honest applies just
+// as much to a fix that lands for real as it does to a mutation that only
+// pretends to.
 //
-// Measured answer: no. A condition that a cyclic "wanted" fails to match —
-// the ordinary outcome for a batch condition, and this one is built to fail
-// on purpose — makes satisfies (batch.go) format that value into its error
-// with fmt.Errorf("%w: ... %v ...", ..., wanted). fmt's own printer has no
-// cycle protection for a slice holding itself through a bare interface, so
-// it recurses the identical shape sameValue would have and dies the
-// identical way: fatal error: stack overflow, from inside fmt, several
-// frames away from sameValue, which by then has already returned. This is
-// reachable by any direct Go caller of the exported Invoke — not a test
-// calling an unexported function, and not through this repo's own front
-// doors (cli/shell.go and server.go both decode every value they hand to
-// Invoke with json.Unmarshal first, which cannot build a cycle) — but
-// through code embedding this store as a library and calling Invoke with a
-// hand-built argument. Run as a child process for the same reason as the
-// test above: this is fatal, not a panic, and would take go test down with
-// it if run inline.
-func TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue(t *testing.T) {
+// This still runs as a child process, on purpose, even though the crash it
+// used to prove is now the very thing it is proving does NOT happen: if
+// task 0049's fix ever regresses (see task 0049 §8's D10, the mutation this
+// test exists to kill three different ways at the exact call sites in
+// batch.go), the failure mode is the fatal stack overflow this test used to
+// expect — and a fatal error inline would take the whole `go test` binary
+// down with it, package-wide, rather than reporting one red test. Isolating
+// it here means a regression comes back as a clean, readable test failure
+// instead of a crashed test run.
+func TestArgDoorCyclicValueNoLongerCrashesThroughSatisfiesItReturnsErrCondition(t *testing.T) {
 	if os.Getenv("SAPEDB_ARGDOOR_CYCLE_CHILD") == "1" {
 		debug.SetMaxStack(16 << 20)
 		defer func() {
 			if r := recover(); r != nil {
-				os.Stdout.WriteString("RECOVERED\n")
+				os.Stdout.WriteString("RECOVERED: " + fmt.Sprint(r) + "\n")
 				os.Exit(3)
 			}
 		}()
@@ -210,16 +213,26 @@ func TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue(t *test
 
 		// The condition cannot match: a cyclic value is never the array
 		// stored on the document, so satisfies is guaranteed to reach its
-		// error-formatting line, not the success path.
-		_, _ = s.Invoke(Caller{}, "widgets.check", 0, map[string]any{
+		// error-formatting line, not the success path — the same setup
+		// 0042 used to reach the crash, unchanged, so this measures the
+		// same door with nothing else different.
+		_, invokeErr := s.Invoke(Caller{}, "widgets.check", 0, map[string]any{
 			"id": "w1", "t": buildCycle(),
 		})
-		os.Stdout.WriteString("RETURNED\n")
-		os.Exit(4)
+		if invokeErr == nil {
+			os.Stdout.WriteString("RETURNED NIL ERROR\n")
+			os.Exit(4)
+		}
+		if !errors.Is(invokeErr, ErrCondition) {
+			os.Stdout.WriteString("RETURNED WRONG ERROR: " + invokeErr.Error() + "\n")
+			os.Exit(4)
+		}
+		os.Stdout.WriteString("RETURNED ErrCondition: " + invokeErr.Error() + "\n")
+		os.Exit(0)
 	}
 
 	cmd := exec.Command(os.Args[0],
-		"-test.run=^TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue$",
+		"-test.run=^TestArgDoorCyclicValueNoLongerCrashesThroughSatisfiesItReturnsErrCondition$",
 		"-test.timeout=60s")
 	cmd.Env = append(os.Environ(), "SAPEDB_ARGDOOR_CYCLE_CHILD=1")
 	out, err := cmd.CombinedOutput()
@@ -228,17 +241,26 @@ func TestArgDoorCyclicValueCrashesThroughSatisfiesFormattingNotSameValue(t *test
 	if strings.Contains(text, "SETUP FAILED") {
 		t.Fatalf("child setup failed before the measurement even started:\n%s", text)
 	}
-	if err == nil {
-		t.Fatalf("the child returned from Invoke normally; a cyclic argument through door two is supposed to crash it via satisfies' error formatting\n%s", text)
+	if strings.Contains(text, "fatal error:") {
+		t.Fatalf("the child died of a fatal error — describe() was supposed to keep satisfies' formatting from recursing on a self-referential argument:\n%s", text)
 	}
 	if strings.Contains(text, "RECOVERED") {
-		t.Fatalf("recover() caught it — this crash is supposed to be as uncatchable as sameValue's own\n%s", text)
+		t.Fatalf("the child panicked and recovered; it is supposed to return an ordinary error, not panic at all:\n%s", text)
 	}
-	if !strings.Contains(text, "fatal error:") || !strings.Contains(text, "stack overflow") {
-		t.Fatalf("the child died, but not of a fatal stack overflow:\n%s", text)
+	if err != nil {
+		t.Fatalf("the child process exited with an error: %v\n%s", err, text)
 	}
-	if !strings.Contains(text, "store.satisfies") {
-		t.Fatalf("the child died of a stack overflow, but not inside satisfies — this test would then be measuring the wrong mechanism:\n%s", text)
+	if !strings.Contains(text, "RETURNED ErrCondition") {
+		t.Fatalf("the child did not report returning ErrCondition:\n%s", text)
+	}
+	// The process is alive and the error carries its identity (errors.Is,
+	// checked inside the child, above) — not a bare string a %v-wrapped
+	// door would have produced. See the handshake()/%w-vs-%v note in task
+	// 0049's own brief: a wrapped error that drops its identity is the
+	// specific shape this test also guards against, one level up from the
+	// crash task 0042 found.
+	if !strings.Contains(text, "sapedb/store: the document is not in the state this operation requires") {
+		t.Fatalf("the returned error's text does not look like ErrCondition's own message:\n%s", text)
 	}
 }
 

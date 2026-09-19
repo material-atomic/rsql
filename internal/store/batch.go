@@ -203,12 +203,34 @@ func satisfies(document map[string]any, conditions []Condition, values map[strin
 			return err
 		}
 		if !present {
-			return fmt.Errorf("%w: %v in %q has no %q, and it must be %v",
-				ErrCondition, key, collection, condition.Path, wanted)
+			// wanted goes through describe, not a bare %v: it is resolved
+			// from condition.Equals by resolveIn with no encoding step in
+			// between (see describe.go and the godoc on sameValue below),
+			// so a direct Go caller of Invoke can hand it a self-
+			// referential []any or map[string]any and this is the line
+			// that would otherwise recurse fmt's own printer to a fatal
+			// stack overflow. key does not go through describe: it has
+			// already been round-tripped through collection.Get above,
+			// which refuses anything that is not the collection's
+			// declared primary-key type (string or number — spec.go
+			// refuses TypeAny as a key type at Declare time), so key can
+			// never be a []any or a map[string]any here at all, cyclic or
+			// not. See the %v sweep table in task 0049's Kết quả for the
+			// rest of this function's %v call sites and why each one is
+			// safe or is not.
+			return fmt.Errorf("%w: %v in %q has no %q, and it must be %s",
+				ErrCondition, key, collection, condition.Path, describe(wanted))
 		}
 		if !sameValue(value, wanted) {
-			return fmt.Errorf("%w: %v in %q has %q of %v, and it must be %v",
-				ErrCondition, key, collection, condition.Path, value, wanted)
+			// value is a document field, so on its own it can never be
+			// cyclic (Put marshals to JSON before writing, and
+			// json.Marshal refuses a cycle instead of hanging — see
+			// sameValue's own godoc) — but it can still be arbitrarily
+			// deep or wide within whatever a stored document allows, and
+			// describe's other job, the 512-byte and depth/count
+			// ceilings, applies to it exactly as it does to wanted.
+			return fmt.Errorf("%w: %v in %q has %q of %s, and it must be %s",
+				ErrCondition, key, collection, condition.Path, describe(value), describe(wanted))
 		}
 	}
 	return nil
@@ -279,8 +301,8 @@ func satisfies(document map[string]any, conditions []Condition, values map[strin
 // the value into its error with fmt.Errorf("%v", ...), and fmt's printer has
 // no cycle protection for a slice or map holding itself through a bare
 // interface. It recurses the identical shape sameValue would have and dies
-// the identical way. So the door this change leaves open is not sameValue's
-// own recursion; it is the error message one frame above it, and it is
+// the identical way. So the door this change (0042) left open was not
+// sameValue's own recursion; it was the error message one frame above it,
 // reachable by any direct Go caller of Invoke, not only by a test — this
 // repo's own front doors do not reach it (cli/shell.go decodes every typed
 // word with json.Unmarshal before it ever becomes a Term or an argument, and
@@ -293,18 +315,31 @@ func satisfies(document map[string]any, conditions []Condition, values map[strin
 // overflow` — a fatal error, not a panic, which no recover() anywhere can
 // catch, including one sitting at a connection's boundary. reflect.DeepEqual
 // would close the sameValue half of this (it tracks visited pairs and
-// terminates); it would not touch the satisfies/fmt.Errorf half at all,
-// because that crash never reaches sameValue. So this fix trades one
+// terminates); it would not have touched the satisfies/fmt.Errorf half at
+// all, because that crash never reaches sameValue. So 0042's fix traded one
 // difference that only shows up through the direct Go API (1 and 1.0
 // disagreeing one level down, the reason this function walks at all) for a
 // cost of its own making (the recursion above) sitting next to a second cost
-// that was already there before this fix touched anything and is not this
-// fix's to close (the error path's unguarded %v). Going back to DeepEqual
-// would not buy that second one back — it has its own numeric mistake, and
-// it never runs the code that has the %v problem either. Both costs are
-// written down here, next to each other, because whoever reads this godoc
-// asking "can a cycle reach here" deserves the sharper answer, not the one
-// that stops at the function whose name is in the question.
+// that was already there before that fix touched anything and was not that
+// fix's to close: the error path's unguarded %v. Going back to DeepEqual
+// would not have bought that second one back — it has its own numeric
+// mistake, and it never ran the code that had the %v problem either.
+//
+// Task 0049 is what closes that second cost: satisfies (below) now formats
+// "wanted" and a mismatched "value" through describe (describe.go), which
+// walks the exact same []any / map[string]any shapes this function does,
+// with a depth and element-count ceiling that makes the walk return an
+// answer even when the value holds itself — so a self-referential argument
+// through door two now reaches an ordinary ErrCondition, not a second fatal
+// stack overflow. describe does not change what sameValue itself can and
+// cannot survive (this godoc's account of that, above, is unchanged and the
+// tests measuring it — cycle_test.go — still measure exactly that), only
+// what the one call site above it that used to crash on the same shape does
+// instead. Both costs are still written down here, next to each other,
+// because whoever reads this godoc asking "can a cycle reach here" deserves
+// the sharper answer, not the one that stops at the function whose name is
+// in the question — and because the fix for one was never, on its own, the
+// fix for both.
 func sameValue(left, right any) bool {
 	if matches(TypeNumber, left) && matches(TypeNumber, right) && left != nil && right != nil {
 		return asNumber(left) == asNumber(right)

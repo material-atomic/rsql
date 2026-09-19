@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,12 @@ func (s *Server) Serve(listener net.Listener) error {
 		}
 		go func() {
 			defer conn.Close()
+			// Registered after conn.Close, which means it runs BEFORE it —
+			// defers unwind last-registered-first — so guard still has a
+			// live socket to write a Failure frame to if this connection's
+			// goroutine panics. See guard's own godoc for what it does and
+			// does not buy.
+			defer guard(conn, s.options.Notice)
 			// Handle already told the client why, over the wire, when it can —
 			// a Failure frame for a handshake that failed. But the client was
 			// the one asking; the operator running sapedbd was not in that
@@ -156,6 +163,118 @@ func (s *Server) Serve(listener net.Listener) error {
 			}
 		}()
 	}
+}
+
+// guard is what a connection's goroutine defers instead of a bare recover().
+//
+// It does NOT let the connection, or the process, keep running. Task 0049
+// measured why a recover-and-keep-serving guard would be actively worse
+// than today's crash, not just no better: runBatch (batch.go) calls
+// s.Rollback() only on its error path, not with its own defer, so a panic
+// partway through it skips that call and leaves s.pages.Pending() true —
+// and runBatch's own first line refuses to run anything else on a database
+// with Pending() true, forever, for every caller, until the process
+// restarts. A server that survives a panic by recovering and serving on
+// would answer every write after that on this database with ErrUncommitted
+// for as long as it stayed up: a wrong answer that outlives the panic that
+// caused it. Dying is the safe path already available — storage here
+// tolerates power loss (two meta pages, an ordered write sequence) and
+// sayHowItWasLeft reports exactly that shape of shutdown the next time the
+// file opens — so this does not try to invent a safer one.
+//
+// It is also not an answer to task 0049's other half: satisfies (batch.go)
+// used to be able to end a goroutine with `fatal error: stack overflow`,
+// not a panic, over a self-referential argument through the exported
+// Invoke. No recover() anywhere — this one included — catches a fatal
+// error; that half is closed by describe (describe.go) making the format
+// call return instead of recursing forever, not by anything here. A guard
+// at this boundary and a bounded formatter one layer down are two
+// different fixes for two different ways a goroutine could stop, and one
+// does not stand in for the other.
+//
+// And it only covers the ONE goroutine it is deferred in — Serve's
+// per-connection goroutine, above. recover() only ever catches a panic
+// unwinding through its own goroutine's own defer stack; it cannot reach
+// into another one. This is not this connection's only goroutine: follow
+// (subscribe.go) starts a second one per live subscription with
+// `go s.stream(...)`, and stream has no recover of its own. A panic inside
+// stream today crashes the whole process exactly as if this file did not
+// exist — measured in TestGuardInOneGoroutineDoesNotProtectAPanicInAnother
+// Goroutine (server_test.go), which is the general case (any two
+// goroutines, not stream specifically) because reaching an actual panic
+// inside stream would need a separate task's worth of fault injection.
+// Giving stream its own guard is future work this task does not do: mục 5
+// keeps this task's touch to guard and Serve.
+//
+// What it actually buys, measured against having nothing here at all: a
+// client gets a Failure frame instead of a socket that just closes (0048
+// taught the client driver to read ID 0 as a reason at teardown; before
+// that, this would have been silent to the client too), and the operator
+// gets a line naming the remote address, the panic value, and a stack —
+// where before this there was nothing at all, on any of the panics
+// task 0042 already knew this goroutine could throw.
+//
+// What is NOT reused after this runs: nothing. The three steps below run
+// against the state as it stood at the moment of the panic — a
+// best-effort write on a connection that may itself be half torn, a log
+// line, nothing more — and then the same panic value goes back out
+// unrecovered, which is what makes "nothing is reused" true rather than
+// asserted: there is no further code path here that touches s, conn, or
+// anything derived from either afterwards.
+func guard(conn net.Conn, notice func(string)) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	// The panic value keeps its own identity when it already was an error:
+	// handing the very same error to failure() (and, through it, codeFor)
+	// preserves whatever errors.Is chain it already carried, exactly the
+	// property task 0049's brief warned this file not to lose a second
+	// time. handshake() (this same package) wraps signing.ErrBadSignature
+	// with fmt.Errorf("%w: %v", ErrHandshake, err) — %v, not %w, on the
+	// inner error — and that single wrong verb is why codeFor reports a
+	// signature failure as "handshake" instead of "signature" (logged as
+	// a debt, not fixed here: mục 5 of this task keeps codeFor and
+	// handshake() out of scope). This file does not repeat that shape: a
+	// panic value that is already an error is passed through as-is, not
+	// re-wrapped with %v or %w. A panic value that was never an error —
+	// the ordinary case, a string from a bare `panic("...")` or a runtime
+	// error like an index out of range — has no identity to lose, and
+	// %v is the plain, correct way to turn it into one. codeFor does not
+	// gain a new code for this: whatever it already returns (usually
+	// "failed", the word for "this build does not have a nearer answer"),
+	// unless the panic value happened to already be one of its known
+	// sentinels, is left alone. See mục 5 of task 0049 for why that line
+	// is not to be touched here.
+	var err error
+	if asErr, ok := recovered.(error); ok {
+		err = asErr
+	} else {
+		err = fmt.Errorf("%v", recovered)
+	}
+
+	// 1) Tell the client something, on this same connection, best-effort.
+	// A write that fails here (the connection may already be the reason
+	// this panicked) is not itself a second failure worth reporting —
+	// there is already a panic in flight, and conn.Close (deferred before
+	// this in Serve) still runs after this returns either way.
+	_ = (&sender{conn: conn}).send(protocol.Frame{Type: protocol.Failure, ID: 0}, failure(err))
+
+	// 2) Tell the operator: address, the panic value itself (not just
+	// err.Error() — a recovered runtime error's %v and its Error() text
+	// agree, but this is written to read like what it is, a panic, not
+	// an ordinary failed connection), and where it happened.
+	if notice != nil {
+		notice(fmt.Sprintf("a connection from %s panicked: %v\n%s", conn.RemoteAddr(), recovered, debug.Stack()))
+	}
+
+	// 3) Die. The exact recovered value, not err — a caller of recover()
+	// downstream of this (there is none in this build, but the next
+	// reader of this function should not have to check) must see the
+	// original panic, not a value this function reshaped on the way
+	// through.
+	panic(recovered)
 }
 
 // notice reports a connection that ended in error, one line per connection.

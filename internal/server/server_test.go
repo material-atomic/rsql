@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1258,5 +1259,224 @@ func TestAFailureAfterAGoodHandshakeAlsoGetsOneLine(t *testing.T) {
 				t.Errorf("the line does not name the real reason: %q", lines[0])
 			}
 		})
+	}
+}
+
+// The three tests below call guard directly, not through a running server —
+// task 0049 §6 asks for exactly that ("gọi thẳng guard chứ không qua một
+// tiến trình thật"), since a guard that actually finished dying would end
+// the test binary along with it. net.Pipe gives two connected, unbuffered
+// net.Conn ends without opening a real socket: guard writes to one end from
+// inside the panicking goroutine below, and a reader goroutine on the other
+// end is what makes that write able to complete at all — net.Pipe has no
+// buffer, so a guard test using it without a concurrent reader would
+// deadlock on the very Failure frame it is trying to prove gets sent.
+
+// TestGuardSendsANoticeLineAFailureFrameAndPanicsAgainWithTheOriginalValue
+// is task 0049 §6's three guard assertions in one test, because they are one
+// call: a Notice line naming the address, the panic value, and a stack; a
+// Failure frame, ID 0, written to the connection; and a re-panic the test's
+// own recover() can see carries the exact original value, not a wrapper.
+func TestGuardSendsANoticeLineAFailureFrameAndPanicsAgainWithTheOriginalValue(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	defer serverEnd.Close()
+	defer clientEnd.Close()
+
+	type read struct {
+		frame protocol.Frame
+		err   error
+	}
+	frames := make(chan read, 1)
+	go func() {
+		frame, err := protocol.NewReader(clientEnd).Read()
+		frames <- read{frame, err}
+	}()
+
+	said := &notices{}
+	const panicValue = "boom-0049-guard"
+
+	func() {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Fatal("guard did not panic again — a recovered panic here must not let the connection's goroutine carry on")
+			}
+			// The exact value, via ==, not just a string that happens to
+			// read the same: guard is not allowed to have rebuilt it
+			// (with fmt.Errorf or otherwise) on the way back out.
+			if recovered != panicValue {
+				t.Fatalf("guard re-panicked with %#v (%T), want the untouched original %#v (%T)",
+					recovered, recovered, panicValue, panicValue)
+			}
+		}()
+		defer guard(serverEnd, said.record)
+		panic(panicValue)
+	}()
+
+	select {
+	case got := <-frames:
+		if got.err != nil {
+			t.Fatalf("reading the frame guard was supposed to send: %v", got.err)
+		}
+		if got.frame.Type != protocol.Failure {
+			t.Fatalf("frame type = %v, want Failure", got.frame.Type)
+		}
+		if got.frame.ID != 0 {
+			t.Fatalf("frame ID = %d, want 0 — this is not an answer to any particular request", got.frame.ID)
+		}
+		if !strings.Contains(string(got.frame.Payload), panicValue) {
+			t.Fatalf("failure payload %s does not mention the panic value", got.frame.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no frame arrived on the connection within 2s — guard's write may be blocked or missing")
+	}
+
+	lines := said.all()
+	if len(lines) != 1 {
+		t.Fatalf("got %d notice lines, want exactly 1: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], panicValue) {
+		t.Fatalf("notice line does not carry the panic value: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], serverEnd.RemoteAddr().String()) {
+		t.Fatalf("notice line does not carry the connection's remote address: %q", lines[0])
+	}
+	// debug.Stack() output always starts with "goroutine N [running/...]:" —
+	// this is what stands in for "and there is a stack" without pinning the
+	// test to any particular frame appearing in it, which would make it
+	// break on every unrelated refactor of guard's own call depth.
+	if !strings.Contains(lines[0], "goroutine ") {
+		t.Fatalf("notice line does not look like it carries a stack: %q", lines[0])
+	}
+}
+
+// TestGuardOnAnErrorPanicPreservesItsErrorsIsIdentity is the other half of
+// mục 6's third assertion: when the panic value already IS an error, guard
+// must not have re-wrapped it with %v (or anything else) on the way to
+// failure() — this is the exact shape task 0049's brief warned against,
+// citing handshake()'s fmt.Errorf("%w: %v", ErrHandshake, err) dropping
+// signing.ErrBadSignature out of errors.Is. Measured here the same way that
+// bug would be measured: build a payload from an error carrying a sentinel,
+// and check errors.Is still finds it after the payload comes back through
+// codeFor.
+func TestGuardOnAnErrorPanicPreservesItsErrorsIsIdentity(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	defer serverEnd.Close()
+	defer clientEnd.Close()
+
+	type read struct {
+		frame protocol.Frame
+		err   error
+	}
+	frames := make(chan read, 1)
+	go func() {
+		frame, err := protocol.NewReader(clientEnd).Read()
+		frames <- read{frame, err}
+	}()
+
+	panicErr := fmt.Errorf("sapedb/server: guard test wrapper: %w", store.ErrCondition)
+
+	func() {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Fatal("guard did not panic again")
+			}
+			asErr, ok := recovered.(error)
+			if !ok {
+				t.Fatalf("guard re-panicked with a %T, want the original error", recovered)
+			}
+			if !errors.Is(asErr, store.ErrCondition) {
+				t.Fatalf("the re-panicked error lost its errors.Is chain to store.ErrCondition: %v", asErr)
+			}
+		}()
+		defer guard(serverEnd, nil)
+		panic(panicErr)
+	}()
+
+	select {
+	case got := <-frames:
+		if got.err != nil {
+			t.Fatalf("reading the frame: %v", got.err)
+		}
+		var body struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		}
+		if err := json.Unmarshal(got.frame.Payload, &body); err != nil {
+			t.Fatalf("failure payload does not read as JSON: %v\n%s", err, got.frame.Payload)
+		}
+		// codeFor is explicitly not touched by this task (mục 5) and a
+		// panic gets no code of its own — but codeFor's own errors.Is
+		// loop runs against whatever error guard hands it, and
+		// store.ErrCondition IS one of its known sentinels. If guard had
+		// flattened the panic value with fmt.Errorf("%v", ...) before
+		// this point, that chain would already be gone and this would
+		// read "failed" instead.
+		if body.Code != "condition" {
+			t.Fatalf("failure code = %q, want %q — guard must have wrapped the panic error with %%v somewhere and lost the errors.Is chain to it", body.Code, "condition")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no frame arrived on the connection within 2s")
+	}
+}
+
+// TestGuardInOneGoroutineDoesNotProtectAPanicInAnotherGoroutine measures,
+// rather than asserts, the first limit task 0049's brief asked to see
+// written down "ngay cạnh code, đừng để một câu 'never' trần" instead of
+// argued about: recover() only ever catches a panic unwinding through its
+// OWN goroutine's defer stack. guard is deferred once, in Serve's
+// per-connection goroutine — but Handle can start a second goroutine off
+// that same connection for a live subscription (subscribe.go's
+// `go s.stream(...)`, called from follow), and stream has no recover of
+// its own. A panic inside stream is not a hypothetical: it is a goroutine
+// this exact codebase spawns, sitting one guard away from looking covered
+// and not being covered at all.
+//
+// This runs as a child process because the whole point is an unrecovered
+// panic in a goroutine — which crashes the entire program, guard or not,
+// exactly the way it would in production. The parent only checks that the
+// child died of that panic, not of anything guard-shaped.
+func TestGuardInOneGoroutineDoesNotProtectAPanicInAnotherGoroutine(t *testing.T) {
+	if os.Getenv("SAPEDB_CROSS_GOROUTINE_CHILD") == "1" {
+		serverEnd, _ := net.Pipe()
+		defer serverEnd.Close()
+
+		// Goroutine A: has guard deferred, exactly like a connection's own
+		// goroutine in Serve. It never panics itself — it just waits, the
+		// way a healthy connection serving frames would.
+		waitForever := make(chan struct{})
+		go func() {
+			defer guard(serverEnd, func(string) {})
+			<-waitForever
+		}()
+
+		// Goroutine B: no recover anywhere in its stack, standing in for
+		// stream() (subscribe.go) or any other goroutine a connection
+		// spawns off to the side of the one guard actually watches.
+		go func() {
+			panic("panic in a sibling goroutine, not the one guard is deferred in")
+		}()
+
+		time.Sleep(2 * time.Second) // give B's panic time to bring the process down
+		os.Stdout.WriteString("STILL ALIVE\n")
+		os.Exit(0)
+	}
+
+	cmd := exec.Command(os.Args[0],
+		"-test.run=^TestGuardInOneGoroutineDoesNotProtectAPanicInAnotherGoroutine$",
+		"-test.timeout=30s")
+	cmd.Env = append(os.Environ(), "SAPEDB_CROSS_GOROUTINE_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	text := string(out)
+
+	if strings.Contains(text, "STILL ALIVE") {
+		t.Fatalf("the process survived a panic in an unguarded sibling goroutine — that would mean recover() somehow reached across goroutines, which Go's own spec says it cannot:\n%s", text)
+	}
+	if err == nil {
+		t.Fatalf("the child exited cleanly; an unrecovered panic in goroutine B is supposed to crash the whole process\n%s", text)
+	}
+	if !strings.Contains(text, "panic: panic in a sibling goroutine") {
+		t.Fatalf("the child died, but not of the panic this test raised in goroutine B:\n%s", text)
 	}
 }
