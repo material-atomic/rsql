@@ -68,6 +68,48 @@ type Hit struct {
 // patrol cannot decode as text (there are none in either repo today) is
 // skipped rather than failing the walk, because a patrol that cannot finish
 // is a patrol nobody can trust the silence of.
+//
+// What Walk does NOT bound, and why naming_test.go cannot tell the
+// difference: Walk has no file-size cap, no file-count cap, and no rule
+// that skips a file by its name prefix. None of the fixtures in
+// naming_test.go plant enough files, or a big enough file, to reach any of
+// those, so the test suite cannot distinguish a version of Walk carrying
+// such a cap from one without one.
+//
+// Three mutants measured against this suite and still alive, left
+// unaddressed on purpose: round 4 of task 0038 closed most of the "widen
+// the edge and it survives" class of mutant; these three are where that
+// chase was deliberately stopped (task 0051 keeps that call, it does not
+// reopen it):
+//
+//   - a file-size cutoff at 64KB here, 100KB on the TypeScript sibling
+//   - a cap that stops the walk after 85 files
+//   - a rule that skips any file whose name starts with "#"
+//
+// Where this repo's tree stands today, measured with the same exclusions as
+// skipDirs above:
+//
+//	find . \( -name .git -o -name node_modules -o -name dist \) -prune \
+//	  -o -type f -print0 | xargs -0 stat -f "%z %N" | sort -rn | head
+//	find . \( -name .git -o -name node_modules -o -name dist \) -prune \
+//	  -o -type f -print | wc -l
+//
+// The largest file is internal/server/server_test.go at 53563 bytes — well
+// under the 64KB mark, so that mutant is silent because nothing in this
+// tree is close to it. But the total file count is 110, already PAST the
+// 85-file mark. The premise "the tree isn't big enough to reach it" holds
+// for size, but does NOT hold for file count on this side: if a
+// stop-after-85-files cap were really present in Walk today, it would
+// already be cutting the tail off this tree — whatever filepath.WalkDir
+// visits last — with nobody told. No file in this tree starts with "#".
+// So two of the three edges are a boundary the tree happens to sit inside;
+// the file-count edge is one the tree has already crossed, and only the
+// absence of that cap from the actual code is what keeps this quiet.
+//
+// Sign that this has been hit: a file crossing 64KB, or the patrol's
+// silence narrowing further as the tree keeps growing past 85 files — some
+// file it used to scan quietly stops being scanned — with nothing telling
+// anyone that happened.
 func Walk(root string) ([]Hit, error) {
 	var hits []Hit
 
