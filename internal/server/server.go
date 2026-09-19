@@ -714,12 +714,46 @@ func (s *Server) database(account, name string) (*database, error) {
 		return db, nil
 	}
 
+	// checkOldExtension before MkdirAll, on purpose: os.Stat needs no
+	// directory to exist, so a connection refused here leaves no account
+	// folder behind. Task 0050 is this reordering — before it, a rejected
+	// connection to a database with an old-extension file still created
+	// filepath.Join(s.options.Dir, account), because MkdirAll ran first.
+	// handshake's own promise applies here too: "A name nobody signed for
+	// must not so much as cause a file to appear" — this is the same rule
+	// for a name that did sign correctly but points at a file this version
+	// will not open silently.
+	//
+	// Measured, not assumed: a hand-built mutant that puts os.MkdirAll back
+	// ahead of checkOldExtension here (the exact pre-0050 order) leaves the
+	// same tree behind either way, on the one repro this package can build —
+	// ca6 needs the old-extension file to already be sitting inside
+	// `folder`, which forces `folder` to already exist, so neither order
+	// creates anything new on disk. dbname.Check rejects a '/' or an
+	// over-length name before account or name ever reach this function, so
+	// unlike the CLI side (see TestARefusalOnTheLockedDirectoryLeavesNoAccountFolder
+	// in internal/cli) there is no way for a REFUSAL here to happen while
+	// `folder` does not yet exist — os.MkdirAll(folder) below is the one
+	// thing that creates it, and every first connection to a brand-new
+	// account reaches that line with `folder` genuinely absent, but that is
+	// the success path, not a refusal. This server also has no per-call
+	// directory-lock refusal for that CLI test's boundary to mirror, since
+	// vfs.LockDir on s.options.Dir runs once, at New(), for the server's
+	// whole life.
+	//
+	// That does not make the two orders equivalent: point `folder` at a
+	// path already occupied by a plain file instead of a directory, and
+	// they fail with different, client-visible error text — checkOldExtension's
+	// own os.Stat("not a directory") first, versus os.MkdirAll's own
+	// ("mkdir ...: not a directory") first — even though neither order
+	// changes anything on disk either. No test in this package pins that
+	// difference down yet.
 	folder := filepath.Join(s.options.Dir, account)
-	if err := os.MkdirAll(folder, 0o700); err != nil {
-		return nil, err
-	}
 	path := filepath.Join(folder, name+".sapedb")
 	if err := checkOldExtension(path); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(folder, 0o700); err != nil {
 		return nil, err
 	}
 

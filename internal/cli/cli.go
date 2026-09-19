@@ -373,7 +373,40 @@ func oldPathHint(opts options, refusal error) error {
 
 // open opens the database file, taking its lock.
 func open(opts options) (*store.Store, func(), error) {
-	// The directory first: a server holds this for its whole life, so being
+	// checkOldExtension first, and before anything that touches disk:
+	// os.Stat needs no lock and creates nothing, so a name refused here
+	// leaves SAPEDB_DIR exactly as it found it — no .lock, no account
+	// folder. Task 0038 found both of those left behind by a refusal that
+	// used to happen after LockDir and MkdirAll had already run; task 0050
+	// is this reordering. A side effect worth naming: when the server
+	// already holds the directory lock and the file also carries the old
+	// extension, this now answers with the mv hint instead of "the server
+	// is probably running" — both are true, but the mv hint is the one
+	// action that is actually blocking, and doing it makes the other
+	// message appear on the next attempt.
+	//
+	// checkOldExtension is placed ahead of BOTH os.MkdirAll and vfs.LockDir
+	// below, not just ahead of LockDir — and that first half matters on its
+	// own, separately from the old-extension case this function is named
+	// after. TestARefusalOnTheLockedDirectoryLeavesNoAccountFolder is the
+	// case that pins it: a directory-lock refusal (nothing wrong with the
+	// file at all, somebody else just holds the lock) must not create the
+	// account folder either, and it will if os.MkdirAll runs before this
+	// check — MkdirAll does not know or care whether the file it is making
+	// room for is old, missing, or fine; it creates the folder the moment
+	// it runs, refusal or not. An earlier version of this comment argued
+	// that ordering could never be observed because an old-extension file
+	// can only be found once its folder already exists, making MkdirAll a
+	// no-op either way — true for THAT specific repro, but that argument
+	// quietly assumed the only way into this refusal path was through an
+	// old-extension file. It is not: a bare locked-directory refusal, with
+	// no file of any kind on disk yet, goes through the exact same lines.
+	path := dbPath(opts)
+	if err := checkOldExtension(path); err != nil {
+		return nil, nil, err
+	}
+
+	// The directory next: a server holds this for its whole life, so being
 	// refused here is the answer to "is the server running", rather than a
 	// guess that depends on which databases it happens to have opened.
 	held, err := vfs.LockDir(opts.dir)
@@ -384,13 +417,7 @@ func open(opts options) (*store.Store, func(), error) {
 		return nil, nil, err
 	}
 
-	path := dbPath(opts)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		held.Close()
-		return nil, nil, err
-	}
-
-	if err := checkOldExtension(path); err != nil {
 		held.Close()
 		return nil, nil, err
 	}

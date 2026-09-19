@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -635,6 +637,88 @@ func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
 	if _, statErr := os.Stat(want); statErr == nil {
 		t.Error("a new .sapedb file was created even though the command was refused")
 	}
+}
+
+// walkTree lists every path under root, file or directory, relative to
+// root and sorted. See internal/cli's copy of this helper for why a full
+// tree snapshot, not a stat on one path somebody thought of, is what task
+// 0050 asks a refused command's test to compare.
+func walkTree(t *testing.T, root string) []string {
+	t.Helper()
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// assertTreeUnchanged compares a snapshot taken before a call against the
+// tree now, and fails with both lists when they differ.
+func assertTreeUnchanged(t *testing.T, root string, before []string) {
+	t.Helper()
+	after := walkTree(t, root)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("a refused call changed %s\n  before: %v\n  after:  %v", root, before, after)
+	}
+}
+
+// TestABoundConnectionToAnOldExtensionFileDoesNotCreateTheAccountFolder is
+// the server-side twin of TestAnOldExtensionFileIsRefusedNotSilentlyReplaced
+// above, reached the way a real client reaches it — a signed handshake —
+// instead of the internal Store() call, because handshake's own comment
+// makes a promise about exactly this path: "The signature is checked
+// before anything is opened or created. A name nobody signed for must not
+// so much as cause a file to appear." That promise is about a signature
+// that fails to verify; this test is about one that verifies fine, for a
+// database whose only file happens to carry the old extension, and checks
+// database() gives it the same guarantee. Task 0050 moved checkOldExtension
+// ahead of os.MkdirAll in database() so a refusal here creates nothing
+// beyond what placing the old-extension file itself already required.
+func TestABoundConnectionToAnOldExtensionFileDoesNotCreateTheAccountFolder(t *testing.T) {
+	server, address := running(t, false)
+
+	old := filepath.Join(server.options.Dir, "acme", "main"+oldDBExt())
+	if err := os.MkdirAll(filepath.Dir(old), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, []byte("stand-in for a real database file; only its path matters here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	signature, err := server.Sign("acme", password, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := walkTree(t, server.options.Dir)
+
+	client := dial(t, address)
+	client.send(protocol.Hello, hello{Account: "acme", Password: password, DBName: "main", Signature: signature})
+
+	frame := client.read()
+	if frame.Type != protocol.Failure {
+		t.Fatalf("it let a bound connection open a database whose only file on disk carries the old extension: %s", frame.Payload)
+	}
+	if !strings.Contains(string(frame.Payload), "mv") {
+		t.Errorf("the refusal does not tell the operator to mv the file: %s", frame.Payload)
+	}
+
+	assertTreeUnchanged(t, server.options.Dir, before)
 }
 
 // A client whose frames arrive in the wrong order must be told that, not told

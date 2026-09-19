@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -410,6 +412,49 @@ func oldDBExt() string {
 	return "." + string([]byte{'r', 's', 'q', 'l'})
 }
 
+// walkTree lists every path under root, file or directory, relative to
+// root and sorted. Task 0050's whole point is that "a refused command
+// leaves nothing" has to be checked against the disk image, not against
+// the one path a person happened to think of — the old version of this
+// test stat'd exactly the .sapedb path and said nothing about the
+// directory lock file or the account folder that a rejected open() used
+// to leave behind on the way to that refusal.
+func walkTree(t *testing.T, root string) []string {
+	t.Helper()
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// assertTreeUnchanged compares a snapshot taken before running a command
+// against the tree now, and fails with both lists when they differ — so a
+// failure names exactly what appeared or disappeared, not just that
+// something did.
+func assertTreeUnchanged(t *testing.T, root string, before []string) {
+	t.Helper()
+	after := walkTree(t, root)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("a refused command changed %s\n  before: %v\n  after:  %v", root, before, after)
+	}
+}
+
 // TestAnOldExtensionFileIsRefusedNotSilentlyReplaced is the file-extension
 // counterpart to TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored, and
 // the reason it needs its own test rather than reusing that one's shape: a
@@ -419,7 +464,118 @@ func oldDBExt() string {
 // which is a database opening successfully, on the wrong file, holding no
 // data — the one variant of the old name in this whole rename that would
 // otherwise fail silently rather than being refused.
+//
+// Task 0050 widened the claim this test makes from "no new .sapedb file"
+// to "SAPEDB_DIR is unchanged, full stop": before that task, open() ran
+// vfs.LockDir and os.MkdirAll before checkOldExtension, so a refusal here
+// still left <dir>/.lock behind (see the sibling tests below for that,
+// and for the account-folder half of the same claim on a fresh
+// directory). Both commands that reach open() on this path are exercised
+// — ls and apply — because a fix that only moved the check late enough to
+// satisfy ls would say nothing about apply.
 func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
+	for _, command := range []string{"ls", "apply"} {
+		t.Run(command, func(t *testing.T) {
+			setup := start(t)
+			if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			old := filepath.Join(setup.dir, "acme", "main"+oldDBExt())
+			if err := os.WriteFile(old, []byte("stand-in for a real database file; only its path matters here"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			before := walkTree(t, setup.dir)
+
+			_, errs, status := setup.run(command)
+			if status == 0 {
+				t.Fatal("it ran against a database whose only file on disk carries the old extension")
+			}
+
+			want := filepath.Join(setup.dir, "acme", "main.sapedb")
+			if !strings.Contains(errs, old) || !strings.Contains(errs, want) {
+				t.Errorf("the refusal does not name both paths: %q", errs)
+			}
+			if !strings.Contains(errs, "mv") {
+				t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+			}
+
+			assertTreeUnchanged(t, setup.dir, before)
+		})
+	}
+}
+
+// TestARefusedCommandDoesNotDeleteAnExistingLock guards against exactly the
+// "fix" task 0050 rules out in its own text: deleting .lock on the refusal
+// path to tidy up after a lock this call would otherwise have taken.
+// Section 2 of that task is explicit about why not — a lock file is not
+// this process's alone to delete once created, and racing whoever else
+// might open it next is worse than a harmless leftover. This test starts
+// from a directory that already has a .lock, the ordinary resting state
+// between two runs of any command that succeeds, and checks that a
+// refusal for an unrelated reason (the old-extension file) leaves it
+// exactly as it was.
+func TestARefusedCommandDoesNotDeleteAnExistingLock(t *testing.T) {
+	setup := start(t)
+	if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(setup.dir, "acme", "main"+oldDBExt())
+	if err := os.WriteFile(old, []byte("stand-in for a real database file; only its path matters here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Nobody holds this right now — an unlocked .lock file left over from a
+	// previous, successful run is the normal state of this design, not a
+	// sign that anything is wrong.
+	if err := os.WriteFile(filepath.Join(setup.dir, ".lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	before := walkTree(t, setup.dir)
+
+	_, errs, status := setup.run("ls")
+	if status == 0 {
+		t.Fatal("it ran against a database whose only file on disk carries the old extension")
+	}
+	if !strings.Contains(errs, "mv") {
+		t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+	}
+
+	assertTreeUnchanged(t, setup.dir, before)
+}
+
+// TestASuccessfulCommandStillTakesItsLock is the control case task 0050's
+// own text asks for: the rule is "a REFUSED command leaves nothing new",
+// not "nothing is ever created". A command that actually runs is supposed
+// to take the directory lock — held.Close() releases it but does not
+// remove the file — and it is supposed to create the account folder its
+// database lives under. Without this test, a change that made open()
+// never take the lock at all would make every refusal test above pass
+// for the wrong reason.
+func TestASuccessfulCommandStillTakesItsLock(t *testing.T) {
+	setup := start(t)
+
+	if _, errs, status := setup.run("ls"); status != 0 {
+		t.Fatal(errs)
+	}
+
+	if _, err := os.Stat(filepath.Join(setup.dir, ".lock")); err != nil {
+		t.Errorf(".lock did not appear after a command that ran successfully: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(setup.dir, "acme")); err != nil || !info.IsDir() {
+		t.Errorf("the account folder was not created for a command that ran successfully: %v", err)
+	}
+}
+
+// TestAnOldExtensionFileWinsOverALockedDirectory pins the design decision
+// in task 0050's Result section: when both are true — the server holds
+// this directory's lock, and the database's only file on disk carries the
+// old extension — the operator sees the mv hint, not "the server is
+// probably running". Before this task the order was reversed (LockDir ran
+// first), so this exact situation reported the wrong blocker: stopping
+// the server would not have made ls succeed, because the file itself was
+// still the one thing actually in the way.
+func TestAnOldExtensionFileWinsOverALockedDirectory(t *testing.T) {
 	setup := start(t)
 	if err := os.MkdirAll(filepath.Join(setup.dir, "acme"), 0o700); err != nil {
 		t.Fatal(err)
@@ -429,21 +585,71 @@ func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Somebody else — the server — holds the directory lock.
+	held, err := vfs.LockDir(setup.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
 	_, errs, status := setup.run("ls")
 	if status == 0 {
-		t.Fatal("it ran against a database whose only file on disk carries the old extension")
-	}
-
-	want := filepath.Join(setup.dir, "acme", "main.sapedb")
-	if !strings.Contains(errs, old) || !strings.Contains(errs, want) {
-		t.Errorf("the refusal does not name both paths: %q", errs)
+		t.Fatal("it ran while both the directory was locked and the file had the old extension")
 	}
 	if !strings.Contains(errs, "mv") {
 		t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
 	}
-	if _, err := os.Stat(want); err == nil {
-		t.Error("a new .sapedb file was created even though the command was refused")
+	if strings.Contains(errs, "probably running") {
+		t.Errorf("the refusal blames the server instead of the old-extension file: %q", errs)
 	}
+}
+
+// TestARefusalOnTheLockedDirectoryLeavesNoAccountFolder is the boundary QA
+// found on M2 (open(): os.MkdirAll moved ahead of checkOldExtension, both
+// still ahead of vfs.LockDir) that TestAnOldExtensionFileWinsOverALockedDirectory
+// above cannot reach. Dropping just the old-extension file and keeping that
+// case's own os.MkdirAll(".../acme") setup is not enough — Reviewer built
+// that exact half-step and it still survives, because the account folder is
+// then pre-created again and MkdirAll has nothing new to do. The axis that
+// actually carries this test is the account folder not existing YET: this
+// case drops both the old-extension file and the setup that pre-creates its
+// folder, so nothing has touched this directory besides the lock itself.
+// checkOldExtension finds nothing to refuse (neither the .sapedb path nor
+// its old-extension sibling exists), so the only thing that can refuse this
+// call is LockDir, and LockDir must be the ONLY thing that ran.
+//
+// M2 fails this: it runs os.MkdirAll(filepath.Dir(path)) before LockDir
+// ever gets a turn, so it creates <dir>/acme/ unconditionally on the way to
+// a refusal that has nothing to do with that folder. Every other test that
+// exercises the locked-directory path (TestAnOldExtensionFileWinsOverALockedDirectory,
+// TestTheToolIsRefusedWhileAServerHoldsTheDirectory) pre-creates the
+// account folder as part of placing a schema or an old-extension file, so
+// none of them can tell "the folder was already there" from "MkdirAll just
+// made it" — this one starts from a directory where the folder is
+// genuinely new, and compares the whole tree to say so.
+func TestARefusalOnTheLockedDirectoryLeavesNoAccountFolder(t *testing.T) {
+	setup := start(t)
+
+	// Somebody else — the server — holds the directory lock. Nothing else
+	// has touched this directory yet: no account folder, no old-extension
+	// file, nothing for checkOldExtension to object to.
+	held, err := vfs.LockDir(setup.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	before := walkTree(t, setup.dir)
+
+	_, errs, status := setup.run("ls")
+	if status == 0 {
+		t.Fatal("it ran while the directory was locked")
+	}
+	if !strings.Contains(errs, "probably running") {
+		t.Errorf("the refusal does not blame the server: %q", errs)
+	}
+
+	assertTreeUnchanged(t, setup.dir, before)
 }
 
 func TestACommandRunWhileTheServerHoldsTheFileIsRefused(t *testing.T) {
