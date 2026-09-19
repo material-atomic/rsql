@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/sapedb/sapedb/internal/connection"
+	"github.com/sapedb/sapedb/internal/server"
 	"github.com/sapedb/sapedb/internal/signing"
 	"github.com/sapedb/sapedb/internal/vfs"
 )
@@ -243,9 +245,18 @@ func TestDumpAndRestoreGoThroughTheCommand(t *testing.T) {
 	// And a dump cut short is refused rather than restored in part.
 	third := start(t)
 	half := dumped[:len(dumped)/2]
-	if _, _, status := third.runWith(nil, half, "restore"); status == 0 {
+	_, errs, status = third.runWith(nil, half, "restore")
+	if status == 0 {
 		t.Error("half a dump was restored")
 	}
+	// ErrDumpFormat's own wording (internal/store/dump.go), not this
+	// package's: a truncation landing mid-line — which cutting a real dump
+	// in half does, since it is not decoder.Decode aligned — reads as a
+	// JSON syntax error, and Restore wraps every one of those in
+	// ErrDumpFormat. This is the "vì gì" pin for the whole
+	// TestARejectedArgumentLeavesTheDiskExactlyAsItFound family's dump/
+	// restore sibling, which that table itself does not cover.
+	assertRefusedBecause(t, errs, pinnedPhrases["dump/half a dump"])
 }
 
 func TestTheLogCanBeRead(t *testing.T) {
@@ -276,9 +287,11 @@ func TestTheLogCanBeRead(t *testing.T) {
 	if strings.Count(strings.TrimSpace(from), "\n") >= strings.Count(strings.TrimSpace(out), "\n") {
 		t.Error("reading from entry 2 gave as much as reading from the start")
 	}
-	if _, _, status := setup.run("log", "soon"); status == 0 {
+	_, errs, status = setup.run("log", "soon")
+	if status == 0 {
 		t.Error("a log position that is not a number was accepted")
 	}
+	assertRefusedBecause(t, errs, pinnedPhrases["log/not a number"])
 }
 
 // The connection string has to be one the client library parses and the server
@@ -481,6 +494,148 @@ func assertTreeUnchanged(t *testing.T, root string, before []string) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Task 0061: a case that only asserts status != 0 cannot tell "hỏng vì gì"
+// (refused for the reason it claims to guard) from any of the package's
+// other ways to end up at exit 1 — a short password, empty stdin, a closed
+// port, ErrUsage's own catch-all. See house-rules.md's closing entry, "Khi
+// MỌI đường hỏng đều cho cùng một status, status không phân biệt được gì".
+//
+// refusalLine and assertRefusedBecause below are what every case added or
+// tightened for this task runs its "vì gì" assertion through.
+
+// refusalLine is the sentence a refusal leads with. Run (cli.go) prints the
+// whole usage constant — 1231 characters, 1233 bytes (len(usage) in Go
+// counts bytes; one em dash in it is 3 bytes) — after every ErrUsage, so an
+// assertion made against the FULL stderr is satisfied by any word that
+// appears in that block — "stdin", "password", "argument", and all seven
+// command names are in it, measured — no matter which command failed or
+// why. Cutting at the first line is what turns a Contains on this string
+// into a measurement instead of a tautology. TestWhatIsNotACommandIsExplained
+// is the one exception: it asserts on whether the usage block is printed
+// AT ALL, so it deliberately keeps reading the full, unstripped errs.
+func refusalLine(errs string) string {
+	line, _, _ := strings.Cut(errs, "\n")
+	return line
+}
+
+// pinnedPhrases is every phrase the refusal cases in this file assert a
+// command was refused BECAUSE of, written out by hand. It is not derived
+// from the messages it pins and not derived from usage: an expectation
+// taken from the thing being checked cannot fail. assertRefusedBecause uses
+// it for the other half of the pair — the negative check that catches one
+// command's refusal carrying another command's sentence, which every case
+// in this package passed for until this task.
+//
+// Two entries are shorter than the usual 16-character/3-word tripwire;
+// belowThreshold, just below, documents why each is still a safe
+// measurement rather than a coincidence.
+var pinnedPhrases = map[string]string{
+	"apply/no file":                   "apply needs a file",
+	"apply/missing file":              "no such file or directory",
+	"apply/directory as file":         "is a directory",
+	"apply/broken json":               "unexpected EOF",
+	"apply/unknown field":             `json: unknown field "unexpectedField"`,
+	"apply/conflicting redeclaration": `collection "articles": sapedb/store:`,
+	"log/not a number":                "is not an entry number",
+	"log/too many arguments":          "log takes at most one argument, FROM",
+	"ls/no arguments":                 "ls takes no arguments",
+	"dump/no arguments":               "dump takes no arguments",
+	"restore/no arguments":            "restore takes no arguments",
+	"dump/half a dump":                "this is not a dump this build can read",
+	"url/password as argument":        "never given as an argument",
+	"url/too many arguments":          "url takes at most a host and -",
+	"shell/bad option":                "shell takes host:port and optionally -insecure",
+}
+
+// belowThreshold documents every pinnedPhrases entry shorter than 16
+// characters or 3 words — the tripwire TestNoPinnedPhraseCanBeSatisfiedByTheUsageBlock
+// otherwise enforces — together with why it is still a safe measurement and
+// not a phrase picked for convenience. Both of these are the ENTIRE word
+// that distinguishes their case from its nearest neighbour; task 0061's own
+// text names both in advance, in section 3.3.
+var belowThreshold = map[string]string{
+	"apply/directory as file": `14 characters, 3 words. The whole distinguishing word between case 3 ` +
+		`(a directory) and case 2 (a missing file): os.ReadFile fails on a ` +
+		`directory in a way os.Stat does not, and "is a directory" is what the ` +
+		`OS (golang:1.24-alpine, per house rule) calls it.`,
+	"apply/broken json": `14 characters, 2 words — below both halves of the tripwire. The whole ` +
+		`distinguishing word between case 4 (broken JSON) and case 5 (an unknown ` +
+		`field): both are decode errors, and "unexpected EOF" is the only text ` +
+		`that says WHICH one this is.`,
+}
+
+// assertRefusedBecause pins WHY, not just THAT. The leading sentence has to
+// carry `because`, and must NOT carry any of the other pinned phrases — the
+// negative half is what catches a command printing another command's
+// sentence, which every test in this package passed for until task 0061.
+func assertRefusedBecause(t *testing.T, errs, because string) {
+	t.Helper()
+	line := refusalLine(errs)
+	if !strings.Contains(line, because) {
+		t.Errorf("the refusal's first line does not say %q: %q", because, line)
+	}
+	for name, phrase := range pinnedPhrases {
+		if phrase == because {
+			continue
+		}
+		// This ONE pair, and only this pair, is excluded from the NEGATIVE
+		// half — measured, not assumed (Reviewer 0058/0061 re-derived the
+		// same finding independently): "unexpected EOF" (apply/broken
+		// json) is io.ErrUnexpectedEOF's own text, and restore's
+		// ErrDumpFormat wraps that exact same stdlib sentinel for a dump
+		// truncated mid-line — "sapedb/store: this is not a dump this
+		// build can read: unexpected EOF" legitimately contains it, with
+		// no R2/R3-style bug involved (checkApply is nowhere on that
+		// path). An earlier version of this exclusion skipped the cross
+		// check for BOTH belowThreshold entries ("apply/directory as
+		// file" too), which is wider than the collision it was written to
+		// fix: only this one pair actually collides (measured — a
+		// deliberately swapped message reusing "is a directory" alongside
+		// its real sentence still gets caught), and the broad version
+		// left two real swaps undetected. Narrowed to exactly the pair
+		// that collides; belowThreshold's POSITIVE use (proving each
+		// entry's own case) is unaffected either way.
+		if name == "apply/broken json" && because == pinnedPhrases["dump/half a dump"] {
+			continue
+		}
+		if strings.Contains(line, phrase) {
+			t.Errorf("the refusal pinned as %q also carries %s's phrase (%q): %q", because, name, phrase, line)
+		}
+	}
+}
+
+// TestNoPinnedPhraseCanBeSatisfiedByTheUsageBlock is the collision guard
+// task 0061 adds. pinnedPhrases is written by hand, above, not read back
+// from usage, commands, or any check function — an expectation taken from
+// the thing being checked cannot fail — and this proves each entry actually
+// holds up against the one thing every ErrUsage refusal carries: not in
+// usage, long enough (or documented in belowThreshold), and not a substring
+// of any other entry. Runs unconditionally: house rule, an absent gate is
+// red.
+func TestNoPinnedPhraseCanBeSatisfiedByTheUsageBlock(t *testing.T) {
+	for name, phrase := range pinnedPhrases {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(usage, phrase) {
+				t.Fatalf("pinned phrase %q (for %s) is satisfied by the usage block itself", phrase, name)
+			}
+			if words := len(strings.Fields(phrase)); len(phrase) < 16 || words < 3 {
+				if _, ok := belowThreshold[name]; !ok {
+					t.Fatalf("pinned phrase %q (for %s) is below 16 characters/3 words and has no entry in belowThreshold", phrase, name)
+				}
+			}
+			for otherName, other := range pinnedPhrases {
+				if otherName == name {
+					continue
+				}
+				if strings.Contains(phrase, other) {
+					t.Fatalf("pinned phrase %q (for %s) contains %s's phrase %q as a substring", phrase, name, otherName, other)
+				}
+			}
+		})
+	}
+}
+
 // TestAnOldExtensionFileIsRefusedNotSilentlyReplaced is the file-extension
 // counterpart to TestTheOldEnvironmentNameIsRefusedNotSilentlyIgnored, and
 // the reason it needs its own test rather than reusing that one's shape: a
@@ -534,8 +689,19 @@ func TestAnOldExtensionFileIsRefusedNotSilentlyReplaced(t *testing.T) {
 			if !strings.Contains(errs, old) || !strings.Contains(errs, want) {
 				t.Errorf("the refusal does not name both paths: %q", errs)
 			}
-			if !strings.Contains(errs, "mv") {
-				t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+			// "does not exist, but", not a bare "mv": checkOldExtension
+			// (cli.go) builds this whole message as one fmt.Errorf with no
+			// ErrUsage wrapping, so it is exactly one line and this phrase
+			// is the literal text between its two interpolated paths — the
+			// paths themselves are already the stronger check just above,
+			// this closes the same 2-character "mv" gap QA 0058 found
+			// elsewhere in this file. Measured directly against
+			// checkOldExtension's source rather than copied from
+			// elsewhere: oldPathHint's "mv it, and that .parts directory"
+			// belongs to a different function (a colliding account/db
+			// pair, not an old file extension) and does not appear here.
+			if !strings.Contains(errs, "does not exist, but") {
+				t.Errorf("the refusal does not describe the old-extension file it found: %q", errs)
 			}
 
 			assertTreeUnchanged(t, setup.dir, before)
@@ -575,8 +741,8 @@ func TestARefusedCommandDoesNotDeleteAnExistingLock(t *testing.T) {
 	if status == 0 {
 		t.Fatal("it ran against a database whose only file on disk carries the old extension")
 	}
-	if !strings.Contains(errs, "mv") {
-		t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+	if !strings.Contains(errs, "does not exist, but") {
+		t.Errorf("the refusal does not describe the old-extension file it found: %q", errs)
 	}
 
 	assertTreeUnchanged(t, setup.dir, before)
@@ -634,8 +800,8 @@ func TestAnOldExtensionFileWinsOverALockedDirectory(t *testing.T) {
 	if status == 0 {
 		t.Fatal("it ran while both the directory was locked and the file had the old extension")
 	}
-	if !strings.Contains(errs, "mv") {
-		t.Errorf("the refusal does not tell the operator to mv the file: %q", errs)
+	if !strings.Contains(errs, "does not exist, but") {
+		t.Errorf("the refusal does not describe the old-extension file it found: %q", errs)
 	}
 	if strings.Contains(errs, "probably running") {
 		t.Errorf("the refusal blames the server instead of the old-extension file: %q", errs)
@@ -1054,10 +1220,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("1 apply with no file", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("apply")
+		_, errs, status := setup.run("apply")
 		if status == 0 {
 			t.Fatal("apply ran with no file")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/no file"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1066,10 +1233,16 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		setup := start(t)
 		missing := filepath.Join(t.TempDir(), "missing.json")
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("apply", missing)
+		_, errs, status := setup.run("apply", missing)
 		if status == 0 {
 			t.Fatal("apply ran against a file that is not there")
 		}
+		// The OS's own wording (golang:1.24-alpine, per house rule — every
+		// run in this suite goes through that image), not this package's:
+		// os.ReadFile's error is passed straight through by checkApply and
+		// apply(). Written out here so nobody downstream mistakes it for a
+		// sentence this tool composed.
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/missing file"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1080,10 +1253,14 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		setup := start(t)
 		asDir := t.TempDir()
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("apply", asDir)
+		_, errs, status := setup.run("apply", asDir)
 		if status == 0 {
 			t.Fatal("apply ran with a directory as its file argument")
 		}
+		// "is a directory" is 14 characters — below the usual tripwire, and
+		// exempted in belowThreshold: it is the entire word that tells this
+		// case apart from case 2 above (a file that is not there at all).
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/directory as file"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1092,10 +1269,14 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		setup := start(t)
 		file := writeOutside(t, brokenJSONSchema)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("apply", file)
+		_, errs, status := setup.run("apply", file)
 		if status == 0 {
 			t.Fatal("apply ran with broken JSON")
 		}
+		// "unexpected EOF" is 14 characters — below the usual tripwire, and
+		// exempted in belowThreshold: it is the entire word that tells this
+		// case apart from case 5 below (valid JSON, an unknown field).
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/broken json"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1104,10 +1285,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		setup := start(t)
 		file := writeOutside(t, unknownFieldSchema)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("apply", file)
+		_, errs, status := setup.run("apply", file)
 		if status == 0 {
 			t.Fatal("apply ran with a field nobody declared")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/unknown field"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1121,10 +1303,16 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		ok := writeOutside(t, onePersonSchema)
 		missing := filepath.Join(t.TempDir(), "missing.json")
 		before := walkTree(t, setup.dir)
-		out, _, status := setup.run("apply", ok, missing)
+		out, errs, status := setup.run("apply", ok, missing)
 		if status == 0 {
 			t.Fatal("apply ran with its second file missing")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/missing file"])
+		// This is the index axis, not the "vì gì" axis: !Contains(out,
+		// "collection") is the real shield against mutation A1
+		// (files -> files[:1]), which would still say "no such file or
+		// directory" for the wrong file — the wants pin above cannot tell
+		// files[0] and files[1] apart, only this can.
 		if strings.Contains(out, "collection") {
 			t.Errorf("apply declared something before failing on the second file: %q", out)
 		}
@@ -1135,10 +1323,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("7 log, not a number", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("log", "not-a-number")
+		_, errs, status := setup.run("log", "not-a-number")
 		if status == 0 {
 			t.Fatal("log ran with a non-numeric position")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["log/not a number"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1148,10 +1337,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("8 log, too many arguments", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("log", "1", "2", "3")
+		_, errs, status := setup.run("log", "1", "2", "3")
 		if status == 0 {
 			t.Fatal("log ran with three positional arguments")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["log/too many arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1167,10 +1357,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("8b log, exactly two arguments (the wall itself, not N=3)", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("log", "1", "2")
+		_, errs, status := setup.run("log", "1", "2")
 		if status == 0 {
 			t.Fatal("log ran with two positional arguments")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["log/too many arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1179,10 +1370,17 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("9 ls, an argument it has no use for", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("ls", "junk")
+		_, errs, status := setup.run("ls", "junk")
 		if status == 0 {
 			t.Fatal("ls ran with an argument")
 		}
+		// The command name is the only thing that tells cases 9/10/11
+		// apart — checkNoArguments("ls"), checkNoArguments("dump") and
+		// checkNoArguments("restore") differ ONLY in the string they close
+		// over, so a generic "takes no arguments" pin shared by all three
+		// would say nothing about R2-shaped mutations (one command's check
+		// printing another's name).
+		assertRefusedBecause(t, errs, pinnedPhrases["ls/no arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1190,10 +1388,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("10 dump, an argument it has no use for", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("dump", "junk")
+		_, errs, status := setup.run("dump", "junk")
 		if status == 0 {
 			t.Fatal("dump ran with an argument")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["dump/no arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1201,10 +1400,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	t.Run("11 restore, an argument it has no use for", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("restore", "junk")
+		_, errs, status := setup.run("restore", "junk")
 		if status == 0 {
 			t.Fatal("restore ran with an argument")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["restore/no arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1225,10 +1425,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		}
 		before := walkTree(t, setup.dir)
 
-		_, _, status := setup.run("log", "not-a-number")
+		_, errs, status := setup.run("log", "not-a-number")
 		if status == 0 {
 			t.Fatal("log ran with a non-numeric position")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["log/not a number"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1248,10 +1449,11 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		}
 		before := walkTree(t, setup.dir)
 
-		_, _, status := setup.run("log", "not-a-number")
+		_, errs, status := setup.run("log", "not-a-number")
 		if status == 0 {
 			t.Fatal("log ran with a non-numeric position")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["log/not a number"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1297,13 +1499,28 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 
 	// Case 16: url never opens a database at all — this pins that the new
 	// command table did not change that.
+	//
+	// Task 0061 rewrote this fixture: it used to be "hunter2" as the
+	// argument, with nothing on stdin, and it was green for the WRONG
+	// reason — measured by mutation U1 (checkURL with the password rule
+	// deleted): with the rule gone, url() still reads from stdin (it reads
+	// whenever len(args) > 1, never looking at what args[1] actually
+	// says), gets an EMPTY string back because this case gave it none, and
+	// signing.Sign refuses that empty string on its own — still exit 1,
+	// still "green", and saying nothing about the rule this case exists to
+	// pin. The fix is the fixture, not the assertion: give stdin a real,
+	// valid-shaped password (16-128 characters), so that removing the rule
+	// makes url actually SUCCEED — status 0 — which is what turns "it was
+	// refused" back into a real measurement. See case 16b below, which is
+	// the same shape one word further along.
 	t.Run("16 url, a password given as an argument", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("url", "localhost:7433", "hunter2")
+		_, errs, status := setup.runWith(nil, "a-password-of-the-right-shape\n", "url", "localhost:7433", "a-password-of-the-right-shape")
 		if status == 0 {
 			t.Fatal("url accepted a password as an argument")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["url/password as argument"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
@@ -1318,26 +1535,133 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 	// short enough that signing.Sign would refuse it on its own, which
 	// would make this case pass for the wrong reason and say nothing
 	// about the arity cap it exists to pin.
+	//
+	// This sits at N=4 (four arguments after "url"). Task 0061 found that
+	// N=4 is not the wall: checkURL's actual guard is len(args) > 2, which
+	// case 16c below pins at N=3, the point where >2 and >3 first
+	// disagree. This case stays at N=4 anyway, unchanged, as the second
+	// independent word-past-the-marker shape (two leftover words rather
+	// than one) — case 16c does not repeat it, it closes a gap this one
+	// cannot reach.
 	t.Run("16b url, a word left over after the password marker", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.runWith(nil, "a-password-of-the-right-shape\n", "url", "localhost:7433", "-", "junk", "junk2")
+		_, errs, status := setup.runWith(nil, "a-password-of-the-right-shape\n", "url", "localhost:7433", "-", "junk", "junk2")
 		if status == 0 {
 			t.Fatal("url accepted a leftover word after the password marker")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["url/too many arguments"])
+		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 16c: the actual wall, not the one case 16b happens to sit on.
+	// Task 0061 measured that checkURL's `len(args) > 2` guard was only
+	// ever exercised at N=4 (case 16b above, and — before this task —
+	// rejectionCases["url"]), and nudging it outward by one to
+	// `len(args) > 3` survived every test in this file: at N=4 both walls
+	// agree ("too many" either way), so N=4 alone cannot tell `> 2` from
+	// `> 3` apart. This is exactly the same shape as case 8 -> case 8b for
+	// checkLog, one command over: N=3 is the one shape where the two
+	// walls disagree, and stdin carries a real, valid-shaped password so
+	// that removing the rule lets url actually run — "junk" is never read
+	// by url() either way, so a mutant that lets it through prints a
+	// connection string and exits 0.
+	t.Run("16c url, one word past the password marker (N=3, the wall itself)", func(t *testing.T) {
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+		_, errs, status := setup.runWith(nil, "a-password-of-the-right-shape\n", "url", "localhost:7433", "-", "junk")
+		if status == 0 {
+			t.Fatal("url accepted a leftover word after the password marker, at N=3")
+		}
+		assertRefusedBecause(t, errs, pinnedPhrases["url/too many arguments"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 
 	// Case 17: same for shell, refused before any network is touched —
-	// "-nope" is not a valid trailing option.
+	// "-nope" is not a valid trailing option. "localhost:1" is a closed
+	// port (nothing is listening on it), which is exactly the axis case
+	// 17b below removes: without a real server, mutation P7/P10/S1
+	// (checkShell's rule gone entirely) would still exit 1 here, just for
+	// "connection refused" instead — the wants pin below is what tells the
+	// two apart on THIS case; case 17b is the stronger shape that also
+	// makes the mutant's status flip to 0.
 	t.Run("17 shell, an option it does not have", func(t *testing.T) {
 		setup := start(t)
 		before := walkTree(t, setup.dir)
-		_, _, status := setup.run("shell", "localhost:1", "-nope")
+		_, errs, status := setup.run("shell", "localhost:1", "-nope")
 		if status == 0 {
 			t.Fatal("shell accepted an option it does not have")
 		}
+		assertRefusedBecause(t, errs, pinnedPhrases["shell/bad option"])
 		assertTreeUnchanged(t, setup.dir, before)
+	})
+
+	// Case 17b: the "cổng đứng trước" case 17 above cannot rule out on its
+	// own — a REAL server, listening, with the account/database this
+	// case's SAPEDB_SECRET/-ACCOUNT/-DB actually name. Section 3.2 of task
+	// 0061 calls the reason out by name: url and shell are both
+	// `opens: false`, so open() never runs for either one, and the disk
+	// image left behind by a check-stage refusal, a bad secret, empty
+	// stdin, or a plain "connection refused" all look identical —
+	// assertTreeUnchanged is structurally blind here, on purpose, which is
+	// exactly why this case exists instead of only widening case 17.
+	//
+	// The setup mirrors shell_live_test.go: a real *server.Server on a
+	// real listener. "-nope" must still be refused, by checkShell, before
+	// any frame crosses the wire — proven by the positive control right
+	// after it: "-insecure" against the SAME server, with the SAME
+	// account/db/secret, and an EMPTY stdin, must exit 0. Without that
+	// control this case could be green because the secret is wrong, the
+	// account/db do not match, or the server has not called Serve yet —
+	// any of which also exits 1 and would make "-nope" look refused for
+	// the right reason when it is not. House rule: "một trần CHỈ TRỪ
+	// không bao giờ làm đỏ một khẳng định MỘT CHIỀU".
+	t.Run("17b shell against a real, listening server (not a closed port)", func(t *testing.T) {
+		liveSecret := "the secret this live server for case 17b was started with"
+		live, err := server.New(server.Options{Dir: t.TempDir(), Secret: liveSecret})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = live.Close() })
+
+		// Created up front, the way `sapedb apply` would, so the shell's
+		// opening WhatIsHere() call has a real, empty database to open
+		// rather than nothing at all.
+		_, release, err := live.Store("acme", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		release()
+
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() { _ = live.Serve(listener) }()
+
+		addr := listener.Addr().String()
+		env := map[string]string{"SAPEDB_SECRET": liveSecret, "SAPEDB_ACCOUNT": "acme", "SAPEDB_DB": "main"}
+
+		setup := start(t)
+		before := walkTree(t, setup.dir)
+
+		_, errs, status := setup.runWith(env, "", "shell", addr, "-nope")
+		if status == 0 {
+			t.Fatal("shell accepted an option it does not have, even against a live, reachable server")
+		}
+		assertRefusedBecause(t, errs, pinnedPhrases["shell/bad option"])
+		assertTreeUnchanged(t, setup.dir, before)
+
+		// The positive control: -insecure IS a valid trailing option, the
+		// server is genuinely reachable, and an empty stdin session ends
+		// at the first EOF — so this must succeed. If it does not, the
+		// refusal above was never about "-nope" being a bad option in the
+		// first place.
+		_, errs, status = setup.runWith(env, "", "shell", addr, "-insecure")
+		if status != 0 {
+			t.Fatalf("shell -insecure against the same live server did not succeed: %s", errs)
+		}
 	})
 
 	// Case 18: the boundary this task deliberately leaves alone. Once a
@@ -1359,9 +1683,15 @@ func TestARejectedArgumentLeavesTheDiskExactlyAsItFound(t *testing.T) {
 		if status == 0 {
 			t.Fatal("a conflicting redeclaration was applied")
 		}
-		if !strings.Contains(errs, "articles") {
-			t.Errorf("the refusal does not name the collection: %q", errs)
-		}
+		// Not a bare "articles": store.go prints spec.Name (the collection
+		// name) whether or not apply's own "collection %q" wrapper is
+		// there to say so — QA 0058 measured that dropping "collection %q"
+		// from apply's %w formatting leaves this suite entirely green
+		// (mutation P20). Pinning the prefix store itself never omits
+		// ("sapedb/store:") right next to the collection name closes that:
+		// it is only present when BOTH layers contribute — apply's own
+		// wrapper AND store's error.
+		assertRefusedBecause(t, errs, pinnedPhrases["apply/conflicting redeclaration"])
 		assertTreeUnchanged(t, setup.dir, before)
 	})
 }
@@ -1394,10 +1724,12 @@ func TestUsageListsExactlyTheCommandsInTheTable(t *testing.T) {
 }
 
 // rejectionCase is one command line, given as a literal invocation, that G2
-// below asserts is refused with the tree exactly as it was.
+// below asserts is refused with the tree exactly as it was — and, since task
+// 0061, refused for the reason wants names.
 type rejectionCase struct {
 	args  []string
 	stdin string
+	wants string
 }
 
 // rejectionCases is written by hand and does not derive from commands: it is
@@ -1406,14 +1738,31 @@ type rejectionCase struct {
 // refused — this is checked, not assumed — and every one is chosen to be
 // refused at the check stage, before open(), so the case also demonstrates
 // the tree staying clean.
+//
+// One row, one command — the exact rule TestEveryCommandInTheTableHasARejectionCase
+// exists to enforce (a second row for the same command would break that
+// set-equality check), so a second rule for a command already listed here
+// gets its own case in TestARejectedArgumentLeavesTheDiskExactlyAsItFound
+// instead, not a second line in this map.
+//
+// "url" and "shell" carry the same fixture discipline as cases 16 and 17b:
+// a password of a valid shape, on stdin, that removing the rule being
+// measured would actually let through — task 0061 measured that the old
+// "hunter2" fixture here left rejectionCases["url"] entirely out of mutation
+// P6's (checkURL cut from the table) red set, for the identical reason case
+// 16 was rewritten for, above.
 var rejectionCases = map[string]rejectionCase{
-	"apply":   {args: []string{"apply"}},
-	"ls":      {args: []string{"ls", "junk"}},
-	"dump":    {args: []string{"dump", "junk"}},
-	"restore": {args: []string{"restore", "junk"}},
-	"log":     {args: []string{"log", "1", "2", "3"}},
-	"url":     {args: []string{"url", "localhost:7433", "hunter2"}},
-	"shell":   {args: []string{"shell", "localhost:1", "-nope"}},
+	"apply":   {args: []string{"apply"}, wants: "apply needs a file"},
+	"ls":      {args: []string{"ls", "junk"}, wants: "ls takes no arguments"},
+	"dump":    {args: []string{"dump", "junk"}, wants: "dump takes no arguments"},
+	"restore": {args: []string{"restore", "junk"}, wants: "restore takes no arguments"},
+	"log":     {args: []string{"log", "1", "2", "3"}, wants: "log takes at most one argument, FROM"},
+	"url": {
+		args:  []string{"url", "localhost:7433", "a-password-of-the-right-shape"},
+		stdin: "a-password-of-the-right-shape\n",
+		wants: "never given as an argument",
+	},
+	"shell": {args: []string{"shell", "localhost:1", "-nope"}, wants: "shell takes host:port and optionally -insecure"},
 }
 
 // TestEveryCommandInTheTableHasARejectionCase is G2. A command added to
@@ -1461,10 +1810,22 @@ func TestEveryCommandInTheTableHasARejectionCase(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			setup := start(t)
 			before := walkTree(t, setup.dir)
-			_, _, status := setup.runWith(nil, tc.stdin, tc.args...)
+			_, errs, status := setup.runWith(nil, tc.stdin, tc.args...)
 			if status == 0 {
 				t.Fatalf("%q ran when the case table says it must be refused", name)
 			}
+			// wants is a "vì gì" pin across all seven commands in one
+			// loop — cheap breadth, one line covering every entry in the
+			// table. Measured (task 0061's harness, H1 paired with P7,
+			// P10, P17, P18): removing THIS specific check does not, on
+			// its own, let any of those four mutants back through,
+			// because case 17/17b and cases 9/10/11 each carry their own
+			// assertRefusedBecause independently. So this line's real job
+			// here is breadth and cross-checking (the same table also
+			// drives TestEveryCommandInTheTableHasARejectionCase's
+			// set-equality check just above), not being the sole guard
+			// for any one of those four — do not read it as such.
+			assertRefusedBecause(t, errs, tc.wants)
 			assertTreeUnchanged(t, setup.dir, before)
 		})
 	}
