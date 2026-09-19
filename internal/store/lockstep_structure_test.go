@@ -13,7 +13,11 @@ import (
 // TestEveryIndexedFieldListReadIsOnTheList is the structural half of task
 // 0054 — the bảng ca above (lockstep_test.go) only proves the lockstep
 // property holds at the sites that exist TODAY. It says nothing about a
-// twelfth place that starts indexing into Fields/Terms/Group next month.
+// SEVENTEENTH place that starts indexing into Fields/Terms/Group next
+// month (the list below has exactly 16 entries — Reviewer 0054 measured
+// that an earlier draft of this comment said "twelfth"/"thirteenth" here,
+// which was simply wrong arithmetic against the list's own length, not a
+// claim about the code).
 //
 // This greps every non-test .go source file in internal/store and
 // internal/keys for an expression that reads a named element out of one of
@@ -21,10 +25,10 @@ import (
 // Steps, Indexes, Rollups) by a loop-shaped index name (i, at, spread, idx),
 // records which function each match falls inside, and requires that set of
 // functions to equal EXACTLY the list below — no fewer, no more. A
-// thirteenth reader appearing without a matching line added here fails this
-// test; a reader disappearing (say, because a function was deleted) also
-// fails it, so the list cannot go stale in either direction without someone
-// noticing.
+// SEVENTEENTH reader appearing without a matching line added here fails
+// this test; a reader disappearing (say, because a function was deleted)
+// also fails it, so the list cannot go stale in either direction without
+// someone noticing.
 //
 // The "which function" tracking is deliberately the simplest thing that
 // works: scan the file top to bottom, and every line beginning with "func "

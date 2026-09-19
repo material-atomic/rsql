@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -103,6 +104,25 @@ func lockstepStore(t *testing.T, seed int64) *Store {
 				// is actually present and Descending is the only thing that
 				// does. See TestARollupGroupWithTwoDifferentDirectionsTotalsEachCombinationSeparately.
 				{Path: "kind", Type: TypeString, Descending: true, Missing: MissingSkip},
+			},
+			Count: true,
+		}, {
+			// gnum: a second field declared TypeNumber, not TypeString. QA
+			// 0054 measured that constantIsEncodable's rollup branch DOES
+			// have a live error path today, contrary to what this file
+			// originally claimed (and what the comment beside that line in
+			// ops.go, present since 759daeb, also claims): matches()
+			// accepts int/int64 as well as float64 for TypeNumber, and
+			// keys.Encode refuses an int64 magnitude beyond 2^53
+			// (ErrTooLarge) or a NaN float64 (ErrNotANumber) — neither is a
+			// slice or a map, so Rollup.validate()'s ban on TypeAny groups
+			// does nothing to close this path. g2 (both fields TypeString)
+			// cannot reach this: a string constant is always encodable.
+			// See TestARollupBoundaryNumberNamesItsOwnField.
+			Name: "gnum",
+			Group: []Field{
+				{Path: "account", Type: TypeString, Missing: MissingSkip},
+				{Path: "amt", Type: TypeNumber, Descending: true, Missing: MissingLast},
 			},
 			Count: true,
 		}},
@@ -309,14 +329,23 @@ func TestABoundIsTypeCheckedAgainstItsOwnFieldNotAnother(t *testing.T) {
 // TestAnUnencodableConstantBoundIsNamedAtItsOwnField is constantIsEncodable's
 // SCAN-side refusal (validateOperation, M9 in the task doc): the second
 // field of w2any is declared "any", so matches() lets a slice through
-// check() above, and keys.Encode is the thing that actually refuses it. The
-// rollup-side twin of this same line (M8 / task 0054 mục 1.3, "P12") is NOT
-// tested here on purpose: Rollup.validate() refuses TypeAny for a Group
-// field, so constantIsEncodable's rollup branch has no declaration in this
-// repo that can ever make it return an error — see the comment beside that
-// line in ops.go, which predates this task (759daeb) and already says so.
-// Writing a test that could only pass by asserting an error that can never
-// happen would be exactly the fake test the task forbids.
+// check() above, and keys.Encode is the thing that actually refuses it.
+//
+// This test does NOT cover the rollup-side twin of this same line (M8 /
+// task 0054 mục 1.3, "P12") — that one needs a NUMBER, not a slice, and has
+// its own test right below: TestARollupBoundaryNumberNamesItsOwnField. An
+// earlier version of this comment claimed "Rollup.validate() refuses TypeAny
+// for a Group field, so constantIsEncodable's rollup branch has no
+// declaration in this repo that can ever make it return an error" — that
+// claim is FALSE, caught by QA 0054 with a measured counter-example: a
+// TypeNumber group field accepts int/int64 (matches(), store.go), and
+// keys.Encode refuses an int64 magnitude beyond 2^53 or a NaN float64 —
+// neither is a slice or a map, so the TypeAny ban does nothing to close
+// this path. The claim was narrower than it looked (true for slices/maps
+// only) and the word "ever" is exactly what house-rules.md warns against
+// writing without a structural proof. See the test below for the measured
+// case, and ops.go's own comment beside constantIsEncodable's TOTALS branch
+// for the same correction.
 func TestAnUnencodableConstantBoundIsNamedAtItsOwnField(t *testing.T) {
 	store := lockstepStore(t, 5406)
 	_, err := store.DeclareOperation(Operation{
@@ -325,6 +354,45 @@ func TestAnUnencodableConstantBoundIsNamedAtItsOwnField(t *testing.T) {
 		From: &Endpoint{Terms: []Term{{Value: "x"}, {Value: []any{1.0, 2.0}}}},
 	})
 	mustNameOnly(t, err, `"z"`, `"a"`)
+}
+
+// TestARollupBoundaryNumberNamesItsOwnField is the rollup-side (TOTALS
+// branch) twin of the test above, and it is NOT a fake test asserting an
+// error that can never happen — QA 0054 measured that it can. gnum's second
+// group field ("amt") is TypeNumber, and two boundary values reach
+// keys.Encode's number/integer refusals without ever touching the
+// TypeAny-only path Rollup.validate() closes:
+//
+//   - an int magnitude beyond 2^53 (ErrTooLarge — a float64 no longer holds
+//     every such integer exactly)
+//   - a float64 NaN (ErrNotANumber)
+//
+// Both are declaration-time constants matches(TypeNumber, ...) accepts
+// (store.go's matches() takes int/int64/float32/float64 for TypeNumber, not
+// only float64), so both reach constantIsEncodable on the rollup branch —
+// the exact line M8/P12 mutates — and this is the case that mutant cannot
+// survive: mutated to fields[0], the refusal names "account" instead of
+// "amt". g2 (mục 4's original two-field rollup, both fields TypeString)
+// cannot reach this at all: every string constant is encodable, so there is
+// no live error path through IT specifically — g2 and gnum are not
+// redundant, they cover different halves of what TypeAny closes and what it
+// does not.
+func TestARollupBoundaryNumberNamesItsOwnField(t *testing.T) {
+	store := lockstepStore(t, 5412)
+
+	_, err := store.DeclareOperation(Operation{
+		Name: "boundary.toolarge", Collection: "wide", Action: ActionTotals,
+		Rollup: "gnum", Limit: 10,
+		From: &Endpoint{Terms: []Term{{Value: "cash"}, {Value: int(1) << 60}}},
+	})
+	mustNameOnly(t, err, `"amt"`, `"account"`)
+
+	_, err = store.DeclareOperation(Operation{
+		Name: "boundary.nan", Collection: "wide", Action: ActionTotals,
+		Rollup: "gnum", Limit: 10,
+		From: &Endpoint{Terms: []Term{{Value: "cash"}, {Value: math.NaN()}}},
+	})
+	mustNameOnly(t, err, `"amt"`, `"account"`)
 }
 
 // TestAWriteWithAnUnencodableFieldNamesItsOwnField is the WRITE-side

@@ -500,14 +500,28 @@ func (s *Store) validateOperation(operation *Operation) error {
 				// A rollup's Group fields cannot be declared "any" —
 				// Rollup.validate() only accepts TypeString, TypeNumber and
 				// TypeBool for them — so matches() already refuses a slice
-				// or a map here before this line is reached: there is no
-				// declaration in this repo that makes this call return a
-				// non-nil error today. Kept anyway, deliberately, for the
-				// same reason sameTerm replaced == in totalsAcross below
-				// rather than only in scanAcross: symmetry with the scan
-				// branch, so a future field type that does allow "any" on a
-				// rollup group does not silently reopen the panic this
-				// closed on the scan side.
+				// or a map here before this line is reached. Kept anyway,
+				// deliberately, for the same reason sameTerm replaced ==
+				// in totalsAcross below rather than only in scanAcross:
+				// symmetry with the scan branch, so a future field type
+				// that does allow "any" on a rollup group does not silently
+				// reopen the panic this closed on the scan side.
+				//
+				// Correction (task 0054, caught by QA — the paragraph above
+				// used to end "there is no declaration in this repo that
+				// makes this call return a non-nil error today," and that
+				// claim was too wide, kept here rather than deleted so the
+				// narrower one below does not drift back open the same way:
+				// the TypeAny ban only closes the SLICE/MAP path.
+				// matches(TypeNumber, ...) (store.go) accepts int and int64
+				// as well as float64, and keys.Encode refuses an int64
+				// magnitude beyond 2^53 (ErrTooLarge) or a float64 NaN
+				// (ErrNotANumber) — neither is a slice or a map, so a
+				// TypeNumber group field with one of those two boundary
+				// values DOES reach this line and DOES return a non-nil
+				// error today. Measured:
+				// TestARollupBoundaryNumberNamesItsOwnField
+				// (lockstep_test.go).
 				if err := constantIsEncodable(term, fields[i]); err != nil {
 					return err
 				}
