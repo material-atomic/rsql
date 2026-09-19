@@ -155,6 +155,15 @@ func (c *Collection) Walk(visit func(key any, document map[string]any) bool) err
 // along it takes the same bounds.
 func (c *Collection) walkRange(within Range, visit func(key any, document map[string]any) bool) error {
 	prefix := c.documents()
+	// Missing here is a formality, not a real choice: keys.Encode only reads
+	// field.Missing for the tag it writes for keys.Absent, and the one place
+	// that produces keys.Absent is entriesForIndex (collection.go), for an
+	// INDEXED field a document is missing — the primary key is never absent, a
+	// document cannot exist without one. So whichever of MissingSkip,
+	// MissingFirst or MissingLast is written here encodes to the same byte
+	// today. Kept as MissingSkip — the field's own zero value — for no reason
+	// stronger than that, and the day the primary key can be optional this
+	// stops being true.
 	fields := []Field{{Path: c.spec.Key.Path, Type: c.spec.Key.Type, Missing: MissingSkip}}
 
 	return c.walk(within, prefix, fields, func(key, value []byte) bool {
@@ -216,6 +225,27 @@ func (c *Collection) walkRange(within Range, visit func(key any, document map[st
 // with two ordinary inclusive ends. Only lower strictly after upper is
 // refused; lower == upper, however it was written, is left to keep reading
 // as empty. That is why the comparison below is > and not >=.
+//
+// Task 0054 measured a narrower counter-example than the number-encoding one
+// above, and this paragraph corrects the claim rather than deleting it: on a
+// bool field the two things this comment calls different — "an Exclusive
+// bound pinned against itself" and "a caller-visible pair describing nothing
+// between them" — are not always separable from "a From that sorts after
+// To". A bool has exactly two values, so keys.Encode(false)=0x20,
+// keys.Encode(true)=0x21, and successor(0x20)=0x21: From=true, To=false
+// (INCLUSIVE, backwards by one step) lands on lower==upper, the identical
+// bytes an intentionally-empty stretch would produce, and reads as an empty
+// answer with no error rather than the ErrArgument a backwards range gets on
+// every other field width. Measured on 5a482ea (unmutated) via
+// DeclareOperation+Invoke on a one-field bool index: ACCEPTED, 0 rows, nil
+// error, both through a constant endpoint and through an argument pair. On a
+// number field two values one step apart do NOT collide this way — From=2,
+// To=1 encodes to lower≠upper and is refused, same measurement, same commit.
+// So on bool, unlike on number, task 0045's promise ("a From that sorts after
+// To is refused, never a silent empty stretch") covers none of the domain:
+// every backwards pair on a bool field is exactly one step wide. This is not
+// fixed here — see TestABackwardsBoolRangeIsAcceptedRatherThanRefused for the
+// pinned behavior and the debt this narrows to.
 func (c *Collection) stretch(within Range, prefix []byte, fields []Field) (lower, upper []byte, err error) {
 	lower, err = c.bound(prefix, fields, within.From, false)
 	if err != nil {

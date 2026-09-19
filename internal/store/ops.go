@@ -741,6 +741,10 @@ func (s *Store) validateStep(step *Step, at int, earlier map[string]bool,
 // included as the clustered one.
 func scanFields(collection *Collection, name string) ([]Field, error) {
 	if name == ClusteredIndex || name == "" {
+		// Same fake field walkRange (scan.go) builds for the same reason, and
+		// the same non-choice: Missing only matters for keys.Absent, and a
+		// document's primary key is never absent. MissingSkip here is the
+		// zero value, not a decision that changes what this declares.
 		return []Field{{
 			Path:    collection.spec.Key.Path,
 			Type:    collection.spec.Key.Type,
